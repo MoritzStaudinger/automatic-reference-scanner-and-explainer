@@ -303,7 +303,7 @@ def generate_report(
     lines: list[str] = []
 
     # --- Header ---
-    title_line = f"# ARES Report"
+    title_line = f"# Reference Verification Report"
     if pdf_name:
         title_line += f" — {pdf_name}"
     lines.append(title_line)

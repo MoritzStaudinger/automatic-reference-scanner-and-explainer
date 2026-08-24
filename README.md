@@ -1,19 +1,19 @@
-# ARES — Automatic Reference Explainer and Scanner
+# Automatic Reference Explainer and Scanner
 
 A pipeline + Streamlit UI for extracting references from academic PDFs and
-auditing them against multiple authoritative databases. ARES surfaces
+auditing them against multiple authoritative databases. The tool surfaces
 hallucinated citations — wrong paper at the cited DOI, fabricated arXiv
 IDs, mis-attributed authors, titles that exist nowhere — before they
 reach reviewers.
 
-> **Human verification is required for every result.** ARES reports what
-> academic databases say. It does not decide whether a citation is
+> **Human verification is required for every result.** The tool reports
+> what academic databases say. It does not decide whether a citation is
 > correct. Treat its verdicts as candidates for review, not as ground
 > truth.
 
 ---
 
-## What ARES does
+## What the tool does
 
 Upload a PDF → parse the bibliography → optionally repair structured
 fields with an LLM → look up each reference across academic sources in
@@ -37,8 +37,8 @@ You need Docker, Docker Compose, and ~10 GB of free RAM (GROBID alone
 asks for 6–8 GB).
 
 ```bash
-git clone https://github.com/<your-org>/ares.git
-cd ares
+git clone https://github.com/<your-org>/reference-explainer.git
+cd reference-explainer
 cp .env.example .env        # fill in any API keys you have
 docker compose up -d --build
 ```
@@ -83,12 +83,12 @@ short version:
 | `GROBID_URL` | GROBID HTTP endpoint (set automatically in Docker) |
 | `ARES_CACHE` | SQLite cache path |
 
-All keys are optional — ARES degrades gracefully when a source is
+All keys are optional — the tool degrades gracefully when a source is
 unavailable. More keys → fewer rate-limit walls.
 
 ## Parser backends
 
-ARES ships with several parser backends. The right one depends on the
+Several parser backends ship in the box. The right one depends on the
 trade-off you want between speed and recall.
 
 | Backend | Notes |
@@ -138,12 +138,12 @@ return in seconds.
 
 ## Limitations and required human review
 
-ARES catches a meaningful fraction of fabricated citations but is **not a
-replacement for human review**. In our 13-paper manually-validated sample
-(460 references), the pipeline reached ~94% accuracy with ~83% recall on
-true fabrications, but precision was ~57% — meaning about 4 of every 10
-flags were false alarms, often legitimate non-academic references like
-Github repos, tools, and tech reports.
+The tool catches a meaningful fraction of fabricated citations but is
+**not a replacement for human review**. In our 13-paper manually-validated
+sample (460 references), the pipeline reached ~94% accuracy with ~83%
+recall on true fabrications, but precision was ~57% — meaning about 4 of
+every 10 flags were false alarms, often legitimate non-academic references
+like Github repos, tools, and tech reports.
 
 Failure modes you should expect:
 
@@ -164,8 +164,8 @@ Failure modes you should expect:
 5. **Non-English bibliographies.** Title/author similarity uses Latin
    normalization. Non-Latin scripts will produce lower confidence scores.
 
-Treat ARES as a **first-pass filter that surfaces candidates for human
-review**, not as an oracle.
+Treat this tool as a **first-pass filter that surfaces candidates for
+human review**, not as an oracle.
 
 ## Repository layout
 
@@ -186,16 +186,17 @@ benchmark/              Evaluation harness against HalluCitation
                         per-run intermediates are gitignored)
 ```
 
-## Citing ARES
+## Citing the tool
 
-If you use ARES in academic work, please cite it as:
+If you use the Automatic Reference Explainer and Scanner in academic
+work, please cite it as:
 
 ```bibtex
-@software{ares2026,
+@software{referenceexplainer2026,
   author = {Staudinger, Moritz},
-  title  = {ARES: Automatic Reference Explainer and Scanner},
+  title  = {Automatic Reference Explainer and Scanner},
   year   = {2026},
-  url    = {https://github.com/<your-org>/ares}
+  url    = {https://github.com/<your-org>/reference-explainer}
 }
 ```
 

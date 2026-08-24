@@ -133,7 +133,7 @@ _S2_BASE   = "https://api.semanticscholar.org/graph/v1"
 _S2_FIELDS = "title,authors,year,externalIds,venue"
 
 _CR_BASE    = "https://api.crossref.org/works"
-_CR_HEADERS = {"User-Agent": "ARES/1.0 (mailto:contact@example.com)"}
+_CR_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
 
 _DBLP_BASE  = "https://dblp.org/search/publ/api"
 _OA_BASE    = "https://api.openalex.org/works"
@@ -147,7 +147,7 @@ _CORE_API_KEY = os.getenv("CORE_API_KEY", "")
 # users via the mailto query parameter.  Set OPENALEX_MAILTO in .env to
 # your real address; we fall back to a generic one only if not set.
 _OA_MAILTO  = os.getenv("OPENALEX_MAILTO", "moritz.staudinger@tuwien.ac.at")
-_OA_HEADERS = {"User-Agent": f"ARES/1.0 (mailto:{_OA_MAILTO})"}
+_OA_HEADERS = {"User-Agent": f"ReferenceExplainer/1.0 (mailto:{_OA_MAILTO})"}
 
 # Title similarity thresholds
 MATCH_THRESHOLD          = 0.90
@@ -791,7 +791,7 @@ def _cited_arxiv_id(ref: dict[str, Any]) -> str | None:
     return None
 
 
-_URL_FOLLOW_HEADERS = {"User-Agent": "ARES/1.0 (mailto:contact@example.com)"}
+_URL_FOLLOW_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
 
 
 def _resolve_url_doi(url: str) -> str | None:
@@ -1623,7 +1623,7 @@ def _lookup_crossref(ref: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _OL_BASE    = "https://openlibrary.org/search.json"
-_OL_HEADERS = {"User-Agent": "ARES/1.0 (mailto:contact@example.com)"}
+_OL_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
 
 
 @_cached("openlibrary", postprocess=_refresh_label)
@@ -1845,7 +1845,7 @@ _DOI_ORG_MAILTO  = os.getenv(
     os.getenv("OPENALEX_MAILTO", "moritz.staudinger@tuwien.ac.at"),
 )
 _DOI_ORG_HEADERS = {
-    "User-Agent": f"ARES/1.0 (mailto:{_DOI_ORG_MAILTO})",
+    "User-Agent": f"ReferenceExplainer/1.0 (mailto:{_DOI_ORG_MAILTO})",
     "Accept":     "application/vnd.citationstyles.csl+json",
 }
 

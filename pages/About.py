@@ -1,5 +1,5 @@
 """
-About / introduction page for ARES (Automatic Reference Explainer and Scanner).
+About / introduction page for the Automatic Reference Explainer and Scanner.
 
 Streamlit auto-loads any file in `pages/` and lists it in the sidebar
 navigation.  This page is a static explainer — it has no side effects
@@ -8,7 +8,7 @@ on the main workflow's session state.
 import streamlit as st
 
 st.set_page_config(
-    page_title="About — ARES",
+    page_title="About — Automatic Reference Explainer and Scanner",
     layout="wide",
 )
 
@@ -100,12 +100,11 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.title("About ARES")
+st.title("About")
 st.markdown(
     '<p class="about-lead">'
-    "<strong>ARES</strong> stands for "
-    "<em>Automatic Reference Explainer and Scanner</em>. "
-    "It extracts the bibliography from an academic PDF, "
+    "The <strong>Automatic Reference Explainer and Scanner</strong> "
+    "extracts the bibliography from an academic PDF, "
     "audits every reference against multiple authoritative databases, "
     "and surfaces the ones that don't add up — wrong-DOI citations, "
     "fabricated arXiv IDs, mis-attributed papers, and citations that "
@@ -143,7 +142,7 @@ st.markdown(
 - **Title that exists nowhere.** A confident-sounding citation that no academic database has ever heard of.
 - **Venue mismatch.** Title and authors check out, but the venue listed is wrong (e.g. arXiv preprint cited as a conference paper).
 
-Reviewers can't catch most of these in a manual pass — there's no shortcut for opening a DOI and checking it resolves to what the bibliography says. ARES does that for every reference automatically.
+Reviewers can't catch most of these in a manual pass — there's no shortcut for opening a DOI and checking it resolves to what the bibliography says. This tool does that for every reference automatically.
 """)
 
 

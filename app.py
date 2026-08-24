@@ -20,7 +20,7 @@ from highlighter import highlight_references
 from lookup import lookup_all
 
 st.set_page_config(
-    page_title="ARES",
+    page_title="Automatic Reference Explainer and Scanner",
     layout="wide",
 )
 
@@ -144,10 +144,9 @@ with st.sidebar:
     st.page_link("pages/About.py",  label="About")
     st.divider()
 
-st.title("ARES")
+st.title("Automatic Reference Explainer and Scanner")
 st.caption(
-    "Automatic Reference Explainer and Scanner — "
-    "upload a PDF to extract and validate its references."
+    "Upload a PDF to extract and validate its references."
 )
 
 # Prominent reminder that this tool's output is advisory, not authoritative.
