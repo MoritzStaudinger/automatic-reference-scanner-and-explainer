@@ -20,7 +20,7 @@ import html as _html
 from datetime import date
 from typing import Any
 
-_VALIDATION_SOURCES = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex", "crossref", "openlibrary", "scholarly", "arxiv")
+_VALIDATION_SOURCES = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex", "crossref", "openlibrary", "scholarly", "arxiv", "url_verify")
 
 
 # ---------------------------------------------------------------------------
@@ -58,14 +58,44 @@ def _best_found(lr: dict) -> dict | None:
 
 
 def _has_wrong_doi(lr: dict | None) -> str | None:
-    """Return the wrong DOI string if flagged, else None.
+    """Return the wrong DOI string if flagged by ANY source, else None.
 
     None-safe: when `lr` is None (pending manual-ref slot — added after
     lookups, not yet queried), there's no wrong-DOI information to surface.
     """
     if not lr:
         return None
-    return lr.get("semantic_scholar", {}).get("wrong_doi") or None
+    for src in _VALIDATION_SOURCES:
+        wd = lr.get(src, {}).get("wrong_doi")
+        if wd:
+            return wd
+    return None
+
+
+def _has_wrong_arxiv_id(lr: dict | None) -> str | None:
+    if not lr:
+        return None
+    for src in _VALIDATION_SOURCES:
+        w = lr.get(src, {}).get("wrong_arxiv_id")
+        if w:
+            return w
+    return None
+
+
+def _has_wrong_authors(lr: dict | None) -> bool:
+    if not lr:
+        return False
+    return any(
+        lr.get(src, {}).get("wrong_authors") for src in _VALIDATION_SOURCES
+    )
+
+
+def _has_wrong_venue(lr: dict | None) -> bool:
+    if not lr:
+        return False
+    return any(
+        lr.get(src, {}).get("wrong_venue") for src in _VALIDATION_SOURCES
+    )
 
 
 # Order matters — the first matching category wins.  Strongest-signal
@@ -74,8 +104,17 @@ def _has_wrong_doi(lr: dict | None) -> str | None:
 SUSPICIOUS_CATEGORIES = (
     "wrong_arxiv_id",      # cited arxiv ID resolves to a different paper
     "wrong_doi",           # cited DOI resolves to a different paper
-    "title_authors_mismatch",  # high title sim (≥0.90) but authors clearly disagree
-    "venue_mismatch",      # title+authors match but venue is wrong
+    "wrong_authors",       # title matches but authors clearly disagree
+                           # (set by any source via _finalize_match when
+                           # tsim ≥ 0.50 AND asim < 0.35)
+    "wrong_venue",         # title matches but venue clearly disagrees,
+                           # excluding preprint markers (set by any source
+                           # via _finalize_match when tsim ≥ 0.50 AND
+                           # vsim < 0.30)
+    "title_authors_mismatch",  # legacy: high title sim (≥0.90) + authors
+                           # disagree — now subsumed by wrong_authors,
+                           # kept for back-compat in benchmark reports.
+    "venue_mismatch",      # title+authors match but venue is wrong (soft)
     "uncertain_match",     # tier-2 fuzzy: best source returned a paper at
                            # 0.70-0.90 title sim but couldn't confirm via
                            # authors.  Often legitimate-but-obscure refs
@@ -121,15 +160,28 @@ def _categorise_suspicious(lr: dict | None) -> str | None:
         if r.get("wrong_doi"):
             return "wrong_doi"
 
-    # 2. Title+authors mismatch — at least one source returned a paper
-    #    with high title similarity but authors clearly disagree.
-    #    Matches our `_composite_label` tier-1 mismatch rule.
+    # 2. Any source flagged wrong_authors — title matches (tsim ≥ 0.50)
+    #    but authors clearly disagree (asim < 0.35).  Captures both the
+    #    tier-1 "exact title, wrong authors" case (legacy
+    #    title_authors_mismatch) and the tier-2 "medium title, wrong
+    #    authors" case that previously fell through to "fuzzy" silently.
+    for _, r in found_sources:
+        if r.get("wrong_authors"):
+            return "wrong_authors"
+
+    # 2b. Same as legacy title_authors_mismatch.  Kept so older cached
+    #     results that don't carry the new flag still classify.
     for _, r in found_sources:
         sim  = r.get("similarity")
         asim = r.get("authors_sim")
         if (sim is not None and sim >= 0.90
                 and asim is not None and asim < 0.35):
             return "title_authors_mismatch"
+
+    # 2c. Any source flagged wrong_venue (excluding preprints).
+    for _, r in found_sources:
+        if r.get("wrong_venue"):
+            return "wrong_venue"
 
     # 3. Title+authors match but venue is wrong — a softer concern,
     #    often a preprint-vs-published confusion.  Only surface when

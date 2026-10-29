@@ -53,7 +53,13 @@ load_dotenv()
 # Connection-pooled HTTP session — every source uses this so TCP+TLS
 # handshakes amortise across the ~200 calls per paper.
 _SESSION = _requests.Session()
-_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+# Pool sized for the actual fanout: 8 refs in parallel × up to 5 sources
+# each = 40 simultaneous connections.  With pool_maxsize<40, late
+# requests block waiting for a free slot, which serialises what should
+# be parallel work.  pool_connections=40 keeps that many DNS-resolved
+# host slots warm; pool_maxsize=80 lets short bursts overshoot without
+# spawning fresh TCP+TLS handshakes.
+_adapter = HTTPAdapter(pool_connections=40, pool_maxsize=80, max_retries=0)
 _SESSION.mount("https://", _adapter)
 _SESSION.mount("http://", _adapter)
 
@@ -130,7 +136,7 @@ def _http_get_retry(
 S2_API_KEY: str | None = os.getenv("S2_API_KEY") or None
 
 _S2_BASE   = "https://api.semanticscholar.org/graph/v1"
-_S2_FIELDS = "title,authors,year,externalIds,venue"
+_S2_FIELDS = "title,authors,year,externalIds,venue,openAccessPdf,abstract"
 
 _CR_BASE    = "https://api.crossref.org/works"
 _CR_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
@@ -154,6 +160,31 @@ MATCH_THRESHOLD          = 0.90
 FUZZY_THRESHOLD          = 0.70
 AUTHOR_MATCH_THRESHOLD   = 0.35   # last-name Jaccard to confirm identity
 VENUE_MISMATCH_THRESHOLD = 0.40
+
+# wrong_authors / wrong_venue gates.
+#
+# `wrong_authors` is meant to catch the precise failure mode:
+#   "a real paper with essentially THIS title exists, the cited authors
+#    are not its authors — likely a fabricated / mis-attributed citation."
+#
+# That requires the titles to genuinely match, not just share a few
+# words.  Originally 0.50 — too low: a 0.55-0.65 tsim is usually the
+# source returning the nearest-titled paper in its index, NOT actually
+# the cited paper.  Flagging wrong_authors in that case produces false
+# positives where the right paper just isn't indexed by that source
+# (Anthropic publications on transformer-circuits.pub, NeurIPS workshop
+# papers, project pages, blog posts, ...).
+#
+# 0.85 = "titles are essentially identical, modulo punctuation and word
+# order".  Below that, the result falls through to the existing fuzzy /
+# missing classification, which is the honest answer.
+#
+# wrong_doi / wrong_arxiv_id still use the 0.50 floor independently:
+# those gates are inverted (tsim < 0.50 → flag) because the identifier
+# itself proves the source resolved a specific paper, so a wildly
+# different title means the IDENTIFIER is wrong.
+WRONG_FLAG_TITLE_FLOOR = 0.85
+WRONG_VENUE_THRESHOLD  = 0.30
 
 _ARXIV_ID_RE = re.compile(
     r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})"
@@ -389,7 +420,7 @@ def _grounded_cited_authors(extracted_authors: str, raw: str) -> str:
     return ", ".join(kept)
 
 
-def author_similarity(a1: str, a2: str) -> float:
+def author_similarity(a1: str, a2: str) -> float | None:
     """
     Author similarity tolerant of truncated lists.
 
@@ -402,6 +433,14 @@ def author_similarity(a1: str, a2: str) -> float:
     We use coverage-of-smaller when the size ratio is large (≥ 2×),
     falling back to Jaccard otherwise.  Lastnames are matched fuzzily
     (`fuzz.ratio` ≥ 85) so Müller/Mueller, OCR typos, etc. still pair.
+
+    Returns None when the available signal is too weak for a confident
+    judgement — specifically when one side has only a single surname
+    token AND no substring overlap exists with the other side.  This
+    catches the "cited as just 'OpenAI'" / "cited as just 'Google'"
+    corporate-author case where Jaccard would collapse to 0 and trigger
+    a spurious wrong_authors flag.  Callers and _composite_label treat
+    None as "no author signal" and skip author-based gating.
     """
     if not a1 or not a2:
         return 0.0
@@ -409,6 +448,23 @@ def author_similarity(a1: str, a2: str) -> float:
     ln2 = {n for n in _extract_lastnames(a2) if n}
     if not ln1 or not ln2:
         return 0.0
+
+    # Single-token-cited / corporate-author guard.
+    # When ONE side has just one surname token (e.g. "OpenAI", "Google",
+    # a single last name) and the OTHER side is a non-trivial personal-
+    # name list, the comparison is brittle:
+    #   (a) "OpenAI" cited / "OpenAI Josh Achiam, Steven Adler, ..." found
+    #       → substring matches → strong evidence of consistency → 1.0
+    #   (b) "OpenAI" cited / "J Achiam, S Adler, ..." found
+    #       → no substring → we genuinely don't know whether the
+    #         citation is right or wrong (only one cited token to compare
+    #         against) → return None so downstream treats it as
+    #         "no author signal" instead of "authors disagree".
+    a1l, a2l = a1.lower(), a2.lower()
+    if len(ln1) == 1 and len(ln2) >= 3:
+        return 1.0 if next(iter(ln1)) in a2l else None
+    if len(ln2) == 1 and len(ln1) >= 3:
+        return 1.0 if next(iter(ln2)) in a1l else None
 
     smaller, larger = (ln1, ln2) if len(ln1) <= len(ln2) else (ln2, ln1)
     consumed: set[str] = set()
@@ -487,11 +543,13 @@ def _refresh_label(result: dict[str, Any]) -> dict[str, Any]:
     """
     Recompute the composite label from a result's stored similarity fields.
     Used as a postprocess hook on cache reads so changes to
-    `_composite_label` take effect without invalidating the cache.
+    `_composite_label` (and wrong_authors / wrong_venue gating) take
+    effect without invalidating the cache.
 
-    Note: this only refreshes the LABEL — the similarity scores remain
-    whatever was stored.  For a full recompute (authors_sim and venue_sim)
-    use `refresh_result_against_ref(result, ref)` which can be called from
+    Note: this only refreshes the LABEL and the wrong_authors / wrong_venue
+    flags — the similarity scores remain whatever was stored.  For a full
+    recompute (authors_sim and venue_sim) use
+    ``refresh_result_against_ref(result, ref)`` which can be called from
     app.py where the original ref data is available.
     """
     if not isinstance(result, dict) or result.get("status") != "found":
@@ -501,12 +559,26 @@ def _refresh_label(result: dict[str, Any]) -> dict[str, Any]:
     vsim = result.get("venue_sim")
     if tsim is None:
         return result
-    new_label = _composite_label(
-        tsim, asim, result.get("found_venue", ""), vsim,
+
+    finalised = _finalize_match(
+        tsim, asim, vsim,
+        # Cached results don't retain the original extracted_venue.
+        # Without it, _finalize_match can't run the wrong_venue check
+        # (it skips when extracted_venue is empty), which is exactly
+        # what we want here: a label refresh shouldn't introduce a new
+        # flag based on partial information.
+        extracted_venue="",
+        found_venue=result.get("found_venue", "") or "",
     )
-    if new_label == result.get("label"):
-        return result
-    return {**result, "label": new_label}
+
+    out = dict(result)
+    out["label"]       = finalised["label"]
+    out["venue_label"] = finalised["venue_label"]
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    if result.get("wrong_doi") or result.get("wrong_arxiv_id"):
+        out["label"] = "mismatch"
+    return out
 
 
 def refresh_result_against_ref(
@@ -562,8 +634,11 @@ def refresh_result_against_ref(
         vsim = (venue_similarity(extracted_venue, found_venue)
                 if (extracted_venue and found_venue) else None)
 
-    new_label       = _composite_label(tsim, asim, found_venue, vsim)
-    new_venue_label = _venue_label(vsim, found_venue)
+    finalised = _finalize_match(
+        tsim, asim, vsim, extracted_venue, found_venue,
+    )
+    new_label       = finalised["label"]
+    new_venue_label = finalised["venue_label"]
 
     # Retroactive wrong-arxiv-id detection for cache entries that predate
     # the flag.  Two guards:
@@ -582,10 +657,13 @@ def refresh_result_against_ref(
         if cited_id:
             wrong_arxiv_id = cited_id
 
-    # wrong_doi / wrong_arxiv_id override the composite label — when a
-    # cited identifier resolves to a different paper, that's a stronger
-    # signal than any title-similarity score and must surface as red.
-    if result.get("wrong_doi") or wrong_arxiv_id:
+    # wrong_doi / wrong_arxiv_id / wrong_authors / wrong_venue all force
+    # mismatch — when a cited identifier resolves to a different paper,
+    # or when authors / venue clearly disagree at a high-enough title sim
+    # to be confident, that's stronger than any composite label.
+    if (result.get("wrong_doi") or wrong_arxiv_id
+            or finalised.get("wrong_authors")
+            or finalised.get("wrong_venue")):
         new_label = "mismatch"
 
     out = {
@@ -598,6 +676,14 @@ def refresh_result_against_ref(
     }
     if wrong_arxiv_id:
         out["wrong_arxiv_id"] = wrong_arxiv_id
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    else:
+        out.pop("wrong_authors", None)
+    if finalised.get("wrong_venue"):
+        out["wrong_venue"] = True
+    else:
+        out.pop("wrong_venue", None)
     return out
 
 
@@ -655,6 +741,62 @@ def _composite_label(
 
     # Tier 3: weak title (< 0.70) — couldn't find it.
     return "fuzzy"
+
+
+def _finalize_match(
+    tsim: float | None,
+    asim: float | None,
+    vsim: float | None,
+    extracted_venue: str = "",
+    found_venue: str = "",
+) -> dict[str, Any]:
+    """
+    Centralised label + wrong_authors / wrong_venue determination.
+
+    Every source result builder should splat this into the returned dict
+    in place of an inline ``_composite_label`` call.  Keeping the logic
+    in one place ensures every source — DOI fast path, title fallback,
+    URL verification — treats author and venue disagreement the same way.
+
+    Returns a dict with::
+
+        label:         "match" | "fuzzy" | "mismatch"
+        venue_label:   "match" | "fuzzy" | "mismatch" | "unknown"
+        wrong_authors: True (only present when set)
+        wrong_venue:   True (only present when set)
+
+    A flag is set when the title is high enough that the candidate is
+    plausibly the cited paper (``tsim ≥ WRONG_FLAG_TITLE_FLOOR``) AND
+    the disagreement is unambiguous.  Either flag forces ``mismatch``.
+
+    Venue is excluded for preprints — the canonical published venue
+    (e.g. ACL) doesn't match the arXiv preprint marker, but the paper
+    is still correctly identified.
+    """
+    out: dict[str, Any] = {
+        "venue_label": _venue_label(vsim, found_venue),
+    }
+
+    title_high_enough = tsim is not None and tsim >= WRONG_FLAG_TITLE_FLOOR
+
+    if (title_high_enough
+            and asim is not None
+            and asim < AUTHOR_MATCH_THRESHOLD):
+        out["wrong_authors"] = True
+
+    if (title_high_enough
+            and not _is_preprint_venue(extracted_venue)
+            and extracted_venue
+            and found_venue
+            and vsim is not None
+            and vsim < WRONG_VENUE_THRESHOLD):
+        out["wrong_venue"] = True
+
+    if out.get("wrong_authors") or out.get("wrong_venue"):
+        out["label"] = "mismatch"
+    else:
+        out["label"] = _composite_label(tsim, asim, found_venue, vsim)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +1009,7 @@ def _s2_paper_to_result(
     vsim = venue_similarity(extracted_venue, found_venue)           if (extracted_venue and found_venue) else None
     ext  = data.get("externalIds") or {}
 
+    finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
     result: dict[str, Any] = {
         "status":        "found",
         "found_title":   found_title,
@@ -874,12 +1017,16 @@ def _s2_paper_to_result(
         "found_venue":   found_venue,
         "similarity":    tsim,
         "authors_sim":   asim,
-        "label":         _composite_label(tsim, asim, found_venue, vsim),
+        "label":         finalised["label"],
         "venue_sim":     vsim,
-        "venue_label":   _venue_label(vsim, found_venue),
+        "venue_label":   finalised["venue_label"],
         "year":          data.get("year"),
         "url":           f"https://www.semanticscholar.org/paper/{data['paperId']}",
     }
+    if finalised.get("wrong_authors"):
+        result["wrong_authors"] = True
+    if finalised.get("wrong_venue"):
+        result["wrong_venue"] = True
     if ext.get("ACL"):
         acl_id = _normalize_acl_id(ext["ACL"])
         result["acl_url"] = f"https://aclanthology.org/{acl_id}"
@@ -889,6 +1036,15 @@ def _s2_paper_to_result(
         result["arxiv_url"] = f"https://arxiv.org/abs/{ext['ArXiv']}"
     if ext.get("DOI"):
         result["doi"] = ext["DOI"]
+    # Full-text pointers + abstract — consumed by the claim verifier so
+    # it can compare cited claims against the actual paper content.
+    # openAccessPdf is a {"url": "...", "status": "..."} dict.
+    oa_pdf = (data.get("openAccessPdf") or {}).get("url") or ""
+    if oa_pdf:
+        result["open_access_pdf"] = oa_pdf
+    abstract = data.get("abstract") or ""
+    if abstract:
+        result["abstract"] = abstract
     return result
 
 
@@ -1105,20 +1261,26 @@ def _lookup_dblp(ref: dict[str, Any]) -> dict[str, Any]:
         doi  = info.get("doi", "")
         url  = info.get("url", "") or (f"https://doi.org/{doi}" if doi else "")
 
-        return {
+        finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+        out: dict[str, Any] = {
             "status":        "found",
             "found_title":   found_title,
             "found_authors": found_authors,
             "found_venue":   found_venue,
             "similarity":    tsim,
             "authors_sim":   asim,
-            "label":         _composite_label(tsim, asim, found_venue, vsim),
+            "label":         finalised["label"],
             "venue_sim":     vsim,
-            "venue_label":   _venue_label(vsim, found_venue),
+            "venue_label":   finalised["venue_label"],
             "year":          info.get("year"),
             "doi":           doi,
             "url":           url,
         }
+        if finalised.get("wrong_authors"):
+            out["wrong_authors"] = True
+        if finalised.get("wrong_venue"):
+            out["wrong_venue"] = True
+        return out
 
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -1154,7 +1316,7 @@ def _lookup_openalex(ref: dict[str, Any]) -> dict[str, Any]:
                 params={
                     "search":   extracted_title,
                     "per_page": 3,
-                    "select":   "id,title,authorships,publication_year,primary_location,doi,open_access",
+                    "select":   "id,title,authorships,publication_year,primary_location,doi,open_access,abstract_inverted_index",
                     "mailto":   _OA_MAILTO,
                 },
                 headers=_OA_HEADERS,
@@ -1171,7 +1333,10 @@ def _lookup_openalex(ref: dict[str, Any]) -> dict[str, Any]:
         if data is None:
             return {"status": "not_found"}
 
-        return _oa_work_to_result(data, extracted_title, extracted_venue, extracted_authors)
+        return _oa_work_to_result(
+            data, extracted_title, extracted_venue, extracted_authors,
+            cited_doi=doi,
+        )
 
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -1182,6 +1347,7 @@ def _oa_work_to_result(
     extracted_title: str,
     extracted_venue: str,
     extracted_authors: str,
+    cited_doi: str = "",
 ) -> dict[str, Any]:
     found_title   = data.get("title") or ""
     doi_found     = (data.get("doi", "") or "").replace("https://doi.org/", "")
@@ -1196,25 +1362,72 @@ def _oa_work_to_result(
     url    = oa_url or (f"https://doi.org/{doi_found}" if doi_found else data.get("id", ""))
 
     tsim = title_similarity(extracted_title, found_title) if extracted_title else None
-    if extracted_title and tsim is not None and tsim < FUZZY_THRESHOLD:
+    # Title-search path: drop low-tsim hits early — the search just
+    # surfaced the nearest title in the index, which isn't evidence
+    # of a wrong paper.  DOI-route hits stay so we can flag wrong_doi.
+    if (not cited_doi
+            and extracted_title
+            and tsim is not None
+            and tsim < FUZZY_THRESHOLD):
         return {"status": "not_found"}
     asim = author_similarity(extracted_authors, found_authors) if (extracted_authors and found_authors) else None
     vsim = venue_similarity(extracted_venue, found_venue)      if (extracted_venue and found_venue) else None
 
-    return {
+    finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+    out: dict[str, Any] = {
         "status":        "found",
         "found_title":   found_title,
         "found_authors": found_authors,
         "found_venue":   found_venue,
         "similarity":    tsim,
         "authors_sim":   asim,
-        "label":         _composite_label(tsim, asim, found_venue, vsim),
+        "label":         finalised["label"],
         "venue_sim":     vsim,
-        "venue_label":   _venue_label(vsim, found_venue),
+        "venue_label":   finalised["venue_label"],
         "year":          data.get("publication_year"),
         "doi":           doi_found,
         "url":           url,
     }
+    # DOI route: when the resolved paper's title is wildly off, the
+    # cited DOI itself is wrong — surface that as the dominant signal.
+    if (cited_doi
+            and extracted_title
+            and tsim is not None
+            and tsim < WRONG_FLAG_TITLE_FLOOR):
+        out["wrong_doi"] = cited_doi
+        out["label"]     = "mismatch"
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    if finalised.get("wrong_venue"):
+        out["wrong_venue"] = True
+    # Full-text pointers + abstract — consumed by the claim verifier.
+    if oa_url:
+        out["open_access_pdf"] = oa_url
+    abstract_text = _oa_reconstruct_abstract(data.get("abstract_inverted_index"))
+    if abstract_text:
+        out["abstract"] = abstract_text
+    return out
+
+
+def _oa_reconstruct_abstract(inv_index: dict[str, list[int]] | None) -> str:
+    """
+    OpenAlex returns abstracts as an inverted index
+    ``{"word": [pos1, pos2, ...]}`` to sidestep publisher licensing on
+    plaintext.  Rebuild the plain text by placing each word at its
+    positions and joining.  Returns "" for missing / malformed input.
+    """
+    if not isinstance(inv_index, dict) or not inv_index:
+        return ""
+    positioned: dict[int, str] = {}
+    for word, positions in inv_index.items():
+        if not isinstance(positions, list):
+            continue
+        for p in positions:
+            if isinstance(p, int):
+                positioned[p] = word
+    if not positioned:
+        return ""
+    return " ".join(positioned[i] for i in sorted(positioned.keys()))
 
 
 def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
@@ -1250,7 +1463,7 @@ def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
         params = {
             "filter":   f"doi:{doi_filter}",
             "per_page": 50,
-            "select":   "id,title,authorships,publication_year,primary_location,doi,open_access",
+            "select":   "id,title,authorships,publication_year,primary_location,doi,open_access,abstract_inverted_index",
             "mailto":   _OA_MAILTO,
         }
         try:
@@ -1273,6 +1486,7 @@ def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
                 ref.get("title", ""),
                 ref.get("venue", ""),
                 ref.get("authors", ""),
+                cited_doi=doi,
             )
             cache.set("openalex", key, result)
     return len(pending)
@@ -1348,9 +1562,13 @@ def _arxiv_batch_prewarm(refs: list[dict[str, Any]]) -> int:
             if (tsim is not None and tsim < 0.50 and extracted_title
                     and cited_id):
                 wrong_arxiv_id = cited_id
+
+            # arXiv carries no venue field — pass vsim=None and skip the
+            # venue gate.  Author gate still applies.
+            finalised = _finalize_match(tsim, asim, None, "", "")
+            label = finalised["label"] if tsim is not None else None
+            if wrong_arxiv_id:
                 label = "mismatch"
-            else:
-                label = _composite_label(tsim, asim) if tsim is not None else None
 
             entry = {
                 "status":        "found",
@@ -1366,6 +1584,8 @@ def _arxiv_batch_prewarm(refs: list[dict[str, Any]]) -> int:
             }
             if wrong_arxiv_id:
                 entry["wrong_arxiv_id"] = wrong_arxiv_id
+            if finalised.get("wrong_authors"):
+                entry["wrong_authors"] = True
             cache.set("arxiv", key, entry)
     return len(pending)
 
@@ -1415,9 +1635,13 @@ def _lookup_arxiv(ref: dict[str, Any]) -> dict[str, Any]:
         if (tsim is not None and tsim < 0.50 and extracted_title
                 and cited_id):
             wrong_arxiv_id = cited_id
+
+        # arXiv carries no venue field — pass vsim=None and skip the
+        # venue gate.  Author gate still applies.
+        finalised = _finalize_match(tsim, asim, None, "", "")
+        label = finalised["label"] if tsim is not None else None
+        if wrong_arxiv_id:
             label = "mismatch"
-        else:
-            label = _composite_label(tsim, asim) if tsim is not None else None
 
         result = {
             "status":        "found",
@@ -1433,6 +1657,8 @@ def _lookup_arxiv(ref: dict[str, Any]) -> dict[str, Any]:
         }
         if wrong_arxiv_id:
             result["wrong_arxiv_id"] = wrong_arxiv_id
+        if finalised.get("wrong_authors"):
+            result["wrong_authors"] = True
         return result
 
     except Exception as exc:
@@ -1495,20 +1721,26 @@ def _crossref_msg_to_result(
     asim = author_similarity(extracted_authors, found_authors)  if (extracted_authors and found_authors) else None
     vsim = venue_similarity(extracted_venue, found_venue)       if (extracted_venue and found_venue) else None
 
-    return {
+    finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+    out: dict[str, Any] = {
         "status":        "found",
         "found_title":   found_title,
         "found_authors": found_authors,
         "found_venue":   found_venue,
         "similarity":    tsim,
         "authors_sim":   asim,
-        "label":         _composite_label(tsim, asim, found_venue, vsim),
+        "label":         finalised["label"],
         "venue_sim":     vsim,
-        "venue_label":   _venue_label(vsim, found_venue),
+        "venue_label":   finalised["venue_label"],
         "year":          year,
         "doi":           doi_val,
         "url":           f"https://doi.org/{doi_val}",
     }
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    if finalised.get("wrong_venue"):
+        out["wrong_venue"] = True
+    return out
 
 
 def _crossref_batch_prewarm(refs: list[dict[str, Any]]) -> int:
@@ -1590,7 +1822,17 @@ def _lookup_crossref(ref: dict[str, Any]) -> dict[str, Any]:
             r = _http_get_retry(f"{_CR_BASE}/{doi}", headers=_CR_HEADERS, timeout=8)
             if r.status_code == 200:
                 msg = r.json().get("message", {})
-                return _build(msg, msg.get("DOI", doi))
+                result = _build(msg, msg.get("DOI", doi))
+                # Wrong-DOI detection: when the resolved paper's title is
+                # wildly off from the cited title, the user's DOI itself
+                # is wrong — surface that as the dominant signal.  Mirrors
+                # the same gate in _lookup_doi_org / _lookup_semantic_scholar.
+                if (extracted_title and result.get("found_title")
+                        and result.get("similarity") is not None
+                        and result["similarity"] < WRONG_FLAG_TITLE_FLOOR):
+                    result["wrong_doi"] = doi
+                    result["label"]     = "mismatch"
+                return result
             if r.status_code == 404:
                 # Crossref says this DOI doesn't exist → likely fabricated.
                 # Don't fall back to title search; a title-search hit on a
@@ -1682,19 +1924,24 @@ def _lookup_openlibrary(ref: dict[str, Any]) -> dict[str, Any]:
         key  = best.get("key", "")
         url  = f"https://openlibrary.org{key}" if key else ""
 
-        return {
+        # OL has no venue field — pass vsim=None and skip the venue gate.
+        finalised = _finalize_match(tsim, asim, None, "", "")
+        out: dict[str, Any] = {
             "status":        "found",
             "found_title":   found_title,
             "found_authors": found_authors,
             "found_venue":   "",          # OL has publishers, not venues
             "similarity":    tsim,
             "authors_sim":   asim,
-            "label":         _composite_label(tsim, asim),
+            "label":         finalised["label"],
             "venue_sim":     None,
             "venue_label":   "unknown",   # don't compare publisher to conference
             "year":          year,
             "url":           url,
         }
+        if finalised.get("wrong_authors"):
+            out["wrong_authors"] = True
+        return out
 
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -1802,19 +2049,25 @@ def _lookup_scholarly(ref: dict[str, Any]) -> dict[str, Any]:
     asim = author_similarity(extracted_authors, found_authors) if (extracted_authors and found_authors) else None
     vsim = venue_similarity(extracted_venue, found_venue)      if (extracted_venue and found_venue) else None
 
-    return {
+    finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+    out: dict[str, Any] = {
         "status":        "found",
         "found_title":   found_title,
         "found_authors": found_authors,
         "found_venue":   found_venue,
         "similarity":    tsim,
         "authors_sim":   asim,
-        "label":         _composite_label(tsim, asim, found_venue, vsim),
+        "label":         finalised["label"],
         "venue_sim":     vsim,
-        "venue_label":   _venue_label(vsim, found_venue),
+        "venue_label":   finalised["venue_label"],
         "year":          year,
         "url":           pub_url,
     }
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    if finalised.get("wrong_venue"):
+        out["wrong_venue"] = True
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1993,24 +2246,254 @@ def _lookup_core(ref: dict[str, Any]) -> dict[str, Any]:
         vsim = (venue_similarity(extracted_venue, found_venue)
                 if (extracted_venue and found_venue) else None)
 
-        return {
+        finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+        out: dict[str, Any] = {
             "status":        "found",
             "found_title":   found_title,
             "found_authors": found_authors,
             "found_venue":   found_venue,
             "similarity":    tsim,
             "authors_sim":   asim,
-            "label":         _composite_label(tsim, asim, found_venue, vsim),
+            "label":         finalised["label"],
             "venue_sim":     vsim,
-            "venue_label":   _venue_label(vsim, found_venue),
+            "venue_label":   finalised["venue_label"],
             "year":          (best.get("yearPublished") or
                               (best.get("publishedDate") or "")[:4] or ""),
             "doi":           doi,
             "url":           url,
         }
+        if finalised.get("wrong_authors"):
+            out["wrong_authors"] = True
+        if finalised.get("wrong_venue"):
+            out["wrong_venue"] = True
+        return out
 
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:120]}
+
+
+# ---------------------------------------------------------------------------
+# URL verification  (any http(s) URL in the citation that isn't already
+# routed by a more authoritative source)
+# ---------------------------------------------------------------------------
+#
+# Many refs carry a URL that bypasses our identifier routes — openreview
+# pages, papers.nips.cc, proceedings.mlr.press, IEEE Xplore, ACM Digital
+# Library, project homepages, GitHub READMEs, blog posts.  Without a
+# DOI / arxiv ID those URLs aren't reached by any of the existing sources;
+# the LLM repair pass dutifully copies them into ref["url"] and they sit
+# there unverified.
+#
+# This source fetches the URL, extracts the page's authoritative metadata
+# (Google Scholar's `citation_*` meta tags — the de-facto cross-publisher
+# standard, used by openreview, ACM, IEEE, MLR proceedings, NeurIPS, most
+# institutional repositories), falls back to `og:title` and `<title>`, and
+# scores the result against the cited title / authors / venue exactly like
+# the other sources.
+#
+# Skipped when:
+#   - the URL is doi.org / arxiv / one of the indexed registries (those
+#     routes are already authoritative)
+#   - the URL fails to resolve (4xx, 5xx, timeout) — surfaced as `error`
+#     so the orchestrator can decide whether to escalate elsewhere
+#   - the response isn't HTML (PDF / image / JSON) — we'd have to OCR or
+#     parse, well outside the scope of a verification check
+
+_URL_ROUTE_COVERED_RE = re.compile(
+    r"(?:^|//|\.)(?:doi\.org|dx\.doi\.org|arxiv\.org|"
+    r"semanticscholar\.org|openalex\.org|dblp\.org|aclanthology\.org)/",
+    re.IGNORECASE,
+)
+_HTTP_URL_RE = re.compile(r'https?://[^\s<>"\)\]\}\\,]+', re.IGNORECASE)
+
+# Google Scholar's de-facto citation_* meta tag schema.  Captures
+# repeated meta tags (citation_author appears once per author on most
+# publisher pages).  Tolerant of attribute order — content= can come
+# before or after name=, and there can be extra whitespace.
+_HTML_META_TAG_RE = re.compile(
+    r'<meta\b[^>]*>',
+    re.IGNORECASE,
+)
+_META_NAME_RE    = re.compile(r'\bname\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_META_PROP_RE    = re.compile(r'\bproperty\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_META_CONTENT_RE = re.compile(r'\bcontent\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+_HTML_TITLE_RE   = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+# Strip common " | Site Name" / " — Site Name" suffixes from <title>.
+_TITLE_SUFFIX_RE = re.compile(r"\s*[|–—\-:]\s*[^|–—\-]{3,}\s*$")
+
+
+def _extract_ref_url(ref: dict[str, Any]) -> str | None:
+    """Return the best candidate http(s) URL for this ref, or None."""
+    url = (ref.get("url", "") or "").strip()
+    if url.startswith(("http://", "https://")):
+        return url
+    raw = _ref_raw_segment(ref)
+    if not raw:
+        raw = ref.get("raw", "") or ""
+    m = _HTTP_URL_RE.search(raw)
+    if m:
+        return m.group(0).rstrip(".,);]'\"")
+    return None
+
+
+def _parse_html_metadata(html_text: str) -> dict[str, Any]:
+    """
+    Extract title / authors / venue / year / doi from HTML.
+
+    Order of preference:
+      1. ``<meta name="citation_*">`` (Google Scholar tags — the most
+         reliable cross-publisher schema; openreview, ACM, IEEE, MLR
+         proceedings, NeurIPS, most institutional repositories all
+         expose them).
+      2. ``<meta property="og:title">`` — Open Graph fallback for sites
+         without citation tags (most blog posts, project pages).
+      3. ``<title>`` — last resort.  Aggressively trimmed: most CMSes
+         suffix `" | Site Name"` which would tank the title similarity.
+    """
+    meta: dict[str, Any] = {}
+    authors: list[str] = []
+
+    for tag in _HTML_META_TAG_RE.findall(html_text):
+        name_m = _META_NAME_RE.search(tag) or _META_PROP_RE.search(tag)
+        cont_m = _META_CONTENT_RE.search(tag)
+        if not name_m or not cont_m:
+            continue
+        key = name_m.group(1).strip().lower()
+        val = _html_unescape(cont_m.group(1)).strip()
+        if not val:
+            continue
+
+        if key == "citation_title":
+            meta.setdefault("title", val)
+        elif key == "citation_author":
+            authors.append(val)
+        elif key in ("citation_journal_title", "citation_conference_title",
+                     "citation_inbook_title", "citation_book_title"):
+            meta.setdefault("venue", val)
+        elif key == "citation_doi":
+            meta.setdefault("doi", val)
+        elif key == "citation_publication_date":
+            year = val[:4]
+            if year.isdigit():
+                meta.setdefault("year", year)
+        elif key in ("og:title", "twitter:title") and "title" not in meta:
+            # Fallback only — don't overwrite a citation_title.  Trim
+            # site-suffix here too in case the OG tag carries one.
+            t = _TITLE_SUFFIX_RE.sub("", val).strip()
+            if t:
+                meta.setdefault("title", t)
+
+    if authors:
+        meta["authors"] = "; ".join(authors)
+
+    if "title" not in meta:
+        m = _HTML_TITLE_RE.search(html_text)
+        if m:
+            t = _html_unescape(m.group(1)).strip()
+            t = re.sub(r"\s+", " ", t)
+            t = _TITLE_SUFFIX_RE.sub("", t).strip()
+            if t:
+                meta["title"] = t
+
+    return meta
+
+
+# Lazy import to avoid pulling html at module-import time for callers
+# (like the benchmark scripts) that never touch URL verification.
+def _html_unescape(s: str) -> str:
+    import html as _h
+    return _h.unescape(s)
+
+
+_URL_VERIFY_HEADERS = {
+    "User-Agent": f"ARES/1.0 (mailto:{_OA_MAILTO})",
+    "Accept":     "text/html,application/xhtml+xml",
+}
+
+
+@_cached("url_verify", postprocess=_refresh_label)
+def _lookup_url(ref: dict[str, Any]) -> dict[str, Any]:
+    """
+    Fetch an arbitrary URL from a citation, parse its HTML metadata, and
+    score it against the cited title / authors / venue.
+
+    Mirrors the contract of every other source: returns a dict with
+    ``status`` in {found, not_found, skipped, error} and (when found) the
+    standard ``similarity`` / ``authors_sim`` / ``venue_sim`` / ``label``
+    fields plus the ``wrong_authors`` / ``wrong_venue`` flags.
+    """
+    url = _extract_ref_url(ref)
+    if not url:
+        return {"status": "skipped"}
+    # Routes that other sources already handle authoritatively — don't
+    # double-fetch (and don't produce a noisy lower-quality verification
+    # competing with the canonical S2/Crossref result).
+    if _URL_ROUTE_COVERED_RE.search(url):
+        return {"status": "skipped"}
+
+    extracted_title   = ref.get("title", "") or ""
+    extracted_venue   = ref.get("venue", "") or ""
+    extracted_authors = ref.get("authors", "") or ""
+
+    try:
+        r = _SESSION.get(
+            url,
+            headers=_URL_VERIFY_HEADERS,
+            timeout=10,
+            allow_redirects=True,
+        )
+        _bump_http_count(url)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:120]}
+
+    if not r.ok:
+        # 4xx / 5xx — could be paywall, dead link, or fabricated URL.
+        # Surface as error so the orchestrator can escalate; the caller
+        # decides whether to treat a 404 here as a "fabricated URL" signal.
+        return {"status": "error", "error": f"HTTP {r.status_code}", "url": r.url}
+
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "html" not in ctype and "xml" not in ctype:
+        # PDF / image / JSON — page exists but we can't extract a
+        # paper title from it.  Treat as resolved-but-uninformative.
+        return {"status": "not_found", "url": r.url}
+
+    # Cap HTML at 256 KB — the head of any modern paper page carries the
+    # citation tags; trailing body / scripts would inflate cache size
+    # without adding signal.
+    html_text = r.text[:262144]
+    meta = _parse_html_metadata(html_text)
+    if not meta.get("title"):
+        return {"status": "not_found", "url": r.url}
+
+    found_title   = meta["title"]
+    found_authors = meta.get("authors", "")
+    found_venue   = meta.get("venue", "")
+
+    tsim = title_similarity(extracted_title, found_title)      if (extracted_title and found_title) else None
+    asim = author_similarity(extracted_authors, found_authors) if (extracted_authors and found_authors) else None
+    vsim = venue_similarity(extracted_venue, found_venue)      if (extracted_venue and found_venue) else None
+
+    finalised = _finalize_match(tsim, asim, vsim, extracted_venue, found_venue)
+    out: dict[str, Any] = {
+        "status":        "found",
+        "found_title":   found_title,
+        "found_authors": found_authors,
+        "found_venue":   found_venue,
+        "similarity":    tsim,
+        "authors_sim":   asim,
+        "label":         finalised["label"],
+        "venue_sim":     vsim,
+        "venue_label":   finalised["venue_label"],
+        "year":          meta.get("year", ""),
+        "doi":           meta.get("doi", ""),
+        "url":           r.url,    # final URL after redirects — useful for the UI
+    }
+    if finalised.get("wrong_authors"):
+        out["wrong_authors"] = True
+    if finalised.get("wrong_venue"):
+        out["wrong_venue"] = True
+    return out
 
 
 _LOOKUP_FNS = {
@@ -2020,6 +2503,7 @@ _LOOKUP_FNS = {
     "openalex":         _lookup_openalex,
     "arxiv":            _lookup_arxiv,
     "crossref":         _lookup_crossref,
+    "url_verify":       _lookup_url,
 }
 # Note: `core` is intentionally absent from _LOOKUP_FNS so the default
 # router / escalation never picks it up.  It IS reachable via direct

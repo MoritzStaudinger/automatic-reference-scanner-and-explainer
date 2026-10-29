@@ -141,6 +141,7 @@ div[data-testid="stButton"] > button[kind="primary"] {
 # automatically, so this functions as a normal multi-page nav.
 with st.sidebar:
     st.page_link("app.py",          label="Validate a PDF")
+    st.page_link("pages/API.py",    label="API")
     st.page_link("pages/About.py",  label="About")
     st.divider()
 
@@ -244,6 +245,13 @@ with st.sidebar:
             "maximum coverage."
         ),
     )
+    # Claim verification lives in a post-lookup two-step flow:
+    #   1. run standard lookup to see which refs match / mismatch / miss
+    #   2. AFTER results are in, offer a button to verify claims for the
+    #      matched refs only (opt-in, slow, LLM-backed)
+    # This checkbox is retained for API-callers who want the old "run
+    # verification as part of the initial pass" behaviour, but the UI
+    # button is the recommended way in.
     show_debug = st.checkbox("Show raw markdown (debug)", value=False)
 
 # ---------------------------------------------------------------------------
@@ -294,10 +302,121 @@ def run_llm_enhancement(refs_json: str, backend: str, model: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def run_highlighter(pdf_bytes: bytes, refs_json: str, statuses_json: str = "[]"):
+def run_highlighter(
+    pdf_bytes: bytes,
+    refs_json: str,
+    statuses_json: str = "[]",
+    bake_color: bool = True,
+):
     refs = json.loads(refs_json)
     statuses = json.loads(statuses_json) or None
-    return highlight_references(pdf_bytes, refs, statuses)
+    return highlight_references(pdf_bytes, refs, statuses, bake_color=bake_color)
+
+
+def _run_claim_verification(
+    pdf_bytes:      bytes,
+    refs:           list[dict],
+    lookup_results: list,
+    depth:          str = "abstract",
+    ref_indices:    list[int] | None = None,
+) -> list[dict]:
+    """
+    Extract inline citations from the citing PDF's body, fetch each
+    cited paper's abstract (fast, default) or full text (slow, opt-in),
+    and LLM-verdict every claim.  Wraps the same pipeline stage the
+    API uses, so behaviour is identical.
+
+    Parameters
+    ----------
+    depth : "abstract" | "fulltext"
+        See ``PipelineOptions.verify_depth``.
+    ref_indices : list[int] | None
+        When set, only verify claims that cite refs in this list.  Used
+        by the per-ref "Check with full text" escalation button — the
+        first fast-path run already produced verdicts for every claim;
+        this second run rescores a handful of them against the full paper.
+    """
+    from dataclasses import asdict as _asdict
+    from pipeline import PipelineOptions, _verify_claims_stage
+    label = ("Verifying claims (fast, abstract-only) …"
+             if depth == "abstract"
+             else "Verifying claims against full paper text …")
+    with st.status(label, expanded=True) as _cs:
+        st.write("Extracting inline citations …")
+        t0 = _time.time()
+        try:
+            verdicts = _verify_claims_stage(
+                pdf_bytes, refs, lookup_results,
+                PipelineOptions(verify_claims=True, verify_depth=depth,
+                                verify_refs=ref_indices))
+        except Exception as exc:
+            _cs.update(label=f"Claim verification failed: {exc}",
+                       state="error", expanded=True)
+            return []
+        elapsed = _time.time() - t0
+
+        n_sup = sum(1 for v in verdicts if v.verdict == "supported")
+        n_con = sum(1 for v in verdicts if v.verdict == "contradicted")
+        n_ambi= sum(1 for v in verdicts if v.verdict == "ambiguous")
+        n_na  = sum(1 for v in verdicts if v.verdict == "not_addressed")
+        n_ns  = sum(1 for v in verdicts if v.verdict == "no_source")
+        n_err = sum(1 for v in verdicts if v.verdict == "error")
+        st.write(
+            f"   Checked **{len(verdicts)}** claim{'s' if len(verdicts)!=1 else ''} "
+            f"in {elapsed:.1f}s — **{n_sup}** supported · **{n_con}** contradicted "
+            f"· **{n_ambi}** ambiguous · **{n_na}** not-addressed · "
+            f"**{n_ns}** no-source · **{n_err}** error"
+        )
+        _cs.update(label=f"Verified {len(verdicts)} claim(s) in {elapsed:.1f}s",
+                   state="complete", expanded=False)
+    return [_asdict(v) for v in verdicts]
+
+
+@st.cache_data(show_spinner=False)
+def _auto_add_orphans(orphans_json: str) -> str:
+    """
+    Take the orphan-block list produced by the highlighter, filter to
+    high-confidence entries, send them as a batch to GROBID's
+    /processCitationList, and return new ref dicts ready to splice into
+    the parsed-refs list.  The returned refs carry rect/page (from the
+    orphan block) and ``_auto_added=True`` so the UI can badge them.
+
+    Cached on the orphan list — silent reruns don't re-hit GROBID.
+    """
+    orphans = json.loads(orphans_json)
+    high = [o for o in orphans if (o or {}).get("confidence") == "high"]
+    if not high:
+        return json.dumps([])
+    from parsers import _grobid_process_citation_list
+    try:
+        parsed = _grobid_process_citation_list([o["text"] for o in high])
+    except Exception:
+        # GROBID unreachable or rejected — silently no-op rather than
+        # nuking the whole processing pipeline.  The user can still see
+        # the orphans in the manual-add panel as a fallback.
+        return json.dumps([])
+
+    out = []
+    for orph, p in zip(high, parsed):
+        if not p:
+            continue
+        new_ref = dict(p)
+        new_ref["_auto_added"] = True
+        new_ref["raw"]    = orph["text"]
+        new_ref["page"]   = orph["page"]
+        new_ref["rect"]   = orph["rect"]
+        new_ref["found"]  = True
+        new_ref["status"] = "pending"
+        out.append(new_ref)
+    return json.dumps(out)
+
+
+# Decide once, at module load, which PDF viewer we're using.  Both the
+# highlighter call below and the col_pdf block downstream branch on
+# this — having it in one place keeps them aligned (otherwise a status
+# change in one but not the other would silently desync the bake/overlay
+# coupling and bring back the "different shade of yellow" bug).
+_USE_PDF_SELECTOR = os.getenv("ARES_PDF_SELECTOR", "1") != "0"
 
 
 # --- Session state for user-added references -----------------------------
@@ -307,6 +426,26 @@ file_id = (uploaded_file.name, len(pdf_bytes))
 if st.session_state.get("manual_refs_file") != file_id:
     st.session_state.manual_refs = []
     st.session_state.manual_refs_file = file_id
+
+
+def _append_manual_ref(new_ref: dict) -> None:
+    """
+    Add a user-supplied reference WITHOUT wiping existing lookup results.
+
+    Appends a placeholder None slot to ``lookup_results`` so it stays
+    index-aligned with the (now extended) ref list; the next "Look up
+    references" run only fills pending slots, and the audit cards for
+    the new ref simply show "pending" until then.
+
+    NOTE: must be defined ABOVE the sidebar block — the sidebar's "Add
+    to references" button calls this at script-execution time, before
+    any function bodies further down would otherwise have been parsed.
+    """
+    st.session_state.manual_refs.append(new_ref)
+    lr = st.session_state.get("lookup_results")
+    if isinstance(lr, list):
+        lr.append(None)   # placeholder; _overall_status(None) → "pending"
+
 
 # --- Sidebar: add a reference the parser missed --------------------------
 # Keep the expander open whenever there are manual refs to manage.  Without
@@ -327,6 +466,7 @@ with st.sidebar:
         )
         if st.button("Add to references", disabled=not manual_text.strip()):
             from parsers import _grobid_process_citation_list
+            import requests as _rq
             try:
                 parsed = _grobid_process_citation_list([manual_text.strip()])
                 if parsed:
@@ -337,10 +477,25 @@ with st.sidebar:
                     st.success(
                         f"Added: {(new_ref.get('title') or manual_text.strip())[:70]}"
                     )
+                    # Clear the input so the next add doesn't accidentally
+                    # re-submit the same citation.  Must `del` (not assign)
+                    # — Streamlit forbids writing to a widget's key after
+                    # it's rendered, but deleting it lets the next rerun
+                    # re-initialise with the default (empty) value.
+                    st.session_state.pop("manual_ref_input", None)
                     st.rerun()
                 else:
                     st.error("GROBID couldn't structure that as a citation. "
                              "Check it has author + year + title.")
+            except (_rq.exceptions.ConnectionError,
+                    _rq.exceptions.Timeout) as exc:
+                # Most common deployment failure: GROBID container is down
+                # or unreachable.  Friendly message instead of a raw
+                # exception repr.
+                st.error(
+                    "GROBID is unreachable — check that the grobid service "
+                    "is running and reachable at the configured GROBID_URL."
+                )
             except Exception as e:
                 st.error(f"Couldn't parse: {e}")
 
@@ -494,11 +649,23 @@ def _silent_process():
         references = json.loads(refs_json)
     references, _ = dedupe_references(references)
     annotated_pdf, parsed_enriched, orphan_blocks = run_highlighter(
-        pdf_bytes, json.dumps(references))
-    # Manual refs ride along with their own rects — no PDF re-bake.
-    enriched_refs = list(parsed_enriched) + _attach_manual_rects(
+        pdf_bytes, json.dumps(references),
+        bake_color=not _USE_PDF_SELECTOR)
+    # Auto-add high-confidence orphans the parser missed: these are
+    # text blocks in the bib region that look unambiguously like
+    # citations (author-start, ref punctuation, DOI/URL/et-al/commas).
+    # Low-confidence orphans stay in `orphan_blocks` so the UI's
+    # "possible missed references" panel still surfaces them for
+    # manual review.
+    auto_added = json.loads(_auto_add_orphans(json.dumps(orphan_blocks)))
+    orphan_blocks = [o for o in orphan_blocks
+                     if (o or {}).get("confidence") != "high"]
+    # Order:  parsed refs  →  auto-added orphans  →  manual refs.
+    # Manual refs must stay at the tail (the +Add flow and the manual-
+    # remove offset arithmetic both rely on it).
+    enriched_refs = list(parsed_enriched) + list(auto_added) + _attach_manual_rects(
         st.session_state.manual_refs)
-    references = list(references) + list(st.session_state.manual_refs)
+    references = list(references) + list(auto_added) + list(st.session_state.manual_refs)
     return references, debug_md, annotated_pdf, enriched_refs, orphan_blocks
 
 
@@ -553,12 +720,27 @@ else:
         # Stage 3 — Locate parsed refs in PDF + initial highlight
         _t = _time.time()
         st.write("**Locating references in the PDF** …")
-        annotated_pdf, parsed_enriched, orphan_blocks = run_highlighter(pdf_bytes, json.dumps(references))
+        annotated_pdf, parsed_enriched, orphan_blocks = run_highlighter(
+            pdf_bytes, json.dumps(references),
+            bake_color=not _USE_PDF_SELECTOR)
 
-        # Manual refs ride along with rects from the original PDF
-        # selection event — no PDF re-bake needed.
-        enriched_refs = list(parsed_enriched) + _attach_manual_rects(
+        # Auto-add high-confidence orphans (parser missed them but the
+        # text in the bib region looks unambiguously like a citation).
+        # Low-confidence ones stay in orphan_blocks for manual triage.
+        auto_added = json.loads(_auto_add_orphans(json.dumps(orphan_blocks)))
+        orphan_blocks = [o for o in orphan_blocks
+                         if (o or {}).get("confidence") != "high"]
+        if auto_added:
+            st.write(f"   Auto-detected **{len(auto_added)}** reference"
+                     f"{'s' if len(auto_added) != 1 else ''} the parser missed "
+                     f"in the bibliography region")
+
+        # Order:  parsed  →  auto-added orphans  →  manual refs.
+        # Manual refs must stay at the tail (the +Add flow + manual-
+        # remove offset arithmetic both rely on it).
+        enriched_refs = list(parsed_enriched) + list(auto_added) + _attach_manual_rects(
             st.session_state.manual_refs)
+        references = list(references) + list(auto_added)
         if st.session_state.manual_refs:
             n_manual = len(st.session_state.manual_refs)
             references = list(references) + list(st.session_state.manual_refs)
@@ -566,8 +748,8 @@ else:
         n_found = sum(1 for e in enriched_refs if e.get("found"))
         st.write(f"   Located **{n_found} / {len(enriched_refs)}** in {_time.time() - _t:.1f}s")
         if orphan_blocks:
-            st.write(f"   Found **{len(orphan_blocks)}** possible missed reference(s) "
-                     f"in the bibliography region — see panel below the PDF")
+            st.write(f"   Found **{len(orphan_blocks)}** further possible reference(s) "
+                     f"the parser missed — see panel below the PDF for manual review")
 
         _stage.update(
             label=f"Ready — {len(references)} refs, {n_found} located in PDF "
@@ -589,23 +771,6 @@ if st.session_state.get("lookup_file") != file_id:
 if "selected_ref" not in st.session_state:
     st.session_state.selected_ref = None
 
-
-def _append_manual_ref(new_ref: dict) -> None:
-    """
-    Add a user-supplied reference WITHOUT wiping existing lookup results.
-
-    The previous behaviour set `lookup_results = None` which forced the
-    user to re-run every API call after each manual add — extremely
-    expensive and visually disruptive.  Instead we append a placeholder
-    None slot so `lookup_results` stays index-aligned with the (now
-    extended) ref list; the next "Look up references" run only fills
-    pending slots, and the audit cards for the new ref simply show
-    "pending" until then.
-    """
-    st.session_state.manual_refs.append(new_ref)
-    lr = st.session_state.get("lookup_results")
-    if isinstance(lr, list):
-        lr.append(None)   # placeholder; _overall_status(None) → "pending"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -670,7 +835,7 @@ def _status_reason(lr: dict | None) -> str:
         nice = {"doi_org": "doi.org", "semantic_scholar": "Semantic Scholar", "openalex": "OpenAlex",
                 "dblp": "DBLP", "crossref": "Crossref", "arxiv": "arXiv",
                 "scholarly": "Google Scholar", "acl_anthology": "ACL",
-                "openlibrary": "Open Library"}
+                "openlibrary": "Open Library", "url_verify": "Source URL"}
         names = [nice.get(s, s) for s in matches[:2]]
         return f"confirmed by {', '.join(names)}"
 
@@ -682,7 +847,15 @@ def _status_reason(lr: dict | None) -> str:
                 return "cited arXiv ID points to a different paper"
             if r.get("wrong_doi"):
                 return "cited DOI points to a different paper"
-        # Otherwise it's a title/author disagreement
+        # Authors disagreed at any title floor
+        for src, r in mismatches:
+            if r.get("wrong_authors"):
+                return "title matches but the cited authors don't"
+        # Venue disagreed (excluding preprints) at any title floor
+        for src, r in mismatches:
+            if r.get("wrong_venue"):
+                return "title matches but the cited venue doesn't"
+        # Legacy tier-1 catch (kept for cached results predating the flag)
         for src, r in mismatches:
             asim = r.get("authors_sim")
             sim  = r.get("similarity")
@@ -708,6 +881,7 @@ def _lookup_rows_html(lr: dict, extracted_title: str | None, extracted_venue: st
         ("arXiv",            "arxiv"),
         ("Open Library",     "openlibrary"),
         ("Google Scholar",   "scholarly"),
+        ("Source URL",       "url_verify"),
     ]:
         r = lr.get(key, {})
         status = r.get("status", "")
@@ -752,17 +926,22 @@ def _lookup_rows_html(lr: dict, extracted_title: str | None, extracted_venue: st
             )
 
         # Authors disagree — the most reliable "wrong paper" signal when
-        # title similarity is high.  Surfacing the source's actual author
-        # list tells the user *why* the match is yellow despite a 100%
-        # title hit (classic fabrication / mis-attribution tell).
+        # the source has plausibly returned the cited paper.  Show whenever
+        # _finalize_match flagged wrong_authors, or fall back to the old
+        # tier-1-only heuristic for cached results predating the flag.
         asim = r.get("authors_sim")
         fa   = r.get("found_authors", "")
-        if (asim is not None and asim < 0.35 and fa
-                and sim is not None and sim >= 0.70):
+        author_disagree = (
+            r.get("wrong_authors")
+            or (asim is not None and asim < 0.35 and fa
+                and sim is not None and sim >= 0.70)
+        )
+        if author_disagree and fa:
             rows.append(
                 f'<li style="margin-left:14px;opacity:.85"><b>Authors:</b> '
                 f'<i>{_html.escape(fa)}</i> '
-                f'({asim:.0%} overlap with cited authors)</li>'
+                + (f"({asim:.0%} overlap with cited authors)" if asim is not None else "(disagree)")
+                + "</li>"
             )
 
         # Venue check — only when we have both sides AND the cited
@@ -812,6 +991,232 @@ def _fields_html(ref: dict) -> str:
     return f'<div class="ref-fields">{cells}</div>'
 
 
+_CLAIM_VERDICT_COLORS = {
+    # (bg, fg, label)
+    "supported":     ("#e6f7ec", "#1b7f3e", "supported"),
+    "contradicted":  ("#fdecea", "#b3261e", "contradicted"),
+    "not_addressed": ("#f1f3f5", "#495057", "not addressed"),
+    "ambiguous":     ("#fff8e1", "#8a6d1d", "ambiguous"),
+    "no_source":     ("#eef2ff", "#3f51b5", "no full-text available"),
+    "error":         ("#f8f9fa", "#868e96", "verification error"),
+}
+
+
+def _claim_verifications_html(ref_index: int) -> str:
+    """
+    Render per-claim verdicts attached to ``refs[ref_index]``.  Reads from
+    st.session_state.claim_verifications (populated after opt-in verify
+    step).  Returns "" when the block is empty or verification hasn't
+    been run.
+    """
+    verdicts = st.session_state.get("claim_verifications") or []
+    mine = [v for v in verdicts if v.get("cited_ref_index") == ref_index]
+    if not mine:
+        return ""
+    rows = []
+    for v in mine:
+        verdict = v.get("verdict") or "error"
+        bg, fg, label = _CLAIM_VERDICT_COLORS.get(
+            verdict, _CLAIM_VERDICT_COLORS["error"])
+        badge = (
+            f'<span style="background:{bg};color:{fg};padding:2px 8px;'
+            f'border-radius:3px;font-size:0.82em;font-weight:600;">'
+            f'{label}</span>'
+        )
+        confidence = (v.get("confidence") or "").strip()
+        conf_note = (f" <small style=\"opacity:0.65;\">"
+                     f"({_html.escape(confidence)} confidence)</small>"
+                     if confidence and verdict != "no_source" else "")
+        # Abstract-only badge — the user should discount these more heavily
+        # than a full-paper verdict.
+        src = v.get("source", "")
+        src_note = ""
+        if v.get("is_abstract_fallback"):
+            src_note = (' <small style="background:#f1f3f5;color:#495057;'
+                        'padding:1px 5px;border-radius:3px;font-size:0.72em;">'
+                        'abstract only</small>')
+        elif src:
+            src_note = (f' <small style="opacity:0.55;">via {_html.escape(src)}</small>')
+
+        claim_text = _html.escape((v.get("claim_text") or "")[:400])
+        evidence = _html.escape((v.get("evidence_passage") or "")[:300])
+        explanation = _html.escape((v.get("explanation") or "")[:300])
+
+        evidence_block = ""
+        if evidence:
+            evidence_block = (
+                f'<div style="margin:4px 0 0 12px;padding:6px 10px;'
+                f'border-left:3px solid #adb5bd;background:#fafbfc;'
+                f'font-style:italic;color:#495057;font-size:0.9em;">'
+                f'"{evidence}"</div>'
+            )
+        explanation_block = ""
+        if explanation:
+            explanation_block = (
+                f'<div style="margin:3px 0 0 12px;font-size:0.85em;'
+                f'color:#6c757d;">{explanation}</div>'
+            )
+        rows.append(
+            f'<li style="margin-bottom:10px;">'
+            f'{badge}{conf_note}{src_note}<br>'
+            f'<span style="font-size:0.9em;">'
+            f'&ldquo;{claim_text}&rdquo;'
+            f'</span>{evidence_block}{explanation_block}'
+            f'</li>'
+        )
+    return (
+        '<div class="ref-lookup" style="margin-top:10px;">'
+        f'<b>Claim verification ({len(mine)})</b>'
+        f'<ul>{"".join(rows)}</ul></div>'
+    )
+
+
+# Verdicts where escalating to full text has a decent chance of
+# changing the answer — the abstract just didn't cover it or was
+# unclear.  "supported" and "contradicted" stay: the abstract already
+# gave a strong signal, escalation would waste the LLM call.
+_ESCALATABLE_VERDICTS = {"not_addressed", "ambiguous", "no_source"}
+
+
+def _render_verification_summary(
+    pdf_bytes:      bytes,
+    refs:           list[dict],
+    lookup_results: list,
+) -> None:
+    """
+    After a claim-verification pass, render an aggregate summary above
+    the ref list PLUS a batch 'escalate all non-conclusive' button
+    when the fast (abstract) pass left refs eligible for a fulltext
+    recheck.  Nothing renders if there are no verdicts yet.
+    """
+    verdicts = st.session_state.get("claim_verifications") or []
+    if not verdicts:
+        return
+
+    n_sup = sum(1 for v in verdicts if v.get("verdict") == "supported")
+    n_con = sum(1 for v in verdicts if v.get("verdict") == "contradicted")
+    n_amb = sum(1 for v in verdicts if v.get("verdict") == "ambiguous")
+    n_na  = sum(1 for v in verdicts if v.get("verdict") == "not_addressed")
+    n_ns  = sum(1 for v in verdicts if v.get("verdict") == "no_source")
+    n_err = sum(1 for v in verdicts if v.get("verdict") == "error")
+
+    # Distinct refs whose current verdict is worth re-checking against
+    # the full paper.  Two categories qualify:
+    #   1. Verdicts from the abstract path that were non-conclusive
+    #      (not_addressed / ambiguous) — the full paper may cover the
+    #      claim even if the abstract didn't.
+    #   2. no_source verdicts — the abstract wasn't available at all,
+    #      but fulltext mode can also fetch OA PDFs (~80% coverage vs
+    #      ~40% for abstracts), so escalation frequently finds a source.
+    # `is_abstract_fallback` distinguishes case 1 (abstract text used)
+    # from a prior fulltext pass we shouldn't re-escalate; case 2 has
+    # no source at all so the flag is False, but we still want to try.
+    escalatable_refs = sorted({
+        v["cited_ref_index"] for v in verdicts
+        if (
+            (v.get("verdict") in ("not_addressed", "ambiguous")
+             and v.get("is_abstract_fallback", False))
+            or v.get("verdict") == "no_source"
+        )
+    })
+
+    st.markdown(
+        f"**Verification results:** "
+        f"🟢 {n_sup} supported · 🔴 {n_con} contradicted · "
+        f"🟡 {n_amb} ambiguous · ⚪ {n_na} not addressed · "
+        f"🔷 {n_ns} no source"
+        + (f" · ⚠ {n_err} error" if n_err else "")
+    )
+
+    if escalatable_refs:
+        _cols = st.columns([2, 3])
+        with _cols[0]:
+            if st.button(
+                f"Escalate all {len(escalatable_refs)} to full text",
+                key="escalate_all_btn",
+                help=(
+                    "Re-verify EVERY non-conclusive ref (not_addressed / "
+                    "ambiguous / no_source from the abstract pass) against "
+                    "its full paper.  Same as clicking every individual "
+                    "'Check with full text' button below.  Slow — expect "
+                    "10-30 s per ref, so ~5-15 min at this batch size."
+                ),
+            ):
+                new_verdicts = _run_claim_verification(
+                    pdf_bytes, refs, lookup_results,
+                    depth="fulltext",
+                    ref_indices=escalatable_refs,
+                )
+                # Splice: drop abstract verdicts for the escalated refs,
+                # merge in the fresh fulltext ones.  Every other ref's
+                # verdicts are preserved.
+                keep = [v for v in verdicts
+                        if v.get("cited_ref_index") not in set(escalatable_refs)]
+                keep.extend(new_verdicts)
+                st.session_state.claim_verifications = keep
+                st.rerun()
+        with _cols[1]:
+            st.caption(
+                "Or use the per-ref **Check with full text** button "
+                "inside individual ref cards for targeted escalation."
+            )
+
+
+def _maybe_render_escalate_button(
+    ref_index:      int,
+    refs:           list[dict],
+    lookup_results: list,
+    pdf_bytes:      bytes,
+) -> None:
+    """
+    Render a "Check with full text" button below the ref card WHEN:
+      - the user has already run the fast (abstract-only) verify, AND
+      - at least one of that ref's claims came back with a verdict
+        where escalation might change the answer, AND
+      - the current verdicts for this ref were produced from the
+        abstract (not already from fulltext — no point re-escalating).
+    """
+    verdicts = st.session_state.get("claim_verifications") or []
+    mine = [v for v in verdicts if v.get("cited_ref_index") == ref_index]
+    if not mine:
+        return
+
+    # Same escalation gate as the batch button in
+    # _render_verification_summary: non-conclusive verdicts from the
+    # abstract path (case 1), or no_source verdicts (case 2 — fulltext
+    # might find an OA PDF the abstract wasn't available for).
+    escalatable = [v for v in mine
+                   if (
+                       (v.get("verdict") in ("not_addressed", "ambiguous")
+                        and v.get("is_abstract_fallback", False))
+                       or v.get("verdict") == "no_source"
+                   )]
+    if not escalatable:
+        return
+
+    n = len(escalatable)
+    if st.button(
+        f"Check {n} claim{'s' if n != 1 else ''} with full text",
+        key=f"escalate_{ref_index}",
+        help=("Fetch the cited paper's OA PDF and re-verify these "
+              "claim(s) against the whole paper.  Slower (10-30s per "
+              "ref) but catches claims the abstract didn't cover."),
+    ):
+        # Fresh verdicts for THIS ref only.
+        new_verdicts = _run_claim_verification(
+            pdf_bytes, refs, lookup_results,
+            depth="fulltext",
+            ref_indices=[ref_index],
+        )
+        # Splice: drop the abstract-only verdicts for this ref, replace
+        # with the fulltext ones.  Preserve verdicts for every other ref.
+        merged = [v for v in verdicts
+                  if v.get("cited_ref_index") != ref_index]
+        merged.extend(new_verdicts)
+        st.session_state.claim_verifications = merged
+        st.rerun()
+
+
 def _render_reference(i: int, ref: dict, lr: dict | None, expanded: bool = False):
     status   = _overall_status(lr)
     icon     = STATUS_ICON[status]
@@ -828,9 +1233,25 @@ def _render_reference(i: int, ref: dict, lr: dict | None, expanded: bool = False
     # Build the second line in the summary: page + reason badge.  The
     # reason gives the user the answer at-a-glance without expanding.
     meta_bits = [f"({page_tag})"]
+    # Small provenance hint when this ref didn't come from the parser
+    # — useful for the user to triage flagged refs differently from
+    # ones the parser may have mangled.
+    if ref.get("_auto_added"):
+        meta_bits.append('<span style="background:#e9f5ff;color:#1864ab;'
+                         'padding:1px 6px;border-radius:3px;font-size:0.78em;">'
+                         'auto-detected</span>')
+    elif ref.get("_user_added"):
+        meta_bits.append('<span style="background:#fff4e6;color:#a06212;'
+                         'padding:1px 6px;border-radius:3px;font-size:0.78em;">'
+                         'manually added</span>')
     if reason:
         meta_bits.append(f"&middot; {_html.escape(reason)}")
     meta_html = " ".join(meta_bits)
+
+    # Per-ref claim-verification block (empty string when the user
+    # didn't opt into "Verify claims").  Renders one row per claim
+    # attributed to this ref, with a verdict badge and evidence quote.
+    claims_h = _claim_verifications_html(i)
 
     card_html = f"""
 <details class="ref-card {status}"{open_attr}>
@@ -838,6 +1259,7 @@ def _render_reference(i: int, ref: dict, lr: dict | None, expanded: bool = False
   <div class="ref-raw">{raw}</div>
   {fields_h}
   {lookup_h}
+  {claims_h}
 </details>"""
 
     st.markdown(card_html, unsafe_allow_html=True)
@@ -934,6 +1356,9 @@ with col_refs:
                     expanded=False,
                 )
             st.session_state.lookup_results = results
+            # Clear any stale claim verifications from a previous run
+            # against a different file.
+            st.session_state.pop("claim_verifications", None)
             st.rerun()
     else:
         # Look for pending (None) slots — created when manual refs were
@@ -970,6 +1395,76 @@ with col_refs:
                 + (f" · ⚪ {len(pending_idxs)} pending" if pending_idxs else "")
             )
 
+        # ---- Step 2: opt-in claim verification against MATCHED refs ----
+        n_matched = statuses.count("match")
+        already_verified = bool(st.session_state.get("claim_verifications"))
+        if n_matched > 0 and _LLM_KEY_PRESENT and not pending_idxs:
+            st.markdown(
+                f"**Verify claims** for the {n_matched} matched reference"
+                f"{'s' if n_matched != 1 else ''} — pick a mode:"
+            )
+            _fast_help = (
+                "Verify each claim against the cited paper's ABSTRACT "
+                "(already retrieved during lookup — no PDF download).  "
+                "Fast: ~30-60s per paper.  Coverage: ~40% of matched "
+                "refs (many papers don't have abstracts indexed).  "
+                "Non-conclusive verdicts can be re-verified against the "
+                "full text per-ref via buttons that appear inside each "
+                f"ref card.  Backend: **{_LLM_BACKEND}** / **{_LLM_MODEL}**."
+            )
+            _deep_help = (
+                "Fetch each cited paper's Open Access PDF (arXiv / S2 / "
+                "OpenAlex) and verify claims against the whole paper.  "
+                "Slow: 5-30 min per paper depending on backend and "
+                "cluster load.  Coverage: ~80% of matched refs.  Best "
+                "for one-off deep audits or when the abstract-only "
+                "pass returned too few conclusive verdicts.  Backend: "
+                f"**{_LLM_BACKEND}** / **{_LLM_MODEL}**."
+            )
+            _btn_cols = st.columns([1, 1, 4])
+            with _btn_cols[0]:
+                if st.button(
+                    "Fast (abstract)",
+                    key="verify_fast_btn",
+                    help=_fast_help,
+                    type="primary" if not already_verified else "secondary",
+                ):
+                    st.session_state.claim_verifications = _run_claim_verification(
+                        pdf_bytes, enriched_refs, lookup_results,
+                        depth="abstract",
+                    )
+                    st.rerun()
+            with _btn_cols[1]:
+                if st.button(
+                    "Deep (full paper)",
+                    key="verify_deep_btn",
+                    help=_deep_help,
+                ):
+                    st.session_state.claim_verifications = _run_claim_verification(
+                        pdf_bytes, enriched_refs, lookup_results,
+                        depth="fulltext",
+                    )
+                    st.rerun()
+            with _btn_cols[2]:
+                if not already_verified:
+                    st.caption(
+                        "Fast returns partial coverage in <1 min; then "
+                        "escalate specific refs to full text as needed.  "
+                        "Deep covers ~2× more refs but is much slower."
+                    )
+
+            # -------- Post-fast summary + batch escalate --------
+            if already_verified:
+                _render_verification_summary(
+                    pdf_bytes, enriched_refs, lookup_results)
+
+        elif n_matched > 0 and not _LLM_KEY_PRESENT:
+            st.caption(
+                "🔒 Claim verification requires an LLM backend — set "
+                "`ANTHROPIC_API_KEY` (paid) or `AQUEDUCT_API_KEY` (free) "
+                "in `.env` and restart to enable."
+            )
+
         # Re-highlight with per-reference colours derived from lookup results.
         # Wrap the post-lookup processing so a single bad ref doesn't take
         # down the whole page — surface the traceback instead of vanishing.
@@ -997,6 +1492,7 @@ with col_refs:
                     pdf_bytes,
                     json.dumps(parsed_enriched_subset),
                     json.dumps(parsed_statuses_subset),
+                    bake_color=not _USE_PDF_SELECTOR,
                 )
             # Reassemble: re-baked parsed refs + manual refs (unchanged).
             enriched_refs = list(reparsed) + _attach_manual_rects(
@@ -1131,6 +1627,11 @@ with col_refs:
                 i, ref, lr,
                 expanded=(_render_focused_expanded and i == focused_idx),
             )
+            # Post-card escalation: if the abstract-only pass produced
+            # a non-conclusive verdict for any claim citing this ref,
+            # offer a per-ref button to re-verify against the full text.
+            _maybe_render_escalate_button(
+                i, enriched_refs, lookup_results, pdf_bytes)
 
     if sync_with_pdf and n_unlocated:
         st.caption(
@@ -1151,10 +1652,11 @@ with col_pdf:
         scroll_page = enriched_refs[sel_ref].get("page")
         st.session_state.last_scrolled_ref = sel_ref
 
-    # Toggle between the legacy streamlit_pdf_viewer and our new
-    # selection-capable component.  Default to the new one; flip via env
-    # var if it misbehaves.
-    use_selector = os.getenv("ARES_PDF_SELECTOR", "1") != "0"
+    # Use the same selector flag we used to decide the bake_color
+    # parameter for run_highlighter — both must agree, otherwise we'd
+    # bake a coloured rect into the PDF and overlay another rect on top
+    # (double-render, parsed-vs-manual shade mismatch).
+    use_selector = _USE_PDF_SELECTOR
     if use_selector:
         from pdf_selector import pdf_selector
         # Build annotations for the component overlay.
@@ -1167,22 +1669,41 @@ with col_pdf:
         # indistinguishable from a missing ref until it gets a verdict,
         # at which point the colour changes naturally.  Treating them
         # differently was confusing — looked like a render bug.
+        # rgba alpha values picked to approximate the OLD "baked + overlay"
+        # combined opacity (~0.40) now that the baked PDF rect is gone in
+        # selector mode.  See bake_color in highlighter.py for the
+        # rationale.  Tune these if a colour is too loud or too faint.
         _STATUS_TO_COLOR = {
-            "match":    "rgba(46, 200, 90, 0.30)",   # green
-            "mismatch": "rgba(237, 70, 70, 0.30)",   # red
-            "missing":  "rgba(255, 217, 51, 0.35)",  # yellow
-            "pending":  "rgba(255, 217, 51, 0.35)",  # same yellow as missing
+            "match":    "rgba(46, 200, 90, 0.40)",   # green
+            "mismatch": "rgba(237, 70, 70, 0.40)",   # red
+            "missing":  "rgba(255, 217, 51, 0.45)",  # yellow
+            "pending":  "rgba(255, 217, 51, 0.45)",  # same yellow as missing
         }
         component_annots: list[dict[str, Any]] = []
         for i, er in enumerate(enriched_refs):
             if not er.get("rect") or not er.get("page"):
                 continue
-            stat = er.get("status") or "pending"
+            # PARSED refs carry `status` baked in by the highlighter on
+            # the last re-bake.  MANUAL refs only flow through
+            # `_attach_manual_rects`, which always writes "pending" —
+            # so once the lookup runs, their card flips to match/missing
+            # but the PDF rectangle would stay yellow without this.
+            # The live source of truth is `lookup_results`, so prefer it.
+            live_lr = (lookup_results[i]
+                       if lookup_results and i < len(lookup_results)
+                       else None)
+            stat = (_overall_status(live_lr) if live_lr is not None
+                    else (er.get("status") or "pending"))
             component_annots.append({
                 "page":      er["page"],
                 "rect":      er["rect"],
                 "color":     _STATUS_TO_COLOR.get(stat, _STATUS_TO_COLOR["pending"]),
-                "opacity":   0.40,
+                # opacity=1.0 lets the rgba alpha above reach the canvas
+                # at face value.  The old 0.40 assumed a baked PDF layer
+                # underneath was carrying half the opacity; once we
+                # dropped that (bake_color=False), the overlay alone
+                # ended up at ~0.12 effective alpha and looked washed out.
+                "opacity":   1.0,
                 "kind":      "filled",
                 "label":     f"[{i+1}] {(er.get('title') or '')[:80]} · {stat}  (click to jump to details)",
                 "ref_index": i,    # makes the box clickable; emits ref_click event
@@ -1226,6 +1747,7 @@ with col_pdf:
 
                 elif kind == "selection":
                     from parsers import _grobid_process_citation_list
+                    import requests as _rq
                     sel_text = (selection.get("text") or "").strip()
                     if sel_text:
                         try:
@@ -1258,6 +1780,13 @@ with col_pdf:
                                     "citation. Try selecting the whole reference "
                                     "(authors + year + title)."
                                 )
+                        except (_rq.exceptions.ConnectionError,
+                                _rq.exceptions.Timeout):
+                            st.error(
+                                "GROBID is unreachable — check that the grobid "
+                                "service is running and reachable at the "
+                                "configured GROBID_URL."
+                            )
                         except Exception as e:
                             st.error(f"Couldn't parse selection: {e}")
     else:
@@ -1294,6 +1823,7 @@ with col_pdf:
                 if cols[1].button("+", key=f"add_orphan_{j}",
                                   help="Add as reference"):
                     from parsers import _grobid_process_citation_list
+                    import requests as _rq
                     try:
                         parsed = _grobid_process_citation_list([orph["text"].strip()])
                         if parsed:
@@ -1305,5 +1835,12 @@ with col_pdf:
                             st.rerun()   # see manual-add handler above
                         else:
                             st.error("GROBID couldn't structure this block as a citation.")
+                    except (_rq.exceptions.ConnectionError,
+                            _rq.exceptions.Timeout):
+                        st.error(
+                            "GROBID is unreachable — check that the grobid "
+                            "service is running and reachable at the "
+                            "configured GROBID_URL."
+                        )
                     except Exception as e:
                         st.error(f"Parse error: {e}")

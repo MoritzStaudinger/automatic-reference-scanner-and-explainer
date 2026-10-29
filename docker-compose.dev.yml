@@ -1,5 +1,5 @@
-# Local-dev overrides.  docker compose auto-merges this on top of
-# docker-compose.yml when it sits next to it.  Gitignored.
+# Local-dev overrides.  Opt in explicitly:
+# (Not auto-merged, so it can never leak host ports onto the prod VM.)
 #
 # What this adds:
 #   Host-port forwards for the three app services so you can hit them

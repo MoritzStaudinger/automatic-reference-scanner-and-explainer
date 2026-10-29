@@ -65,6 +65,67 @@ docker run -d --rm --name grobid -p 8070:8070 lfoppiano/grobid:0.8.1
 streamlit run app.py
 ```
 
+## HTTP API and batch mode
+
+ARES exposes a headless HTTP API for programmatic use and batch
+processing of large PDF collections.
+
+The Docker Compose deployment ships with an `ares-api` service alongside
+the Streamlit container; nginx routes `/api/*` to it. For local
+development you can also run it standalone:
+
+```bash
+ARES_API_KEY=your-secret uvicorn api:app --host 0.0.0.0 --port 8500
+```
+
+Set `ARES_API_KEY` in the environment (and `.env` for Docker) — every
+request must then carry `X-API-Key: your-secret`. When the variable is
+unset the API runs unauthenticated (dev mode only).
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Liveness check. No auth. |
+| `POST` | `/api/v1/process` | Sync single-PDF processing. Multipart upload, returns JSON report. |
+| `POST` | `/api/v1/batch` | Async batch: multiple PDFs in one request, returns `job_id`. |
+| `GET` | `/api/v1/batch/{job_id}` | Job status / progress counters. |
+| `GET` | `/api/v1/batch/{job_id}/results` | Full per-PDF results. |
+| `GET` | `/api/v1/batch/{job_id}/results.jsonl` | Streamed JSONL. |
+| `GET` | `/api/v1/batches` | Recent jobs. |
+
+Single-PDF example:
+
+```bash
+curl -X POST https://your-host/api/v1/process \
+     -H "X-API-Key: $ARES_API_KEY" \
+     -F file=@paper.pdf \
+     -F parser=grobid \
+     -F use_llm=false
+```
+
+### Batch CLI
+
+For driving the pipeline against a directory of PDFs, `batch_cli.py`
+wraps both the local pipeline and the remote API:
+
+```bash
+# Local (in the repo, with GROBID running):
+python batch_cli.py /path/to/pdfs/ /path/to/output/ \
+       --parser grobid --concurrency 4
+
+# Remote (against a deployed ARES):
+python batch_cli.py /path/to/pdfs/ /path/to/output/ \
+       --remote https://your-host/api/v1 \
+       --api-key $ARES_API_KEY \
+       --concurrency 8
+```
+
+Per-PDF JSON reports land in the output directory along with
+`summary.csv` rolling up `n_match` / `n_mismatch` / `n_missing` per paper.
+Re-running skips PDFs that already have an output JSON (pass
+`--overwrite` to redo).
+
 ## Configuration
 
 All configuration is via environment variables (typically loaded from

@@ -91,10 +91,67 @@ def _search_snippets(raw: str, title: str = "") -> list[str]:
     return snippets
 
 
+_ORPHAN_AUTHOR_START_RE = re.compile(
+    r"^[A-Z][a-zA-Z\-']{1,}"          # capital surname
+    r"(?:,?\s+[A-Z]\.?"               # comma+initial OR
+    r"|\s+[A-Z][a-zA-Z\-']+)",        # space+capital first name
+)
+_ORPHAN_DOI_RE   = re.compile(r"10\.\d{4,}/\S+")
+_ORPHAN_ARXIV_RE = re.compile(r"arXiv:\s*\d{4}\.\d+|arxiv\.org/", re.IGNORECASE)
+_ORPHAN_URL_RE   = re.compile(r"https?://", re.IGNORECASE)
+_ORPHAN_ETAL_RE  = re.compile(r"\bet\s*al\.?\b", re.IGNORECASE)
+
+# Phrases that mark text as prose / not a citation.  Conservative: each
+# of these is something we'd basically never see at the START of a
+# bibliography entry but commonly see in body text inside the bib
+# region (e.g. an editor's note, an embedded paragraph).
+_ORPHAN_BODY_MARKERS = (
+    "we propose", "we present", "we describe", "in this paper",
+    "in this section", "in this work", "in conclusion",
+    "table ", "figure ", "section ", "appendix ",
+    "as shown in", "for example", "however,",
+)
+
+
+def _orphan_confidence(text: str) -> str:
+    """
+    Classify an orphan text block as 'high' or 'low' confidence reference.
+
+    'high' means the block looks unambiguously like a bibliography
+    entry (author surname start + ref-shaped punctuation + at least one
+    strong signal: DOI / arXiv ID / URL / "et al" / ≥3 commas).  Callers
+    can auto-add these as references without user review.
+
+    'low' means we surface it as a "possible missed reference" but
+    don't act on it automatically.  Stays in the manual-triage panel.
+    """
+    text = text.strip()
+    if len(text) < 60:
+        return "low"
+
+    if not _ORPHAN_AUTHOR_START_RE.match(text):
+        return "low"
+
+    low = text.lower()
+    if any(marker in low for marker in _ORPHAN_BODY_MARKERS):
+        return "low"
+
+    has_doi          = bool(_ORPHAN_DOI_RE.search(text))
+    has_arxiv        = bool(_ORPHAN_ARXIV_RE.search(text))
+    has_url          = bool(_ORPHAN_URL_RE.search(text))
+    has_etal         = bool(_ORPHAN_ETAL_RE.search(text))
+    has_many_commas  = text.count(",") >= 3
+
+    if has_doi or has_arxiv or has_url or has_etal or has_many_commas:
+        return "high"
+    return "low"
+
+
 def highlight_references(
     pdf_bytes: bytes,
     references: list[dict[str, Any]],
     statuses: list[str] | None = None,
+    bake_color: bool = True,
 ) -> tuple[bytes, list[dict[str, Any]]]:
     """
     Add highlights for each reference found in the PDF.
@@ -108,17 +165,20 @@ def highlight_references(
     statuses : list[str] | None
         Per-reference status strings (``"match"``, ``"mismatch"``,
         ``"missing"``, ``"pending"``).  Defaults to ``"pending"`` for all.
+    bake_color : bool
+        Whether to draw colored rectangles into the PDF page content.
 
-    Returns
-    -------
-    annotated_pdf : bytes
-    enriched_refs : list[dict]
-        Each entry gains ``page`` (1-based int or None) and ``found`` (bool).
-    orphan_blocks : list[dict]
-        Text blocks on pages where parsed refs live but that no ref claimed
-        AND that look citation-shaped (year + ≥40 chars).  Surfaced in the
-        UI as "possible missed references" the user can add manually.
-        Each: {"page": 1-based int, "rect": [x0,y0,x1,y1], "text": str}.
+        ``True`` (default) — used by the legacy ``streamlit_pdf_viewer``
+        viewer which has no overlay capability; the colour has to live in
+        the PDF bytes themselves.
+
+        ``False`` — used by our custom ``pdf_selector`` component, which
+        paints its own DOM overlay rectangles on top of PDF.js.  Baking
+        the rect AS WELL doubles the visual opacity for parsed refs
+        (baked 30% + overlay ~14%), while manually-added refs would only
+        get the overlay — producing the "different shade of yellow"
+        symptom the user sees.  We still record ``rect`` / ``page`` on
+        each entry so the overlay knows where to draw.
     """
     if statuses is None:
         statuses = ["pending"] * len(references)
@@ -244,16 +304,19 @@ def highlight_references(
         if best_idx >= 0 and best_score >= 80:
             pn, rect, _, _ = blocks[best_idx]
             page = doc[pn]
-            # Draw the highlight as page CONTENT, not as a PDF annotation.
-            # add_rect_annot would create an interactive widget that PDF.js
-            # renders in its AnnotationLayer with pointer-events:auto —
-            # which intercepts clicks on any PDF link annotation underneath
-            # (DOIs, URLs, etc.) and makes them unclickable.  draw_rect
-            # bakes the rectangle into the page's content stream, so it's
-            # visually identical but completely non-interactive — links
-            # underneath stay clickable.
-            page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
-                           width=0, overlay=True)
+            if bake_color:
+                # Draw the highlight as page CONTENT, not as a PDF annotation.
+                # add_rect_annot would create an interactive widget that PDF.js
+                # renders in its AnnotationLayer with pointer-events:auto —
+                # which intercepts clicks on any PDF link annotation underneath
+                # (DOIs, URLs, etc.) and makes them unclickable.  draw_rect
+                # bakes the rectangle into the page's content stream, so it's
+                # visually identical but completely non-interactive — links
+                # underneath stay clickable.
+                page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
+                               width=0, overlay=True)
+            # When `bake_color` is False we still record rect + page so the
+            # JS overlay knows where to draw — it just owns the colour.
             used_block_idx.add(best_idx)
             entry["found"] = True
             entry["page"] = pn + 1
@@ -278,9 +341,14 @@ def highlight_references(
 
     # Identify orphan blocks — text paragraphs in the bibliography region
     # that no reference claimed.  These are the most likely "missed refs"
-    # the user might want to add manually.  We restrict to blocks on pages
-    # where at least one parsed ref was located (so we don't surface body
-    # text from the rest of the doc).
+    # the user might want to add (or the system might want to auto-add).
+    # Restricted to pages where at least one parsed ref was located
+    # (so we don't surface body text from the rest of the doc).
+    #
+    # Each orphan carries a `confidence` field — "high" means we're
+    # confident enough to auto-add it as a ref (callers can do this
+    # without user review); "low" means it goes to the "possible missed
+    # references" panel for manual triage.
     pages_with_refs = {e["page"] for e in enriched if e.get("page")}
     orphans: list[dict[str, Any]] = []
     import re as _re_h
@@ -289,15 +357,27 @@ def highlight_references(
             continue
         if (pn + 1) not in pages_with_refs:
             continue
-        # Heuristic: must look like a citation (has year + reasonable length).
+        # Baseline orphan filter: must look like a citation
+        # (has year + reasonable length).
         if len(text) < 40:
             continue
         if not _re_h.search(r"\b(?:19|20)\d{2}\b", text):
             continue
+        # PDF-native rect coords (bottom-up y) — same convention as
+        # parsed-ref rects above so the JS overlay can render
+        # auto-added orphans consistently.
+        page_h_orph = doc[pn].rect.height
+        pdf_rect = [
+            rect.x0,
+            page_h_orph - rect.y1,
+            rect.x1,
+            page_h_orph - rect.y0,
+        ]
         orphans.append({
-            "page": pn + 1,
-            "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
-            "text": text,
+            "page":       pn + 1,
+            "rect":       pdf_rect,
+            "text":       text,
+            "confidence": _orphan_confidence(text),
         })
         # NOTE: we deliberately do NOT draw the orphan rectangle as a PyMuPDF
         # annotation here.  The PDF selector component receives `orphans` via

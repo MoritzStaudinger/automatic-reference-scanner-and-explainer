@@ -20,6 +20,11 @@ anthropic>=0.94.1         # LLM_BACKEND=anthropic
 openai>=1.40.0            # LLM_BACKEND=aqueduct (OpenAI-compatible API)
 pydantic>=2.0             # structured output schemas
 
+# HTTP API (api.py) — drives the pipeline remotely + batch processing
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9   # required for FastAPI multipart uploads
+
 # Misc
 pandas>=2.2.0
 python-dotenv>=1.0.0

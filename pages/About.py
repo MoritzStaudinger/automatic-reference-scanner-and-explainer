@@ -93,6 +93,7 @@ h1, h2, h3, h4 {
 # Custom sidebar nav, same as the main page
 with st.sidebar:
     st.page_link("app.py",          label="Validate a PDF")
+    st.page_link("pages/API.py",    label="API")
     st.page_link("pages/About.py",  label="About")
     st.divider()
 

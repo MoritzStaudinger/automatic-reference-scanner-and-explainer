@@ -72,12 +72,55 @@ services:
     # No host port — nginx reaches the container via `ares:8501` on the
     # compose network.
 
+  # ---------------------------------------------------------------------
+  # ares-api — headless HTTP API for programmatic / batch use.
+  #
+  # Same image as the Streamlit app, but the entry point is uvicorn on
+  # the FastAPI surface in api.py.  Shares the SQLite cache volume with
+  # the UI container — a batch run pre-warms the cache for any user who
+  # later inspects one of those papers in the UI.
+  #
+  # ARES_API_KEY must be set in .env to gate the endpoints; otherwise
+  # the API runs unauthenticated and nginx exposes it to the world.
+  # ---------------------------------------------------------------------
+  ares-api:
+    build: .
+    image: ares:latest
+    container_name: ares-api
+    restart: unless-stopped
+    depends_on:
+      grobid:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - GROBID_URL=http://grobid:8070
+      - ARES_CACHE=/app/data/cache.sqlite
+      - ARES_JOBS_DB=/app/data/jobs.sqlite
+    volumes:
+      - ares-data:/app/data
+    mem_limit: 4g
+    # No host port — nginx routes /api/* and /healthz to ares-api:8500.
+    command: ["uvicorn", "api:app",
+              "--host", "0.0.0.0",
+              "--port", "8500",
+              "--workers", "1",
+              "--proxy-headers",
+              "--forwarded-allow-ips", "*"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8500/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   nginx:
     image: nginx:latest
     container_name: ares-nginx
     restart: unless-stopped
     depends_on:
       - ares
+      - ares-api
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       # Bind the system cert + key from /etc/ssl/ directly.  Renewals
