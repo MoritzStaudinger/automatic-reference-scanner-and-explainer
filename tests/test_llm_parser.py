@@ -90,3 +90,15 @@ def test_numeric_claims_use_raw_labels():
     refs = [{"raw": "[2] B. Beta.", "title": "Beta"}, {"raw": "[5] E. Eps.", "title": "Eps"}]
     claims = extract("As shown before [5].", refs)
     assert refs[claims[0].cited_ref_index]["title"] == "Eps"
+
+
+def test_hybrid_raises_parser_error_when_grobid_down(monkeypatch, tmp_path):
+    import parsers
+    monkeypatch.setattr(parsers, "GROBID_URL", "http://127.0.0.1:9")   # closed port
+    monkeypatch.setattr(parsers.time, "sleep", lambda s: None)
+    import fitz
+    pdf = tmp_path / "x.pdf"
+    doc = fitz.open(); doc.new_page().insert_text((72, 72), "References\n[1] A. B. Title. 2020."); doc.save(pdf)
+    import pytest
+    with pytest.raises(parsers.ParserError):
+        parsers.extract_references_hybrid(str(pdf))

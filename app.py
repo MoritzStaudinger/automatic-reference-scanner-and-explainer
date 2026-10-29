@@ -14,6 +14,7 @@ from parsers import (
     extract_references_pymupdf4llm,
     extract_references_grobid,
     extract_references_hybrid,
+    ParserError,
     grobid_is_available,
 )
 from highlighter import highlight_references
@@ -282,6 +283,19 @@ def run_parser(pdf_bytes: bytes, parser: str):
         os.unlink(tmp_path)
 
 
+def _parse(pdf_bytes: bytes, parser: str) -> tuple[list, str, str | None]:
+    """run_parser with a fallback: when GROBID is down, parse with
+    pymupdf4llm instead and return a warning for the user.  ParserError
+    isn't cached, so the next run retries GROBID."""
+    try:
+        refs, dbg = run_parser(pdf_bytes, parser)
+        return refs, dbg, None
+    except ParserError as e:
+        refs, dbg = run_parser(pdf_bytes, "pymupdf4llm")
+        return refs, dbg, (f"{e}. Fell back to the pymupdf4llm parser, which is less "
+                           f"accurate — try again in a few minutes for the full parse.")
+
+
 @st.cache_data(show_spinner=False)
 def run_llm_enhancement(refs_json: str, backend: str, model: str) -> str:
     """
@@ -517,7 +531,7 @@ with st.sidebar:
                 else:
                     st.error("GROBID couldn't structure that as a citation. "
                              "Check it has author + year + title.")
-            except (_rq.exceptions.ConnectionError,
+            except (ParserError, _rq.exceptions.ConnectionError,
                     _rq.exceptions.Timeout) as exc:
                 # Most common deployment failure: GROBID container is down
                 # or unreachable.  Friendly message instead of a raw
@@ -673,7 +687,7 @@ def _silent_process():
     This keeps `annotated_pdf` bytes stable across manual-ref adds, so
     the JS-side fast path (PDF hash unchanged → just repaint annotation
     overlay) fires and the PDF doesn't jump."""
-    references, debug_md = run_parser(pdf_bytes, parser)
+    references, debug_md, _ = _parse(pdf_bytes, parser)
     if use_llm:
         references, _llm_warning = _llm_repair(references)
     references, _ = dedupe_references(references)
@@ -713,8 +727,10 @@ else:
         # Stage 1 — Parse
         _t = _time.time()
         st.write(f"**Parsing references** with `{parser}` …")
-        references, debug_md = run_parser(pdf_bytes, parser)
+        references, debug_md, _parse_warning = _parse(pdf_bytes, parser)
         _stage_t = _time.time() - _t
+        if _parse_warning:
+            st.warning(_parse_warning)
         if not references:
             st.write("   No references could be extracted")
             _stage.update(label="No references found", state="error", expanded=True)
@@ -1716,7 +1732,7 @@ with col_pdf:
                                     "citation. Try selecting the whole reference "
                                     "(authors + year + title)."
                                 )
-                        except (_rq.exceptions.ConnectionError,
+                        except (ParserError, _rq.exceptions.ConnectionError,
                                 _rq.exceptions.Timeout):
                             st.error(
                                 "GROBID is unreachable — check that the grobid "
@@ -1771,7 +1787,7 @@ with col_pdf:
                             st.rerun()   # see manual-add handler above
                         else:
                             st.error("GROBID couldn't structure this block as a citation.")
-                    except (_rq.exceptions.ConnectionError,
+                    except (ParserError, _rq.exceptions.ConnectionError,
                             _rq.exceptions.Timeout):
                         st.error(
                             "GROBID is unreachable — check that the grobid "

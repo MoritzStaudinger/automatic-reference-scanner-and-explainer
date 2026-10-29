@@ -28,6 +28,7 @@ from parsers import (
     extract_references_grobid,
     extract_references_hybrid,
     extract_references_pymupdf4llm,
+    ParserError,
 )
 from lookup import lookup_all
 from report import _best_found, _categorise_suspicious
@@ -139,6 +140,8 @@ class PipelineReport:
     used_llm: bool
     # LLM repair outcome — {backend, model, n_sent, n_failed_refs, first_error, ...}
     llm_stats: dict[str, Any] = field(default_factory=dict)
+    # Set when the requested parser failed and pymupdf4llm was used instead.
+    parser_fallback: str = ""
     # Claim verification block — empty when opts.verify_claims is False.
     verify_claims_seconds: float = 0.0
     n_claims:           int = 0
@@ -159,6 +162,7 @@ class PipelineReport:
             "parser":     self.parser,
             "used_llm":   self.used_llm,
             **({"llm_repair": self.llm_stats} if self.llm_stats else {}),
+            **({"parser_fallback": self.parser_fallback} if self.parser_fallback else {}),
             "timings_seconds": {
                 "parse":  round(self.parse_seconds, 2),
                 "repair": round(self.repair_seconds, 2),
@@ -298,11 +302,17 @@ def process_pdf(
     #    open files, not bytes).  We write to a tmpfile and unlink in a
     #    `finally` so a parser crash doesn't leak the file.
     t0 = time.time()
+    parser_fallback = ""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
     try:
-        refs, _debug_md = _run_parser(tmp_path, opts.parser)
+        try:
+            refs, _debug_md = _run_parser(tmp_path, opts.parser)
+        except ParserError as exc:
+            # GROBID down: degrade to the GROBID-free parser and say so.
+            parser_fallback = f"{exc}; used pymupdf4llm"
+            refs, _debug_md = _run_parser(tmp_path, "pymupdf4llm")
     finally:
         try:
             os.unlink(tmp_path)
@@ -361,6 +371,7 @@ def process_pdf(
             llm_stats.get("n_sent", 0) == 0 or
             llm_stats.get("n_failed_refs") == llm_stats.get("n_sent")),
         llm_stats       = llm_stats,
+        parser_fallback = parser_fallback,
         verify_claims_seconds = verify_s,
         n_claims           = counts["n_claims"],
         n_supported        = counts["n_supported"],

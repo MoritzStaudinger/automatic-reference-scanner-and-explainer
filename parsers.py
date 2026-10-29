@@ -14,14 +14,61 @@ dicts with (at least) these optional keys:
 
 from __future__ import annotations
 import os
+import time
+import threading
 import re
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from typing import Any
 
 import requests as _requests
 
 GROBID_URL: str = os.getenv("GROBID_URL", "http://localhost:8070")
+GROBID_TIMEOUT: float = float(os.getenv("GROBID_TIMEOUT", "90"))
 _TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
+
+# GROBID runs with a 2 GB heap, but its native PDF layer (pdfalto) uses
+# memory outside the heap: one 3 MB paper peaked at ~3.8 GB.  Two parallel
+# full-document parses got the container OOM-killed at mem_limit 4g, which
+# surfaced as random parsing failures.  Full-document parses are therefore
+# serialised per process; the light citation-list calls get two slots.
+_GROBID_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARES_GROBID_CONCURRENCY", "2")))
+_GROBID_FULLTEXT_SLOTS = threading.BoundedSemaphore(
+    int(os.getenv("ARES_GROBID_FULLTEXT_CONCURRENCY", "1")))
+
+
+class ParserError(RuntimeError):
+    """A parser backend failed (e.g. GROBID down) — callers should tell
+    the user and fall back instead of showing "no references found"."""
+
+
+def _grobid_post(endpoint: str, **kwargs) -> _requests.Response:
+    """POST to GROBID with bounded concurrency and one retry on 503 /
+    connection failure.  Raises ParserError when GROBID can't answer."""
+    url = f"{GROBID_URL}/api/{endpoint}"
+    last: Exception | None = None
+    for attempt in range(2):
+        files = kwargs.get("files")
+        if files and attempt:
+            for fh in files.values():
+                fh.seek(0)
+        heavy = _GROBID_FULLTEXT_SLOTS if endpoint == "processFulltextDocument" else nullcontext()
+        with heavy, _GROBID_SLOTS:
+            try:
+                r = _requests.post(url, timeout=GROBID_TIMEOUT, **kwargs)
+            except (_requests.ConnectionError, _requests.Timeout) as e:
+                last = e
+            else:
+                if r.status_code == 503 and attempt == 0:
+                    last = RuntimeError("GROBID busy (503)")
+                elif r.ok:
+                    return r
+                else:
+                    raise ParserError(f"GROBID returned HTTP {r.status_code} for {endpoint}")
+        if attempt == 0:
+            time.sleep(2)
+    _grobid_alive_cache.update(ts=0.0)
+    raise ParserError(f"GROBID unavailable ({type(last).__name__}: {last})"[:300])
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +370,21 @@ def extract_references_pymupdf4llm(
 # GROBID backend
 # ---------------------------------------------------------------------------
 
-def grobid_is_available() -> bool:
-    """Return True if the GROBID service is reachable."""
+_grobid_alive_cache: dict[str, Any] = {"ts": 0.0, "ok": False}
+
+
+def grobid_is_available(max_age: float = 30.0) -> bool:
+    """Return True if the GROBID service is reachable (cached ``max_age`` s,
+    so UI reruns don't each pay a network round trip)."""
+    now = time.monotonic()
+    if now - _grobid_alive_cache["ts"] < max_age:
+        return _grobid_alive_cache["ok"]
     try:
-        r = _requests.get(f"{GROBID_URL}/api/isalive", timeout=3)
-        return r.status_code == 200
+        ok = _requests.get(f"{GROBID_URL}/api/isalive", timeout=3).status_code == 200
     except Exception:
-        return False
+        ok = False
+    _grobid_alive_cache.update(ts=now, ok=ok)
+    return ok
 
 
 def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
@@ -432,14 +487,12 @@ def extract_references_grobid(
     ``return_markdown`` returns the raw TEI XML for debugging (not actual markdown).
     """
     with open(pdf_path, "rb") as fh:
-        response = _requests.post(
-            f"{GROBID_URL}/api/processFulltextDocument",
+        response = _grobid_post(
+            "processFulltextDocument",
             files={"input": fh},
             data={"consolidateReferences": "0",
                   "includeRawReferences": "1"},
-            timeout=120,
         )
-    response.raise_for_status()
     tei_xml = response.text
 
     references = _parse_tei_references(tei_xml)
@@ -493,13 +546,11 @@ def _grobid_process_citation_list(citations: list[str]) -> list[dict[str, Any]]:
         return []
     # form-encoded with repeated `citations` parameter; ask for TEI XML
     payload = [("citations", c) for c in citations]
-    response = _requests.post(
-        f"{GROBID_URL}/api/processCitationList",
+    response = _grobid_post(
+        "processCitationList",
         data=payload,
         headers={"Accept": "application/xml"},
-        timeout=120,
     )
-    response.raise_for_status()
     tei = response.text
     refs = _parse_tei_references(tei)
     # processCitationList preserves input order.  Force raw to the input
@@ -588,10 +639,7 @@ def _extract_via_section_pipeline(pdf_path: str) -> list[dict[str, Any]]:
     figures/equations, adding 10-30 s per page — a 1-3 minute freeze on
     papers with extensive appendices.
     """
-    import fitz
-    doc = fitz.open(pdf_path)
-    full_text = "\n".join(page.get_text() for page in doc)
-    doc.close()
+    full_text = _plain_text(pdf_path)
     section = _locate_reference_section(full_text)
     if not section:
         return []
@@ -604,11 +652,15 @@ def _extract_via_section_pipeline(pdf_path: str) -> list[dict[str, Any]]:
     candidates = [c for c in candidates_raw if _looks_like_ref_candidate(c)]
     if not candidates:
         return []
-    try:
-        refs = _grobid_process_citation_list(candidates)
-    except Exception:
-        return []
+    refs = _grobid_process_citation_list(candidates)   # ParserError propagates
     return [r for r in refs if _is_plausible_reference(r)]
+
+
+def _plain_text(pdf_path: str) -> str:
+    """Raw PyMuPDF text of every page (no OCR, no markdown conversion)."""
+    import fitz
+    with fitz.open(pdf_path) as doc:
+        return "\n".join(page.get_text() for page in doc)
 
 
 def _norm_for_dedup(text: str) -> str:
@@ -770,26 +822,33 @@ def extract_references_hybrid(
     # Run GROBID full-doc parse and the pymupdf-section pipeline in
     # parallel — they share no state and hit different HTTP endpoints.
     from concurrent.futures import ThreadPoolExecutor
+    errors: list[str] = []
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_grobid  = pool.submit(extract_references_grobid, pdf_path)
         f_section = pool.submit(_extract_via_section_pipeline, pdf_path)
         try:
             grobid_refs = f_grobid.result()
-        except Exception:
+        except Exception as e:
+            errors.append(str(e))
             grobid_refs = []
         try:
             section_refs = f_section.result()
-        except Exception:
+        except Exception as e:
+            errors.append(str(e))
             section_refs = []
-
     merged = _merge_ref_lists(grobid_refs, section_refs)
     merged = [r for r in merged if _is_plausible_reference(r)]
+    if errors and not merged:
+        # Both halves need GROBID; silently returning [] used to show
+        # "no references found" when the real problem was GROBID.
+        raise ParserError(errors[0])
 
     if return_markdown:
-        # Best-effort: return the markdown for debugging the section split
+        # Debug view of what the section splitter saw.  Plain page text,
+        # not pymupdf4llm: to_markdown can trigger minutes of OCR on
+        # appendix pages and this ran on every hybrid parse.
         try:
-            import pymupdf4llm
-            md = pymupdf4llm.to_markdown(pdf_path)
+            md = _locate_reference_section(_plain_text(pdf_path)) or ""
         except Exception:
             md = ""
         return merged, md
