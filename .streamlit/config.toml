@@ -1,0 +1,20 @@
+# Streamlit settings shared by local runs and the Docker image.
+# (Previously spread across Dockerfile CLI flags and compose env vars.)
+
+[server]
+headless = true
+# Public instance: keep uploads small.  nginx allows a little more so
+# Streamlit, not nginx, produces the user-facing error.
+maxUploadSize = 25
+# Streamlit sits behind nginx on the same origin; XSRF protection stays
+# on (it was disabled in compose, which isn't needed behind a proxy that
+# forwards Host and cookies).
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"

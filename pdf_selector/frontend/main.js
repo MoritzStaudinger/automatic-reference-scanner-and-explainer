@@ -15,15 +15,13 @@
 //   4. Text-layer painting is manual (PDF.js v4 TextLayer class was
 //      flaky); spans are transparent but selectable.
 
-const PDFJS_VERSION = "4.0.379";
 
+// Vendored copy (see vendor/README.md) — no third-party CDN at runtime.
 async function loadPdfJs() {
   if (window._pdfjs) return window._pdfjs;
-  const mod = await import(
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.mjs`
-  );
-  mod.GlobalWorkerOptions.workerSrc =
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+  const base = new URL("./vendor/", import.meta.url);
+  const mod = await import(new URL("pdf.min.js", base).href);
+  mod.GlobalWorkerOptions.workerSrc = new URL("pdf.worker.min.js", base).href;
   window._pdfjs = mod;
   return mod;
 }

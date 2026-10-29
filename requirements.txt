@@ -1,4 +1,4 @@
-streamlit>=1.40.0
+streamlit>=1.50,<2         # st.navigation, theme fonts, fragments, badges
 streamlit-pdf-viewer>=0.0.28
 
 # PDF parsing
@@ -26,5 +26,4 @@ uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9   # required for FastAPI multipart uploads
 
 # Misc
-pandas>=2.2.0
 python-dotenv>=1.0.0

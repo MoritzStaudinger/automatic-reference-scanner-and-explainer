@@ -1,35 +1,40 @@
-# Local-dev overrides.  Opt in explicitly:
-# (Not auto-merged, so it can never leak host ports onto the prod VM.)
+# Local-dev overrides.  Opt in explicitly (never auto-merged, so it can't
+# leak host ports onto the production VM):
 #
-# What this adds:
-#   Host-port forwards for the three app services so you can hit them
-#   directly without going through nginx (which needs a TU Wien-issued
-#   PEM the dev box doesn't have).
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 #
-# NOTE: this file does NOT disable nginx — Compose merges arrays
-# additively, so you can't "clear" a service's ports/volumes from an
-# override.  Start the dev stack explicitly without nginx:
-#
-#   docker compose up -d --build grobid ares ares-api
-#
-# Then open:
-#   Streamlit UI : http://localhost:8501
-#   HTTP API     : http://localhost:8500/healthz
-#   GROBID       : http://localhost:8070/api/isalive  (debugging only)
-#
-# Tear down with the same restricted set:
-#   docker compose down
+# What this changes:
+#   * host ports for direct access, bound to localhost only
+#       Streamlit  http://localhost:8501
+#       HTTP API   http://localhost:8500/healthz
+#       GROBID     http://localhost:8070/api/isalive
+#   * nginx on https://localhost:8443 (http 8080) instead of 80/443, so the
+#     production proxy path (TLS, WebSocket, XSRF, rate limits) is testable.
+#     Point TLS_CERT/TLS_KEY/ARSE_TLS_* at self-signed files, e.g.
+#       openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+#         -subj /CN=reference-cleaner.ds-ifs.tuwien.ac.at \
+#         -keyout dev.key -out dev.pem
+#     and open https://reference-cleaner.ds-ifs.tuwien.ac.at:8443 with a
+#     hosts-file entry (or curl --resolve).
+#   * the API runs without keys (ARES_API_ALLOW_UNAUTHENTICATED=1)
 
 services:
 
   grobid:
     ports:
-      - "8070:8070"
+      - "127.0.0.1:8070:8070"
 
   ares:
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
 
   ares-api:
     ports:
-      - "8500:8500"
+      - "127.0.0.1:8500:8500"
+    environment:
+      - ARES_API_ALLOW_UNAUTHENTICATED=1
+
+  nginx:
+    ports: !override
+      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8443:443"

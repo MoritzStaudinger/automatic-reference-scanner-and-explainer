@@ -1,49 +1,44 @@
 # Automatic Reference Explainer and Scanner
-# Deployment target: reference-cleaner.ds-ifs.tuwien.ac.at
+# Deployment targets: reference-cleaner.ds-ifs.tuwien.ac.at
+#                     arse.ds-ifs.tuwien.ac.at
 #
-# TLS via an institutional cert (TU Wien-issued PEM bundle) — no
-# certbot, no Let's Encrypt.  The cert + key live on the host under
-# ./nginx/certs/ and are bind-mounted into the nginx container.
+# Only nginx is exposed on the host (80 + 443).  ares, ares-api and grobid
+# talk over the compose-internal network.  See DEPLOY.md for the full
+# runbook; `scripts/deploy.sh` performs and verifies a deploy.
 #
-# Only nginx is exposed on the host network (ports 80 + 443).  The
-# ares and grobid containers talk over the compose-internal network.
+# TLS: institutional (TU Wien / GEANT) certificates, no certbot.  nginx
+# picks the certificate per hostname (SNI), so each hostname gets its own
+# cert + key mount below.  Paths come from .env:
 #
-# First-time setup on the VM:
-#   1. Place the institutional cert files at:
-#        ./nginx/certs/fullchain.pem   (cert + intermediate chain)
-#        ./nginx/certs/privkey.pem     (private key, mode 600)
-#      If the institutional bundle uses different filenames
-#      (e.g. `.crt` + `.key`), either rename them here or update the
-#      paths in nginx/conf.d/default.conf to match.
-#   2. Copy .env next to this file (NEVER commit — it carries API keys).
-#   3. docker compose up -d --build
+#   TLS_CERT / TLS_KEY            reference-cleaner.ds-ifs.tuwien.ac.at
+#   ARSE_TLS_CERT / ARSE_TLS_KEY  arse.ds-ifs.tuwien.ac.at
 #
-# Cert renewal: when TU Wien issues a refreshed bundle, overwrite the
-# two files in ./nginx/certs/ and run `docker compose restart nginx`.
+# The ARSE_* variables default to the reference-cleaner files, which is
+# right once the certificate's SAN list covers both names.  Every cert
+# file must be the FULL CHAIN (leaf + GEANT intermediate) — see
+# scripts/build_fullchain.sh.  Renewal: replace the files on the host,
+# then `docker compose restart nginx`.
 
 services:
 
   grobid:
     # CRF-only build — skips DeLFT (deep-learning) initialization, which
-    # is what the app uses anyway.  The full `0.8.1` image hangs on first
-    # boot waiting for DeLFT/HuggingFace assets on some networks and
-    # adds 6+ GB of unused RAM for models we never invoke.
+    # is what the app uses anyway.
     image: lfoppiano/grobid:0.9.0-crf
     container_name: ares-grobid
     restart: unless-stopped
-    mem_limit: 4g
+    # The JVM heap is 2 GB, but GROBID's native PDF layer allocates outside
+    # it: one 3 MB paper peaked at ~3.8 GB total.  At 4g the container was
+    # OOM-killed under concurrent parses (the "random parsing failures").
+    mem_limit: 6g
     environment:
       - JAVA_OPTS=-Xmx2g
-    # No host port — only the ares service talks to grobid via the
-    # internal `grobid` hostname.  Add `ports: ["8070:8070"]` back if
-    # you need host access for debugging.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8070/api/isalive"]
       interval: 30s
       timeout: 10s
-      # GROBID loads 12 Wapiti models + warms up the JVM on first boot.
-      # On a modest VM this can take 3-5 minutes; bump generously so the
-      # dependency check doesn't kill the container mid-startup.
+      # GROBID loads 12 Wapiti models + warms up the JVM on first boot;
+      # on a modest VM this takes 3-5 minutes.
       retries: 10
       start_period: 240s
 
@@ -61,28 +56,20 @@ services:
       # In-container service discovery — overrides any GROBID_URL in .env
       - GROBID_URL=http://grobid:8070
       - ARES_CACHE=/app/data/cache.sqlite
-      # Streamlit behind a reverse proxy
-      - STREAMLIT_SERVER_ENABLE_CORS=false
-      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
     volumes:
-      # SQLite cache + temp uploads persist across container restarts.
-      # ~3 GB after a full HalluCitation benchmark run.
+      # SQLite lookup cache, persists across restarts.
       - ares-data:/app/data
     mem_limit: 4g
-    # No host port — nginx reaches the container via `ares:8501` on the
-    # compose network.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
-  # ---------------------------------------------------------------------
-  # ares-api — headless HTTP API for programmatic / batch use.
-  #
-  # Same image as the Streamlit app, but the entry point is uvicorn on
-  # the FastAPI surface in api.py.  Shares the SQLite cache volume with
-  # the UI container — a batch run pre-warms the cache for any user who
-  # later inspects one of those papers in the UI.
-  #
-  # ARES_API_KEY must be set in .env to gate the endpoints; otherwise
-  # the API runs unauthenticated and nginx exposes it to the world.
-  # ---------------------------------------------------------------------
+  # Headless HTTP API (api.py) for programmatic / batch use.  Same image,
+  # uvicorn entry point.  Shares the cache volume with the UI.  Without
+  # ARES_API_KEY or a keys file it answers 503 to everything but /healthz.
   ares-api:
     build: .
     image: ares:latest
@@ -97,10 +84,10 @@ services:
       - GROBID_URL=http://grobid:8070
       - ARES_CACHE=/app/data/cache.sqlite
       - ARES_JOBS_DB=/app/data/jobs.sqlite
+      - ARES_API_KEYS_FILE=/app/data/api_keys.json
     volumes:
       - ares-data:/app/data
     mem_limit: 4g
-    # No host port — nginx routes /api/* and /healthz to ares-api:8500.
     command: ["uvicorn", "api:app",
               "--host", "0.0.0.0",
               "--port", "8500",
@@ -115,23 +102,47 @@ services:
       start_period: 30s
 
   nginx:
-    image: nginx:latest
+    image: nginx:1.27-alpine
     container_name: ares-nginx
     restart: unless-stopped
     depends_on:
-      - ares
-      - ares-api
+      ares:
+        condition: service_healthy
+      ares-api:
+        condition: service_healthy
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      # Bind the system cert + key from /etc/ssl/ directly.  Renewals
-      # on the host (overwrite-in-place) propagate after a
-      # `docker compose restart nginx` — no copy step required.
-      # Mounted read-only so a misbehaving nginx process can't touch them.
-      - /etc/ssl/reference-cleaner.pem:/etc/nginx/certs/fullchain.pem:ro
-      - /etc/ssl/key.pem:/etc/nginx/certs/privkey.pem:ro
+      # One cert/key pair per hostname, read-only.  create_host_path:
+      # false makes a wrong path fail loudly instead of Docker silently
+      # creating an empty directory in its place.
+      - type: bind
+        source: ${TLS_CERT:-/etc/ssl/reference-cleaner.pem}
+        target: /etc/nginx/certs/reference-cleaner.ds-ifs.tuwien.ac.at.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TLS_KEY:-/etc/ssl/key.pem}
+        target: /etc/nginx/certs/reference-cleaner.ds-ifs.tuwien.ac.at.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ARSE_TLS_CERT:-${TLS_CERT:-/etc/ssl/reference-cleaner.pem}}
+        target: /etc/nginx/certs/arse.ds-ifs.tuwien.ac.at.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ARSE_TLS_KEY:-${TLS_KEY:-/etc/ssl/key.pem}}
+        target: /etc/nginx/certs/arse.ds-ifs.tuwien.ac.at.key
+        read_only: true
+        bind: {create_host_path: false}
     ports:
       - "80:80"
       - "443:443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   ares-data:

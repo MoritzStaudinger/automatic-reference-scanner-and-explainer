@@ -33,23 +33,22 @@ A SQLite cache makes any second pass on the same paper near-instant.
 
 ## Quick start (Docker)
 
-You need Docker, Docker Compose, and ~10 GB of free RAM (GROBID alone
-asks for 6–8 GB).
+You need Docker, Docker Compose v2.24+, and ~12 GB of free RAM (GROBID
+alone can peak near 4 GB per paper and is capped at 6 GB).
 
 ```bash
-git clone https://github.com/<your-org>/reference-explainer.git
-cd reference-explainer
+git clone https://github.com/MoritzStaudinger/automatic-reference-scanner-and-explainer.git
+cd automatic-reference-scanner-and-explainer
 cp .env.example .env        # fill in any API keys you have
-docker compose up -d --build
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -subj /CN=localhost -keyout dev.key -out dev.pem
+TLS_CERT=$PWD/dev.pem TLS_KEY=$PWD/dev.key \
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
-The Streamlit UI lives behind nginx at port 443 in the shipped compose.
-For local development without TLS, comment out the `nginx` service and
-add `ports: ["8501:8501"]` to the `ares` service, then visit
-`http://localhost:8501`.
-
-Production deployment with an institutional certificate is documented in
-the comments at the top of `docker-compose.yml`.
+Then open `http://localhost:8501` (or `https://localhost:8443` through
+nginx). Production deployment — TLS for both hostnames, API keys, limits —
+is in [DEPLOY.md](DEPLOY.md); `scripts/deploy.sh` performs and verifies it.
 
 ## Quick start (local Python)
 
