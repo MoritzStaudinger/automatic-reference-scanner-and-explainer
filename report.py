@@ -16,33 +16,16 @@ Verified      – confirmed correct (title match, venue plausible).
 
 from __future__ import annotations
 
-import html as _html
 from datetime import date
 from typing import Any
 
-_VALIDATION_SOURCES = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex", "crossref", "openlibrary", "scholarly", "arxiv", "url_verify")
+from verdict import SOURCE_NAMES, VALIDATION_SOURCES as _VALIDATION_SOURCES
+from verdict import overall_status as _overall_status   # noqa: F401  (re-exported)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (mirror app.py logic without importing Streamlit)
+# Internal helpers
 # ---------------------------------------------------------------------------
-
-def _overall_status(lr: dict | None) -> str:
-    if lr is None:
-        return "pending"
-    found = [
-        lr.get(src, {})
-        for src in _VALIDATION_SOURCES
-        if lr.get(src, {}).get("status") == "found"
-    ]
-    labels = [r.get("label") for r in found]
-    if not found:
-        return "missing"
-    if "match" in labels:
-        return "match"
-    if "mismatch" in labels:
-        return "mismatch"
-    return "missing"
 
 
 def _best_found(lr: dict) -> dict | None:
@@ -227,7 +210,7 @@ def _categorise_suspicious(lr: dict | None) -> str | None:
     return "unclassified"
 
 
-def _venue_concern(lr: dict | None) -> tuple[str, str] | None:
+def _venue_concern(lr: dict | None, extracted_venue: str = "") -> tuple[str, str] | None:
     """
     Return (extracted_venue, found_venue) if the title matched but the venue
     is clearly wrong in at least one source, else None.
@@ -238,7 +221,7 @@ def _venue_concern(lr: dict | None) -> tuple[str, str] | None:
         r = lr.get(src, {})
         if r.get("status") == "found" and r.get("label") == "match":
             if r.get("venue_label") == "mismatch":
-                return r.get("found_venue", ""), r.get("found_venue", "")
+                return extracted_venue, r.get("found_venue", "")
     return None
 
 
@@ -539,14 +522,10 @@ def generate_report(
 # ---------------------------------------------------------------------------
 
 _SOURCE_LABELS: list[tuple[str, str]] = [
-    ("semantic_scholar", "Semantic Scholar"),
-    ("crossref",         "Crossref"),
-    ("openalex",         "OpenAlex"),
-    ("acl_anthology",    "ACL Anthology"),
-    ("dblp",             "DBLP"),
-    ("arxiv",            "arXiv"),
-    ("openlibrary",      "Open Library"),
-    ("scholarly",        "Google Scholar"),
+    (src, SOURCE_NAMES[src]) for src in (
+        "doi_org", "semantic_scholar", "crossref", "openalex", "acl_anthology",
+        "dblp", "arxiv", "openlibrary", "scholarly", "url_verify",
+    )
 ]
 
 _STATUS_ICONS = {
@@ -556,6 +535,8 @@ _STATUS_ICONS = {
     "skipped":          "—",
     "not_in_anthology": "—",
     "no_index":         "—",
+    "dead_link":        "⚠️",
+    "archived":         "🗄️",
 }
 
 _LABEL_ICONS = {
@@ -563,6 +544,11 @@ _LABEL_ICONS = {
     "fuzzy":    "🟡",
     "mismatch": "🔴",
 }
+
+
+def _cell(text: Any) -> str:
+    """Make free text safe inside a Markdown table cell."""
+    return " ".join(str(text).split()).replace("|", "\\|")
 
 
 def _pct(x: float | None) -> str:
@@ -703,7 +689,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
     ]:
         val = (ref.get(field) or "").strip()
         if val:
-            display = f"`{val}`" if field in ("doi", "url") else val
+            display = f"`{_cell(val)}`" if field in ("doi", "url") else _cell(val)
             field_rows.append(f"| {label} | {display} |")
     if field_rows:
         out.append("**Extracted fields**\n")
@@ -719,7 +705,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
     # Per-source table — skip rows that just say "skipped" so the verdict
     # block stays focused on sources that actually returned a signal.
     lr = lr or {}
-    interesting = ("found", "not_found", "error")
+    interesting = ("found", "not_found", "error", "dead_link", "archived")
     rows: list[str] = []
     for src, label in _SOURCE_LABELS:
         r = lr.get(src) or {}
@@ -732,7 +718,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
         vsim   = r.get("venue_sim")
         vlbl   = r.get("venue_label", "")
         if r.get("found_venue"):
-            vcell = r["found_venue"]
+            vcell = _cell(r["found_venue"])
             if vlbl in ("fuzzy", "mismatch") and vsim is not None:
                 vcell += f" ({vsim:.0%}, {vlbl})"
         else:
@@ -741,11 +727,13 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
         if status == "found":
             mlbl = r.get("label")
             mark = _LABEL_ICONS.get(mlbl, "")
-            ft   = r.get("found_title") or ""
-            url  = r.get("url") or ""
+            ft   = _cell(r.get("found_title") or "").replace("[", "\\[").replace("]", "\\]")
+            url  = (r.get("url") or "").replace(" ", "%20").replace(")", "%29")
             result_cell = f"{mark} [{ft}]({url})" if url and ft else (ft or "(found)")
         elif status == "not_found":
             result_cell = "not found"
+        elif status in ("dead_link", "archived"):
+            result_cell = _cell(r.get("note") or status.replace("_", " "))
         else:   # error
             err = (r.get("error") or "")[:80].replace("|", "\\|")
             result_cell = f"error: `{err}`"

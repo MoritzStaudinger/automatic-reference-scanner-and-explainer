@@ -3,17 +3,19 @@ Persistent SQLite cache for external lookup responses.
 
 Keys: (source, query_hash). Values: JSON-serialised result dicts.
 
-We cache `found` and `not_found` results indefinitely — papers don't move,
-and re-querying for "still nothing" is wasted work.  We do NOT cache
-transient errors (`error`, `rate_limited`, `no_index`) so a flaky run
-doesn't poison the cache for next time.
+We cache `found` results indefinitely — papers don't move.  Negative
+results (`not_found`, `not_in_anthology`) expire after ARES_NEG_TTL_DAYS
+(default 14) so papers that get indexed later are picked up again.  We do
+NOT cache transient errors (`error`, `rate_limited`, `no_index`) so a
+flaky run doesn't poison the cache for next time.
 
-Refresh by deleting ``data/cache.sqlite``.
+Clean up stale negatives with ``scripts/purge_negative_cache.py``.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +30,10 @@ CACHE_PATH    = Path(os.getenv(
     "ARES_CACHE", _PROJECT_ROOT / "data" / "cache.sqlite"))
 
 _CACHEABLE_STATUSES = {"found", "not_found", "not_in_anthology"}
+_NEGATIVE_STATUSES  = {"not_found", "not_in_anthology"}
+NEG_TTL_SECONDS     = int(float(os.getenv("ARES_NEG_TTL_DAYS", "14")) * 86400)
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +45,8 @@ class _LookupCache:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False,
+                                     timeout=30)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS cache (
                 source TEXT NOT NULL,
@@ -50,15 +57,23 @@ class _LookupCache:
             )
         """)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.commit()
 
     def get(self, source: str, key: str) -> Any | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT value FROM cache WHERE source=? AND key=?",
+                "SELECT value, ts FROM cache WHERE source=? AND key=?",
                 (source, key),
             ).fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        value = json.loads(row[0])
+        if (isinstance(value, dict)
+                and value.get("status") in _NEGATIVE_STATUSES
+                and time.time() - row[1] > NEG_TTL_SECONDS):
+            return None   # stale negative — re-query
+        return value
 
     def set(self, source: str, key: str, value: Any) -> None:
         with self._lock:
@@ -68,6 +83,21 @@ class _LookupCache:
                 (source, key, json.dumps(value), int(time.time())),
             )
             self._conn.commit()
+
+    def purge_negative(self, older_than_s: int = 0,
+                       source: str | None = None) -> int:
+        """Delete negative results older than ``older_than_s`` seconds."""
+        cutoff = int(time.time()) - older_than_s
+        sql = ("DELETE FROM cache WHERE ts <= ? AND "
+               "json_extract(value, '$.status') IN ('not_found','not_in_anthology')")
+        params: list[Any] = [cutoff]
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        with self._lock:
+            n = self._conn.execute(sql, params).rowcount
+            self._conn.commit()
+        return n
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -132,7 +162,9 @@ def cache_key(ref: dict[str, Any]) -> str | None:
 # Decorator
 # ---------------------------------------------------------------------------
 
-def cached(source_name: str, postprocess: Callable | None = None) -> Callable:
+def cached(source_name: str, postprocess: Callable | None = None,
+           key_fn: Callable[[dict[str, Any]], str | None] | None = None,
+           ) -> Callable:
     """
     Decorator that wraps a ``_lookup_<source>(ref) -> dict`` function with
     SQLite caching.  Cache miss → call wrapped function and (if cacheable)
@@ -142,24 +174,33 @@ def cached(source_name: str, postprocess: Callable | None = None) -> Callable:
     every returned dict (whether the result came from a cache hit or a
     fresh call).  Use this to recompute fields whose logic may have
     changed since the result was cached — e.g. composite labels.
+
+    Pass ``key_fn`` to override ``cache_key`` (e.g. to key on the URL).
+    SQLite errors never fail a lookup — they degrade to an uncached call.
     """
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
         def wrapped(ref: dict[str, Any], *args, **kwargs) -> dict:
-            key = cache_key(ref)
+            key = (key_fn or cache_key)(ref)
             if not key:
                 r = fn(ref, *args, **kwargs)
                 return postprocess(r) if postprocess else r
 
-            cache = get_cache()
-            hit = cache.get(source_name, key)
+            try:
+                hit = get_cache().get(source_name, key)
+            except sqlite3.Error as e:
+                log.warning("cache read failed (%s/%s): %s", source_name, key, e)
+                hit = None
             if hit is not None:
                 return postprocess(hit) if postprocess else hit
 
             result = fn(ref, *args, **kwargs) or {}
             status = result.get("status")
             if status in _CACHEABLE_STATUSES:
-                cache.set(source_name, key, result)
+                try:
+                    get_cache().set(source_name, key, result)
+                except sqlite3.Error as e:
+                    log.warning("cache write failed (%s/%s): %s", source_name, key, e)
             return postprocess(result) if postprocess else result
 
         return wrapped

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from cache import get_cache
-from lookup import _SESSION      # connection-pooled session
+from lookup import USER_AGENT, _SESSION      # connection-pooled session
 
 
 # Lazy CORE support: only try CORE for refs whose OA chain came up empty,
@@ -58,7 +58,7 @@ _FETCH_MAX_BYTES = 10 * 1024 * 1024
 # claim + prompt + response).
 _MAX_TEXT_CHARS = 120_000
 
-_UA = "ARES/1.0 (mailto:moritz.staudinger@tuwien.ac.at)"
+_UA = USER_AGENT
 
 
 # ---------------------------------------------------------------------------

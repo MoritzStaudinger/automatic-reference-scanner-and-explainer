@@ -32,6 +32,7 @@ Identifier source (link only):
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -50,6 +51,15 @@ from cache import cache_key as _cache_key, cached as _cached, get_cache as _get_
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
+# One contact address for every polite-pool API (Crossref, OpenAlex,
+# doi.org, Open Library) and for URL fetches.  Override with
+# ARES_CONTACT_EMAIL; the per-source OPENALEX_MAILTO / DOI_ORG_MAILTO
+# variables still win when set.
+CONTACT_EMAIL = os.getenv("ARES_CONTACT_EMAIL", "moritz.staudinger@tuwien.ac.at")
+USER_AGENT    = f"ARES/1.0 (+https://reference-cleaner.ds-ifs.tuwien.ac.at; mailto:{CONTACT_EMAIL})"
+
 # Connection-pooled HTTP session — every source uses this so TCP+TLS
 # handshakes amortise across the ~200 calls per paper.
 _SESSION = _requests.Session()
@@ -66,8 +76,9 @@ _SESSION.mount("http://", _adapter)
 # Lightweight HTTP-call counter for cost/throughput analysis.  Increments
 # every time `_http_get_retry` or any `_SESSION.{get,post}` is invoked.
 # Categorised by host so the benchmark can show "X S2 calls, Y Crossref
-# calls, ..." per paper.  Disabled by default (no-op cost when off).
+# calls, ..." per paper.  Process-wide: totals mix concurrent users.
 HTTP_CALL_COUNTS: dict[str, int] = {}
+_HTTP_COUNT_LOCK = threading.Lock()
 
 
 def _bump_http_count(url: str) -> None:
@@ -75,14 +86,16 @@ def _bump_http_count(url: str) -> None:
         host = url.split("//", 1)[1].split("/", 1)[0]
     except Exception:
         host = "unknown"
-    HTTP_CALL_COUNTS[host] = HTTP_CALL_COUNTS.get(host, 0) + 1
+    with _HTTP_COUNT_LOCK:
+        HTTP_CALL_COUNTS[host] = HTTP_CALL_COUNTS.get(host, 0) + 1
 
 
 def reset_http_counts() -> dict[str, int]:
     """Snapshot + zero the HTTP call counter.  Returns the previous totals
     so the caller can attribute calls to a unit of work (e.g. a paper)."""
-    prev = dict(HTTP_CALL_COUNTS)
-    HTTP_CALL_COUNTS.clear()
+    with _HTTP_COUNT_LOCK:
+        prev = dict(HTTP_CALL_COUNTS)
+        HTTP_CALL_COUNTS.clear()
     return prev
 
 # Transient HTTP statuses worth retrying — public APIs hit these under load.
@@ -139,7 +152,7 @@ _S2_BASE   = "https://api.semanticscholar.org/graph/v1"
 _S2_FIELDS = "title,authors,year,externalIds,venue,openAccessPdf,abstract"
 
 _CR_BASE    = "https://api.crossref.org/works"
-_CR_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
+_CR_HEADERS = {"User-Agent": USER_AGENT}
 
 _DBLP_BASE  = "https://dblp.org/search/publ/api"
 _OA_BASE    = "https://api.openalex.org/works"
@@ -152,8 +165,8 @@ _CORE_API_KEY = os.getenv("CORE_API_KEY", "")
 # OpenAlex grants ~10× higher rate limits ("polite pool") to identifiable
 # users via the mailto query parameter.  Set OPENALEX_MAILTO in .env to
 # your real address; we fall back to a generic one only if not set.
-_OA_MAILTO  = os.getenv("OPENALEX_MAILTO", "moritz.staudinger@tuwien.ac.at")
-_OA_HEADERS = {"User-Agent": f"ReferenceExplainer/1.0 (mailto:{_OA_MAILTO})"}
+_OA_MAILTO  = os.getenv("OPENALEX_MAILTO") or CONTACT_EMAIL
+_OA_HEADERS = {"User-Agent": USER_AGENT}
 
 # Title similarity thresholds
 MATCH_THRESHOLD          = 0.90
@@ -460,11 +473,18 @@ def author_similarity(a1: str, a2: str) -> float | None:
     #         citation is right or wrong (only one cited token to compare
     #         against) → return None so downstream treats it as
     #         "no author signal" instead of "authors disagree".
-    a1l, a2l = a1.lower(), a2.lower()
+    # Whole-word / surname match only: a raw substring test let a cited
+    # "Li" match "Oliver" or "Lin" in the found list.
+    def _single_token_hit(tok: str, other_names: set[str], other_raw: str) -> bool:
+        if tok in other_names:
+            return True
+        return re.search(rf"(?<![a-z]){re.escape(tok)}(?![a-z])",
+                         _ascii_fold(other_raw.lower())) is not None
+
     if len(ln1) == 1 and len(ln2) >= 3:
-        return 1.0 if next(iter(ln1)) in a2l else None
+        return 1.0 if _single_token_hit(next(iter(ln1)), ln2, a2) else None
     if len(ln2) == 1 and len(ln1) >= 3:
-        return 1.0 if next(iter(ln2)) in a1l else None
+        return 1.0 if _single_token_hit(next(iter(ln2)), ln1, a1) else None
 
     smaller, larger = (ln1, ln2) if len(ln1) <= len(ln2) else (ln2, ln1)
     consumed: set[str] = set()
@@ -576,7 +596,11 @@ def _refresh_label(result: dict[str, Any]) -> dict[str, Any]:
     out["venue_label"] = finalised["venue_label"]
     if finalised.get("wrong_authors"):
         out["wrong_authors"] = True
-    if result.get("wrong_doi") or result.get("wrong_arxiv_id"):
+    # wrong_venue can't be recomputed without the extracted venue, so a
+    # stored flag stays authoritative (refresh_result_against_ref, which
+    # has the ref, re-derives it properly).
+    if (result.get("wrong_doi") or result.get("wrong_arxiv_id")
+            or result.get("wrong_venue")):
         out["label"] = "mismatch"
     return out
 
@@ -685,6 +709,19 @@ def refresh_result_against_ref(
     else:
         out.pop("wrong_venue", None)
     return out
+
+
+def refresh_results(results: dict[str, Any], ref: dict[str, Any]) -> dict[str, Any]:
+    """Apply ``refresh_result_against_ref`` to every source in a
+    ``lookup_reference`` result, in place.  Returns ``results``.
+
+    The cache key ignores authors/venue, so a cached entry may carry sims
+    computed against someone else's version of the reference — re-scoring
+    against *this* ref makes UI, API and report agree."""
+    for src, r in results.items():
+        if not src.startswith("_") and isinstance(r, dict):
+            results[src] = refresh_result_against_ref(r, ref)
+    return results
 
 
 def _composite_label(
@@ -933,7 +970,7 @@ def _cited_arxiv_id(ref: dict[str, Any]) -> str | None:
     return None
 
 
-_URL_FOLLOW_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
+_URL_FOLLOW_HEADERS = {"User-Agent": USER_AGENT}
 
 
 def _resolve_url_doi(url: str) -> str | None:
@@ -1457,6 +1494,10 @@ def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
         return 0
 
     works_by_doi: dict[str, dict] = {}
+    # DOIs whose chunk request failed.  Absence from the response only
+    # means "not indexed" when the request itself succeeded — writing
+    # not_found for a failed chunk would poison the cache permanently.
+    failed: set[str] = set()
     for i in range(0, len(pending), 50):
         chunk = pending[i : i + 50]
         doi_filter = "|".join(d for _, d, _ in chunk)
@@ -1474,9 +1515,12 @@ def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
                 if wdoi:
                     works_by_doi[wdoi] = work
         except Exception:
+            failed.update(d for _, d, _ in chunk)
             continue   # leave this chunk to the per-ref fallback
 
     for key, doi, ref in pending:
+        if doi in failed:
+            continue
         work = works_by_doi.get(doi)
         if work is None:
             cache.set("openalex", key, {"status": "not_found"})
@@ -1495,6 +1539,38 @@ def _oa_batch_prewarm(refs: list[dict[str, Any]]) -> int:
 # ---------------------------------------------------------------------------
 # arXiv  (identifier only — link + ID, no title/venue validation)
 # ---------------------------------------------------------------------------
+
+class _TimeoutSession(_requests.Session):
+    """requests.Session with a default timeout — the arxiv library calls
+    ``session.get(url, headers=...)`` with none, so a stalled export.arxiv.org
+    connection used to hang a lookup worker forever."""
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 15)
+        return super().request(*args, **kwargs)
+
+
+_ARXIV_CLIENTS: dict[int, Any] = {}
+_ARXIV_CLIENTS_LOCK = threading.Lock()
+
+
+def _arxiv_client(page_size: int = 100):
+    """Shared arxiv.Client per page size.  One client means the library's
+    built-in 3 s inter-request pacing actually applies across threads
+    (a fresh client per call bypassed it).  The client isn't thread-safe
+    around its pacing timestamp, so callers hold ``_ARXIV_CLIENTS_LOCK``
+    while iterating results."""
+    import arxiv
+    with _ARXIV_CLIENTS_LOCK:
+        c = _ARXIV_CLIENTS.get(page_size)
+        if c is None:
+            c = arxiv.Client(num_retries=3, delay_seconds=3, page_size=page_size)
+            c._session = _TimeoutSession()
+            _ARXIV_CLIENTS[page_size] = c
+        return c
+
+
+_ARXIV_CALL_LOCK = threading.Lock()
+
 
 def _arxiv_batch_prewarm(refs: list[dict[str, Any]]) -> int:
     """
@@ -1526,11 +1602,13 @@ def _arxiv_batch_prewarm(refs: list[dict[str, Any]]) -> int:
     import arxiv
     papers_by_id: dict[str, Any] = {}
     try:
-        client = arxiv.Client(num_retries=5, delay_seconds=2, page_size=100)
+        client = _arxiv_client(100)
         for i in range(0, len(pending), 100):
             chunk = pending[i : i + 100]
             search = arxiv.Search(id_list=[p[1] for p in chunk])
-            for paper in client.results(search):
+            with _ARXIV_CALL_LOCK:
+                chunk_papers = list(client.results(search))
+            for paper in chunk_papers:
                 full = paper.entry_id.split("/abs/")[-1]
                 base = full.split("v")[0]     # strip version (1234.5678v3 -> 1234.5678)
                 papers_by_id[base] = paper
@@ -1608,9 +1686,11 @@ def _lookup_arxiv(ref: dict[str, Any]) -> dict[str, Any]:
         return {"status": "skipped"}
 
     try:
-        client = arxiv.Client(num_retries=5, delay_seconds=2)
+        # Usually a cache hit thanks to _arxiv_batch_prewarm; the shared
+        # client + lock keep stragglers within arXiv's 1 req / 3 s policy.
         search = arxiv.Search(id_list=[arxiv_id])
-        results = list(client.results(search))
+        with _ARXIV_CALL_LOCK:
+            results = list(_arxiv_client(1).results(search))
         if not results:
             return {"status": "not_found"}
 
@@ -1775,6 +1855,7 @@ def _crossref_batch_prewarm(refs: list[dict[str, Any]]) -> int:
         return 0
 
     msgs_by_doi: dict[str, dict] = {}
+    failed: set[str] = set()   # see _oa_batch_prewarm
     # 25 DOIs per query — Crossref accepts up to ~50 in the filter but the
     # URL gets long; 25 keeps us well under any limit and parallelises better.
     for i in range(0, len(pending), 25):
@@ -1790,9 +1871,12 @@ def _crossref_batch_prewarm(refs: list[dict[str, Any]]) -> int:
                 if d:
                     msgs_by_doi[d] = msg
         except Exception:
+            failed.update(d.lower() for _, d, _ in chunk)
             continue   # this chunk falls back to per-ref lookups
 
     for key, doi, ref in pending:
+        if doi.lower() in failed:
+            continue
         msg = msgs_by_doi.get(doi.lower())
         if msg is None:
             cache.set("crossref", key, {"status": "not_found"})
@@ -1865,7 +1949,7 @@ def _lookup_crossref(ref: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _OL_BASE    = "https://openlibrary.org/search.json"
-_OL_HEADERS = {"User-Agent": "ReferenceExplainer/1.0 (mailto:contact@example.com)"}
+_OL_HEADERS = {"User-Agent": USER_AGENT}
 
 
 @_cached("openlibrary", postprocess=_refresh_label)
@@ -1956,45 +2040,48 @@ def _lookup_openlibrary(ref: dict[str, Any]) -> dict[str, Any]:
 # We therefore:
 #   - call it only as Phase 5, when no academic source matched
 #   - rate-limit to one request every _SCHOLARLY_MIN_DELAY seconds
-#   - set a session-wide `_SCHOLARLY_BLOCKED` flag the moment Google
+#   - back off for _SCHOLARLY_BLOCK_COOLDOWN the moment Google
 #     CAPTCHAs us, so we don't waste minutes hammering a wall
 
 _SCHOLARLY_LAST_CALL: float = 0.0
 _SCHOLARLY_LOCK = threading.Lock()
-_SCHOLARLY_BLOCKED = False
+# Monotonic timestamp until which Scholar is considered blocked.  A CAPTCHA
+# used to disable Scholar for the life of the process; now it backs off.
+_SCHOLARLY_BLOCKED_UNTIL: float = 0.0
+_SCHOLARLY_BLOCK_COOLDOWN = 30 * 60
+_SCHOLARLY_TIMEOUT = 20
 _SCHOLARLY_MIN_DELAY = 2.5
 _SCHOLARLY_BLOCK_HINTS = ("captcha", "blocked", "429", "too many requests",
                           "maxtriesexceeded")
 
 # Per-lookup_all() budget: Scholar is rate-limited and serialised, so on
 # papers with many unmatched refs it would otherwise dominate wall time.
-# Reset by `lookup_all` at the start of each invocation.
+# Each lookup_all() call owns its own budget object, so concurrent users
+# (one Streamlit process, many sessions) can't drain or reset each other's.
 _SCHOLARLY_BUDGET_DEFAULT  = 30
-_SCHOLARLY_BUDGET_LOCK     = threading.Lock()
-_SCHOLARLY_BUDGET_REMAINING: int = 0
+_SCHOLARLY_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scholar")
 
 
-def _scholarly_take_budget() -> bool:
-    """Atomically claim one Scholar call.  Returns False once depleted."""
-    global _SCHOLARLY_BUDGET_REMAINING
-    with _SCHOLARLY_BUDGET_LOCK:
-        if _SCHOLARLY_BUDGET_REMAINING <= 0:
-            return False
-        _SCHOLARLY_BUDGET_REMAINING -= 1
-        return True
+class ScholarBudget:
+    def __init__(self, n: int = _SCHOLARLY_BUDGET_DEFAULT):
+        self._remaining = max(0, n)
+        self._lock = threading.Lock()
 
-
-def _scholarly_reset_budget(n: int = _SCHOLARLY_BUDGET_DEFAULT) -> None:
-    global _SCHOLARLY_BUDGET_REMAINING
-    with _SCHOLARLY_BUDGET_LOCK:
-        _SCHOLARLY_BUDGET_REMAINING = max(0, n)
+    def take(self) -> bool:
+        """Atomically claim one Scholar call.  Returns False once depleted."""
+        with self._lock:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+            return True
 
 
 @_cached("scholarly", postprocess=_refresh_label)
-def _lookup_scholarly(ref: dict[str, Any]) -> dict[str, Any]:
-    global _SCHOLARLY_LAST_CALL, _SCHOLARLY_BLOCKED
+def _lookup_scholarly(ref: dict[str, Any],
+                      budget: ScholarBudget | None = None) -> dict[str, Any]:
+    global _SCHOLARLY_LAST_CALL, _SCHOLARLY_BLOCKED_UNTIL
 
-    if _SCHOLARLY_BLOCKED:
+    if budget is None or time.monotonic() < _SCHOLARLY_BLOCKED_UNTIL:
         return {"status": "skipped"}
 
     extracted_title   = (ref.get("title") or "").strip()
@@ -2005,7 +2092,7 @@ def _lookup_scholarly(ref: dict[str, Any]) -> dict[str, Any]:
 
     # Per-lookup_all() budget: ensures Scholar doesn't dominate wall time
     # on papers with many unmatched refs.  Refuses extra calls quietly.
-    if not _scholarly_take_budget():
+    if not budget.take():
         return {"status": "skipped"}
 
     try:
@@ -2013,20 +2100,23 @@ def _lookup_scholarly(ref: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         return {"status": "skipped"}
 
-    # Serialise calls and pace at ~one every 2.5 s.
+    # Pace at ~one call every 2.5 s.  The lock only covers the pacing
+    # bookkeeping; the request itself runs on a single-worker pool with a
+    # timeout so one hung Scholar call can't wedge every waiting thread.
     with _SCHOLARLY_LOCK:
         wait = _SCHOLARLY_MIN_DELAY - (time.time() - _SCHOLARLY_LAST_CALL)
-        if wait > 0:
-            time.sleep(wait)
-        _SCHOLARLY_LAST_CALL = time.time()
+        _SCHOLARLY_LAST_CALL = time.time() + max(wait, 0)
+    if wait > 0:
+        time.sleep(wait)
 
-        try:
-            pub = _sch.search_single_pub(extracted_title)
-        except Exception as exc:
-            msg = str(exc).lower()
-            if any(h in msg for h in _SCHOLARLY_BLOCK_HINTS):
-                _SCHOLARLY_BLOCKED = True
-            return {"status": "error", "error": str(exc)[:120]}
+    try:
+        pub = _SCHOLARLY_POOL.submit(_sch.search_single_pub, extracted_title) \
+                             .result(timeout=_SCHOLARLY_TIMEOUT)
+    except Exception as exc:
+        msg = (str(exc) or type(exc).__name__).lower()
+        if any(h in msg for h in _SCHOLARLY_BLOCK_HINTS):
+            _SCHOLARLY_BLOCKED_UNTIL = time.monotonic() + _SCHOLARLY_BLOCK_COOLDOWN
+        return {"status": "error", "error": msg[:120]}
 
     if not pub:
         return {"status": "not_found"}
@@ -2093,12 +2183,9 @@ def _lookup_scholarly(ref: dict[str, Any]) -> dict[str, Any]:
 #
 # Cached in SQLite via `@_cached("doi_org")`.
 
-_DOI_ORG_MAILTO  = os.getenv(
-    "DOI_ORG_MAILTO",
-    os.getenv("OPENALEX_MAILTO", "moritz.staudinger@tuwien.ac.at"),
-)
+_DOI_ORG_MAILTO  = os.getenv("DOI_ORG_MAILTO") or _OA_MAILTO
 _DOI_ORG_HEADERS = {
-    "User-Agent": f"ReferenceExplainer/1.0 (mailto:{_DOI_ORG_MAILTO})",
+    "User-Agent": f"ARES/1.0 (mailto:{_DOI_ORG_MAILTO})",
     "Accept":     "application/vnd.citationstyles.csl+json",
 }
 
@@ -2406,7 +2493,7 @@ def _html_unescape(s: str) -> str:
 
 
 _URL_VERIFY_HEADERS = {
-    "User-Agent": f"ARES/1.0 (mailto:{_OA_MAILTO})",
+    "User-Agent": USER_AGENT,
     "Accept":     "text/html,application/xhtml+xml",
 }
 
@@ -2680,7 +2767,9 @@ def _has_mismatch(results: dict[str, Any], sources: list[str]) -> bool:
     )
 
 
-def lookup_reference(ref: dict[str, Any]) -> dict[str, Any]:
+def lookup_reference(ref: dict[str, Any],
+                     scholar_budget: ScholarBudget | None = None,
+                     ) -> dict[str, Any]:
     """
     Look up a single reference through a tiered pipeline:
 
@@ -2796,7 +2885,7 @@ def lookup_reference(ref: dict[str, Any]) -> dict[str, Any]:
     # confirmed the paper.  Skip when the ref is so short or junk-like that
     # a Scholar query would just burn quota.
     if no_academic_match and results["openlibrary"].get("label") != "match":
-        results["scholarly"] = _lookup_scholarly(ref)
+        results["scholarly"] = _lookup_scholarly(ref, scholar_budget)
     else:
         results["scholarly"] = {"status": "skipped"}
 
@@ -2873,11 +2962,14 @@ def lookup_all(
 
     Set ``scholarly_budget=0`` to disable Phase 5 Google Scholar lookups
     entirely (recommended for batch / benchmark runs — Scholar's 2.5 s
-    rate-limit lock dominates wall time).  The UI default keeps Scholar on.
+    rate-limit lock dominates wall time).  The UI default is off.
+
+    A failure while looking up one reference never aborts the run: that
+    reference gets ``{"_error": ...}`` and every source marked ``error``.
     """
     # Scholar budget — capped per lookup_all() call so a single paper with
     # many unmatched refs doesn't burn minutes on serialised Scholar queries.
-    _scholarly_reset_budget(scholarly_budget)
+    budget = ScholarBudget(scholarly_budget) if scholarly_budget > 0 else None
 
     # Identifier-batch pre-warm — one round trip per source, populates the
     # cache so per-ref S2 / OpenAlex / Crossref / arXiv calls become local
@@ -2889,15 +2981,22 @@ def lookup_all(
         _arxiv_batch_prewarm,
     )
     with ThreadPoolExecutor(max_workers=len(_batch_fns)) as _pool:
-        for _fn in _batch_fns:
-            _pool.submit(_fn, references)
-        # implicit wait on context-manager exit
+        for _fut in [_pool.submit(_fn, references) for _fn in _batch_fns]:
+            # Pre-warm is an optimisation; a failure just means per-ref calls.
+            if _fut.exception() is not None:
+                log.warning("pre-warm failed: %r", _fut.exception())
 
     results: list[Any] = [None] * len(references)
     _lock = threading.Lock()
 
     def _worker(i: int, ref: dict) -> int:
-        res = lookup_reference(ref)
+        try:
+            res = refresh_results(lookup_reference(ref, budget), ref)
+        except Exception as exc:
+            log.exception("lookup failed for ref %d", i)
+            res = {src: {"status": "error", "error": str(exc)[:200]}
+                   for src in _ALL_API_SOURCES}
+            res["_error"] = f"{type(exc).__name__}: {exc}"[:300]
         with _lock:
             results[i] = res
         return i

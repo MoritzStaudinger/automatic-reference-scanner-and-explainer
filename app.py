@@ -776,95 +776,12 @@ if "selected_ref" not in st.session_state:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_VALIDATION_SOURCES = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex", "crossref", "openlibrary", "scholarly", "arxiv")
-
-
-def _overall_status(lr: dict | None) -> str:
-    """'match' | 'mismatch' | 'missing' | 'pending'
-
-    match    (green)  – at least one source returned a confirmed match
-    mismatch (red)    – at least one source found a paper at this title
-                        but the authors clearly disagree (= wrong paper /
-                        mis-attribution).  Surfacing this aggressively
-                        is important: the user wants to see the citation
-                        errors, not have them buried.
-    missing  (yellow) – not found anywhere, or only weak/fuzzy results
-
-    Note: composite_label already decides per-source mismatch only when
-    we have positive evidence of a wrong paper (high title + bad authors),
-    never just from a low-tsim closest-match.  So lifting "mismatch" to
-    the overall here is safe.
-    """
-    if lr is None:
-        return "pending"
-
-    found = [
-        lr.get(src, {})
-        for src in _VALIDATION_SOURCES
-        if lr.get(src, {}).get("status") == "found"
-    ]
-    labels = [r.get("label") for r in found]
-
-    if not found:
-        return "missing"
-    if "match" in labels:
-        return "match"
-    if "mismatch" in labels:
-        return "mismatch"   # at least one source is sure it's a wrong paper
-    return "missing"        # only fuzzy / weak results — couldn't confidently find
-
-
-STATUS_ICON = {"match": "🟢", "mismatch": "🔴", "missing": "🟡", "pending": "⚪"}
-
-
-def _status_reason(lr: dict | None) -> str:
-    """One-line plain-English reason for the overall status, displayed
-    next to the ref summary so the user knows *why* it's red/yellow/green
-    without expanding the audit card."""
-    if lr is None:
-        return ""
-
-    found = [(src, lr.get(src, {})) for src in _VALIDATION_SOURCES
-             if lr.get(src, {}).get("status") == "found"]
-    if not found:
-        return "not found in any database"
-
-    matches = [src for src, r in found if r.get("label") == "match"]
-    if matches:
-        # Friendly source names
-        nice = {"doi_org": "doi.org", "semantic_scholar": "Semantic Scholar", "openalex": "OpenAlex",
-                "dblp": "DBLP", "crossref": "Crossref", "arxiv": "arXiv",
-                "scholarly": "Google Scholar", "acl_anthology": "ACL",
-                "openlibrary": "Open Library", "url_verify": "Source URL"}
-        names = [nice.get(s, s) for s in matches[:2]]
-        return f"confirmed by {', '.join(names)}"
-
-    mismatches = [(src, r) for src, r in found if r.get("label") == "mismatch"]
-    if mismatches:
-        # Pick the most specific reason available across all mismatch sources
-        for src, r in mismatches:
-            if r.get("wrong_arxiv_id"):
-                return "cited arXiv ID points to a different paper"
-            if r.get("wrong_doi"):
-                return "cited DOI points to a different paper"
-        # Authors disagreed at any title floor
-        for src, r in mismatches:
-            if r.get("wrong_authors"):
-                return "title matches but the cited authors don't"
-        # Venue disagreed (excluding preprints) at any title floor
-        for src, r in mismatches:
-            if r.get("wrong_venue"):
-                return "title matches but the cited venue doesn't"
-        # Legacy tier-1 catch (kept for cached results predating the flag)
-        for src, r in mismatches:
-            asim = r.get("authors_sim")
-            sim  = r.get("similarity")
-            if asim is not None and asim < 0.35 and sim is not None and sim >= 0.70:
-                return "title matches but the cited authors don't"
-        return "found a paper at this title but details disagree"
-
-    # Only fuzzy results
-    return "no confident match found"
+from verdict import (
+    STATUS_ICON,
+    overall_status as _overall_status,
+    status_reason as _status_reason,
+    status_rgba,
+)
 
 
 def _lookup_rows_html(lr: dict, extracted_title: str | None, extracted_venue: str | None) -> str:
@@ -1293,17 +1210,10 @@ with col_refs:
     # post-lookup improvements to author_similarity / preprint-venue
     # handling without forcing a re-run of the API calls.
     if lookup_results:
-        from lookup import refresh_result_against_ref
-        _SRC_KEYS = ("semantic_scholar", "acl_anthology", "dblp", "openalex",
-                     "crossref", "openlibrary", "scholarly", "arxiv")
+        from lookup import refresh_results
         for lr_idx, lr in enumerate(lookup_results):
-            if not isinstance(lr, dict) or lr_idx >= len(enriched_refs):
-                continue
-            ref = enriched_refs[lr_idx]
-            for src in _SRC_KEYS:
-                r = lr.get(src)
-                if isinstance(r, dict):
-                    lr[src] = refresh_result_against_ref(r, ref)
+            if isinstance(lr, dict) and lr_idx < len(enriched_refs):
+                refresh_results(lr, enriched_refs[lr_idx])
 
     if lookup_results is None:
         if st.button("Look up all references", type="primary"):
@@ -1673,12 +1583,7 @@ with col_pdf:
         # combined opacity (~0.40) now that the baked PDF rect is gone in
         # selector mode.  See bake_color in highlighter.py for the
         # rationale.  Tune these if a colour is too loud or too faint.
-        _STATUS_TO_COLOR = {
-            "match":    "rgba(46, 200, 90, 0.40)",   # green
-            "mismatch": "rgba(237, 70, 70, 0.40)",   # red
-            "missing":  "rgba(255, 217, 51, 0.45)",  # yellow
-            "pending":  "rgba(255, 217, 51, 0.45)",  # same yellow as missing
-        }
+
         component_annots: list[dict[str, Any]] = []
         for i, er in enumerate(enriched_refs):
             if not er.get("rect") or not er.get("page"):
@@ -1697,7 +1602,7 @@ with col_pdf:
             component_annots.append({
                 "page":      er["page"],
                 "rect":      er["rect"],
-                "color":     _STATUS_TO_COLOR.get(stat, _STATUS_TO_COLOR["pending"]),
+                "color":     status_rgba(stat),
                 # opacity=1.0 lets the rgba alpha above reach the canvas
                 # at face value.  The old 0.40 assumed a baked PDF layer
                 # underneath was carrying half the opacity; once we

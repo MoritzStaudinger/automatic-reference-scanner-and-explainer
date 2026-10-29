@@ -9,6 +9,8 @@ from typing import Any
 
 import fitz  # PyMuPDF
 
+from verdict import STATUS_RGB
+
 
 Color = tuple[float, float, float]
 
@@ -18,15 +20,7 @@ Color = tuple[float, float, float]
 #   missing  = yellow  → couldn't find in any database (NOT proof of wrong;
 #                        common for blogs/tech-reports/uncommon venues)
 #   pending  = pale yellow → lookup not yet completed
-COLORS: dict[str, Color] = {
-    "match":    (0.18, 0.78, 0.35),   # green
-    "mismatch": (0.93, 0.27, 0.27),   # red
-    "missing":  (1.00, 0.85, 0.20),   # clearer yellow
-    "pending":  (1.00, 0.85, 0.20),   # same yellow as missing — pending and
-                                      # missing are visually indistinguishable
-                                      # in the UI, so the baked PDF colour
-                                      # matches.  Status changes after lookup.
-}
+COLORS: dict[str, Color] = dict(STATUS_RGB)
 
 
 def _clean_for_search(text: str) -> str:

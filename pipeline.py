@@ -30,7 +30,8 @@ from parsers import (
     extract_references_pymupdf4llm,
 )
 from lookup import lookup_all
-from report import _best_found, _categorise_suspicious, _overall_status
+from report import _best_found, _categorise_suspicious
+from verdict import overall_status as _overall_status
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +316,8 @@ def process_pdf(
 
     # 4. Lookup — fan out to the configured sources per ref.
     t = time.time()
-    lookup_results = lookup_all(refs)
+    # Scholar scraping from a server IP gets CAPTCHA-blocked fast; never in API/batch.
+    lookup_results = lookup_all(refs, scholarly_budget=0)
     lookup_s = time.time() - t
 
     # 5. Tabulate
