@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from cache import get_cache
-from lookup import USER_AGENT, _SESSION      # connection-pooled session
+from lookup import USER_AGENT
 
 
 # Lazy CORE support: only try CORE for refs whose OA chain came up empty,
@@ -214,12 +214,25 @@ def _extract_abstract(lookup_sources: dict[str, Any]) -> tuple[str, str]:
     Prefer S2 abstract (usually longer + cleaner); fall back to OpenAlex.
     Returns (text, source_tag) — empty text signals no abstract available.
     """
-    s2 = (lookup_sources.get("semantic_scholar") or {}).get("abstract") or ""
-    if s2:
-        return s2, "abstract_s2"
-    oa = (lookup_sources.get("openalex") or {}).get("abstract") or ""
-    if oa:
-        return oa, "abstract_openalex"
+    for src, tag in (("semantic_scholar", "abstract_s2"), ("openalex", "abstract_openalex"),
+                     ("arxiv", "abstract_arxiv"), ("crossref", "abstract_crossref"),
+                     ("doi_org", "abstract_doi")):
+        r = lookup_sources.get(src) or {}
+        if r.get("status") != "found" or r.get("label") == "mismatch":
+            continue      # an abstract of a *different* paper is no evidence
+        text = re.sub(r"<[^>]+>", " ", r.get("abstract") or "")   # JATS markup
+        text = " ".join(text.split())
+        if len(text) > 80:
+            return text, tag
+    # Routes that stop at doi.org / arXiv never queried an abstract-bearing
+    # source.  Fetch one on demand by DOI.
+    doi = next((r.get("doi") for r in lookup_sources.values()
+                if isinstance(r, dict) and r.get("label") == "match" and r.get("doi")), "")
+    if doi:
+        from lookup import fetch_abstract
+        text = fetch_abstract(doi)
+        if len(text) > 80:
+            return text, "abstract_openalex"
     return "", ""
 
 

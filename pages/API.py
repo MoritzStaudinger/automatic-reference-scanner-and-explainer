@@ -1,96 +1,73 @@
 """
-HTTP API reference page for ARES.
+HTTP API reference page.
 
-Intentionally minimal — the live OpenAPI/Swagger UI at /api/docs is the
-source of truth for endpoints, request shapes, and response schemas.
-This page exists to point users there and give one copy-pasteable curl.
+Deliberately short — the live OpenAPI UI at /api/docs is the source of
+truth for endpoints and schemas.  This page points there and gives
+copy-pasteable examples for whichever hostname the visitor used.
 """
 
 import os
+
 import streamlit as st
 
+_KNOWN_HOSTS = {"reference-cleaner.ds-ifs.tuwien.ac.at", "arse.ds-ifs.tuwien.ac.at"}
+_DEFAULT_BASE = os.getenv("ARES_API_PUBLIC_BASE", "https://reference-cleaner.ds-ifs.tuwien.ac.at")
 
-st.set_page_config(
-    page_title="API — ARES",
-    layout="wide",
-)
-
-
-# Mirror the typography from pages/About.py so the sidebar of pages
-# reads as one cohesive thing.
-st.markdown("""
-<style>
-html, body, [class*="css"] {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
-                 "Helvetica Neue", Arial, sans-serif;
-}
-h1, h2, h3, h4 { letter-spacing: -0.01em; color: #1f2933; }
-.stApp h1 { font-weight: 600; font-size: 1.95rem; }
-.stApp h2 { font-weight: 600; font-size: 1.35rem; margin-top: 2rem; }
-.api-lead {
-    font-size: 1.05rem;
-    line-height: 1.6;
-    color: #343a40;
-    max-width: 780px;
-    margin-bottom: 1.2rem;
-}
-[data-testid="stSidebarNav"] { display: none; }
-</style>
-""", unsafe_allow_html=True)
-
-
-with st.sidebar:
-    st.page_link("app.py",          label="Validate a PDF")
-    st.page_link("pages/API.py",    label="API")
-    st.page_link("pages/About.py",  label="About")
-    st.divider()
-
-
-# Resolve the public base URL from the request so the curl snippet
-# works on whatever host the visitor reaches us at.
-try:
-    _hdrs   = st.context.headers       # Streamlit ≥ 1.40
-    _scheme = _hdrs.get("x-forwarded-proto", "https")
-    _host   = _hdrs.get("host", "reference-cleaner.ds-ifs.tuwien.ac.at")
-    BASE = f"{_scheme}://{_host}"
-except Exception:
-    BASE = os.getenv("ARES_API_PUBLIC_BASE",
-                     "https://reference-cleaner.ds-ifs.tuwien.ac.at")
-
+# Examples use the host the visitor reached us at — only if it is one of
+# ours, so a forged Host header can't put another URL on the page.
+host = (st.context.headers.get("host") or "").split(":")[0].lower()
+BASE = f"https://{host}" if host in _KNOWN_HOSTS else _DEFAULT_BASE
 
 st.title("HTTP API")
 st.markdown(
-    '<p class="api-lead">'
-    "ARES exposes the same pipeline this UI uses over HTTP — "
-    "single-PDF processing and async batch.  "
-    f'The full interactive reference is at <a href="{BASE}/api/docs">'
-    f"<code>{BASE}/api/docs</code></a>."
-    '</p>',
-    unsafe_allow_html=True,
+    "The pipeline behind this site is also available over HTTP: process one PDF "
+    "synchronously, or submit a batch and collect the results later. "
+    f"The interactive reference is at [{BASE}/api/docs]({BASE}/api/docs)."
 )
 
-st.markdown(
-    "Authenticate with an `X-API-Key` header on every call to `/api/*`.  "
-    "To request a key, email "
-    "[moritz.staudinger@tuwien.ac.at](mailto:moritz.staudinger@tuwien.ac.at?subject=ARES%20API%20key%20request)"
-    " with a one-line note about what you want to use it for.  "
-    "`GET /healthz` is the only unauthenticated endpoint."
-)
+with st.container(border=True):
+    st.markdown(
+        "**:material/key: Access** — every `/api/*` call needs an `X-API-Key` header. "
+        "To request a key, email "
+        "[moritz.staudinger@tuwien.ac.at](mailto:moritz.staudinger@tuwien.ac.at?subject=ARES%20API%20key%20request) "
+        "with a line about what you want to use it for."
+    )
 
+st.subheader("Check one paper")
 st.code(
     f'curl -fsS -X POST {BASE}/api/v1/process \\\n'
     f'     -H "X-API-Key: $ARES_API_KEY" \\\n'
     f'     -F file=@paper.pdf \\\n'
-    f'     -F parser=grobid \\\n'
+    f'     -F parser=hybrid \\\n'
+    f'     -F use_llm=1 \\\n'
     f'     > report.json',
     language="bash",
 )
-
 st.markdown(
-    "Pass `-F verify_claims=1` to also run per-citation claim "
-    "verification.  Two modes:\n\n"
-    "- `verify_depth=abstract` (default): fast, ~30-60 s per paper, "
-    "  ~40% of refs verifiable (many don't have S2/OpenAlex abstracts).\n"
-    "- `verify_depth=fulltext`: slow, minutes-to-hours, ~80% of refs "
-    "  verifiable (fetches OA PDFs from arXiv / S2 / OpenAlex)."
+    "The response has a `summary` (counts, timings, LLM-repair and parser-fallback "
+    "notes) and one entry per reference with its overall status, the reason, and "
+    "what each source returned."
 )
+
+st.subheader("Batches")
+st.code(
+    f'job=$(curl -fsS -X POST {BASE}/api/v1/batch -H "X-API-Key: $ARES_API_KEY" \\\n'
+    f'      -F files=@a.pdf -F files=@b.pdf -F parser=hybrid | jq -r .job_id)\n'
+    f'curl -fsS {BASE}/api/v1/batch/$job -H "X-API-Key: $ARES_API_KEY"          # progress\n'
+    f'curl -fsS {BASE}/api/v1/batch/$job/results.jsonl -H "X-API-Key: $ARES_API_KEY"',
+    language="bash",
+)
+
+st.subheader("Citation context")
+st.markdown(
+    "Add `-F verify_claims=1` to also check whether each cited paper supports the "
+    "sentence that cites it.\n\n"
+    "- `verify_depth=abstract` (default) compares against the cited paper's abstract — "
+    "fast, but only papers with an indexed abstract can be checked.\n"
+    "- `verify_depth=fulltext` downloads open-access full texts first — slower, "
+    "and covers more papers."
+)
+
+st.caption("Limits: one synchronous request is processed at a time per slot; when the "
+           "server is busy you get `503` with `Retry-After`. Requests per IP are "
+           "rate-limited (`429`).")

@@ -65,11 +65,16 @@ def test_finalize_match() -> None:
     )
 
     # Just-above-floor: titles are essentially the same, authors disagree.
-    r = _finalize_match(0.88, 0.10, None, "", "")
+    from lookup import WRONG_FLAG_TITLE_FLOOR
+    r = _finalize_match(WRONG_FLAG_TITLE_FLOOR + 0.01, 0.10, None, "", "")
     check(
-        "wrong_authors fires just above floor (tsim 0.88, asim 0.10)",
+        "wrong_authors fires just above floor (asim 0.10)",
         r.get("wrong_authors") is True and r["label"] == "mismatch",
     )
+    # A different paper with a similar title (0.86) is not "wrong authors".
+    r = _finalize_match(0.86, 0.10, None, "", "")
+    check("near-title (0.86) with other authors is not a mismatch",
+          not r.get("wrong_authors") and r["label"] != "mismatch", f"{r}")
 
     # Just-below-floor: typical "nearest-titled paper in the index"
     # case — flagging would produce false positives (e.g. Anthropic

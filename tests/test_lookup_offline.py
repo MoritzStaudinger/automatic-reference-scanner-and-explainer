@@ -56,3 +56,11 @@ def test_refresh_label_keeps_wrong_venue_mismatch():
          "venue_sim": 0.1, "found_venue": "ICML", "label": "mismatch",
          "wrong_venue": True}
     assert lookup._refresh_label(r)["label"] == "mismatch"
+
+
+def test_near_title_different_authors_is_not_mismatch():
+    # "Paraphrasing user stories with LLMs" vs "Paraphrasing with LLMs"
+    r = lookup._finalize_match(0.86, 0.0, None, "", "")
+    assert not r.get("wrong_authors") and r["label"] != "mismatch"
+    r = lookup._finalize_match(0.99, 0.0, None, "", "")
+    assert r.get("wrong_authors") and r["label"] == "mismatch"

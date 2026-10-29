@@ -360,9 +360,7 @@ async function renderAllPages() {
     const idx = state.pendingScrollToPage - 1;
     if (state.pageElements[idx]) {
       // small delay to let layout settle
-      requestAnimationFrame(() =>
-        state.pageElements[idx].el.scrollIntoView({ block: "start", behavior: "auto" })
-      );
+      requestAnimationFrame(() => scrollWrapTo(state.pageElements[idx].el, "auto"));
     }
     state.pendingScrollToPage = null;
   }
@@ -427,10 +425,20 @@ function updatePageBar() {
   if (label) label.textContent = `${state.pageNum} / ${state.totalPages}`;
 }
 
+// Scroll only the viewer's own container.  scrollIntoView() also scrolls
+// every ancestor — including the Streamlit page around this iframe — so
+// "Show on p. N" used to yank the whole app down.
+function scrollWrapTo(el, behavior) {
+  const wrap = document.getElementById("pages-wrap");
+  if (!wrap || !el) return;
+  const top = el.getBoundingClientRect().top - wrap.getBoundingClientRect().top + wrap.scrollTop;
+  wrap.scrollTo({ top: Math.max(0, top - 8), behavior });
+}
+
 function scrollToPage(n) {
   if (n < 1 || n > state.totalPages) return;
   const pi = state.pageElements[n - 1];
-  if (pi) pi.el.scrollIntoView({ block: "start", behavior: "smooth" });
+  if (pi) scrollWrapTo(pi.el, "smooth");
 }
 
 async function loadPdf(pdfBytes, annotations, scrollToTarget) {
@@ -602,8 +610,19 @@ function _clearSelecting() {
   });
 })();
 
+function applyTheme(theme) {
+  if (!theme) return;
+  const root = document.documentElement;
+  root.classList.toggle("dark", theme.base === "dark");
+  if (theme.primaryColor) {
+    root.style.setProperty("--accent", theme.primaryColor);
+    root.style.setProperty("--accent-hover", theme.primaryColor);
+  }
+}
+
 function onRender(event) {
   const args = event.detail.args || {};
+  applyTheme(event.detail.theme);
   // Always update the emit flag — it controls JS-side behaviour for
   // page-change emissions and doesn't itself require a re-render.
   state.emitPageChanges = !!args.emit_page_changes;
@@ -629,7 +648,11 @@ function onRender(event) {
   // that got lost), the skip prevented recovery.  Splitting lets the
   // annotation-only path always run when there's a change, while the
   // expensive PDF reload still gets the skip optimisation.
-  const pdfKey   = (args.pdf_b64 || "").length;
+  // Length plus content samples: length alone treated two different
+  // PDFs of the same encoded size as unchanged.
+  const b64      = args.pdf_b64 || "";
+  const mid      = b64.length >> 1;
+  const pdfKey   = `${b64.length}:${b64.slice(-96)}:${b64.slice(mid, mid + 96)}`;
   const annotKey = JSON.stringify(args.annotations || []);
   const pdfUnchanged   = pdfKey   === _lastPdfKey;
   const annotUnchanged = annotKey === _lastAnnotKey;

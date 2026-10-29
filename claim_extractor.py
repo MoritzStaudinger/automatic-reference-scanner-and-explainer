@@ -175,6 +175,9 @@ def _sentences_around(text: str, span_start: int, span_end: int) -> str:
     sentence = text[left:right].strip()
     # Collapse whitespace + strip markdown emphasis noise.
     sentence = re.sub(r"\s+", " ", sentence)
+    # pymupdf4llm body text is markdown: drop emphasis markers so they
+    # don't reach the LLM prompt or the UI.
+    sentence = re.sub(r"(\*\*|__|(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w))", "", sentence)
     return sentence
 
 

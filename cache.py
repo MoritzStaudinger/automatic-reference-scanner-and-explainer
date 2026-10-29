@@ -99,6 +99,18 @@ class _LookupCache:
             self._conn.commit()
         return n
 
+    def forget(self, keys: list[str]) -> int:
+        """Delete every source's entry for these keys (per-ref re-check)."""
+        keys = [k for k in keys if k]
+        if not keys:
+            return 0
+        with self._lock:
+            n = self._conn.execute(
+                f"DELETE FROM cache WHERE key IN ({','.join('?' * len(keys))})", keys
+            ).rowcount
+            self._conn.commit()
+        return n
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(

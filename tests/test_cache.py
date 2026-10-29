@@ -46,3 +46,11 @@ def test_custom_key_fn(fresh_cache):
     lookup({"title": "T", "url": "https://b.example"})
     lookup({"title": "T", "url": "https://a.example"})
     assert calls == ["https://a.example", "https://b.example"]
+
+
+def test_forget(fresh_cache):
+    fresh_cache.set("openalex", "k1", {"status": "found"})
+    fresh_cache.set("crossref", "k1", {"status": "not_found"})
+    fresh_cache.set("crossref", "k2", {"status": "found"})
+    assert fresh_cache.forget(["k1", None]) == 2
+    assert fresh_cache.stats() == {"crossref": 1}

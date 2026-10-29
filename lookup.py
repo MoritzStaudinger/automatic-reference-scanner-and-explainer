@@ -196,8 +196,16 @@ VENUE_MISMATCH_THRESHOLD = 0.40
 # those gates are inverted (tsim < 0.50 → flag) because the identifier
 # itself proves the source resolved a specific paper, so a wildly
 # different title means the IDENTIFIER is wrong.
-WRONG_FLAG_TITLE_FLOOR = 0.85
+#
+# Raised from 0.85 to 0.93: genuine same-paper pairs score ~1.0, while a
+# *different* paper with a similar title lands at 0.82-0.86 ("Paraphrasing
+# user stories with LLMs" vs "Paraphrasing with LLMs" = 0.86).  At 0.85 such
+# near-titles were declared "right paper, wrong authors" → false mismatch.
+WRONG_FLAG_TITLE_FLOOR = 0.93
 WRONG_VENUE_THRESHOLD  = 0.30
+# Inverted gate for identifier routes: below this the cited DOI / arXiv ID
+# resolved to a clearly different paper.
+WRONG_ID_TITLE_FLOOR   = 0.50
 
 _ARXIV_ID_RE = re.compile(
     r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})"
@@ -1455,7 +1463,7 @@ def _oa_work_to_result(
     if (cited_doi
             and extracted_title
             and tsim is not None
-            and tsim < WRONG_FLAG_TITLE_FLOOR):
+            and tsim < WRONG_ID_TITLE_FLOOR):
         out["wrong_doi"] = cited_doi
         out["label"]     = "mismatch"
     if finalised.get("wrong_authors"):
@@ -1684,6 +1692,7 @@ def _arxiv_batch_prewarm(refs: list[dict[str, Any]]) -> int:
                 "venue_label":   "unknown",
                 "arxiv_id":      full_id,
                 "url":           paper.entry_id,
+                "abstract":      (paper.summary or "").strip()[:8000],
             }
             if wrong_arxiv_id:
                 entry["wrong_arxiv_id"] = wrong_arxiv_id
@@ -1759,6 +1768,7 @@ def _lookup_arxiv(ref: dict[str, Any]) -> dict[str, Any]:
             "venue_label":   "unknown",
             "arxiv_id":      arxiv_id_found,
             "url":           paper.entry_id,
+            "abstract":      (paper.summary or "").strip()[:8000],
         }
         if wrong_arxiv_id:
             result["wrong_arxiv_id"] = wrong_arxiv_id
@@ -1841,6 +1851,8 @@ def _crossref_msg_to_result(
         "doi":           doi_val,
         "url":           f"https://doi.org/{doi_val}",
     }
+    if msg.get("abstract"):
+        out["abstract"] = str(msg["abstract"])[:8000]   # JATS; stripped by fulltext
     if finalised.get("wrong_authors"):
         out["wrong_authors"] = True
     if finalised.get("wrong_venue"):
@@ -1938,7 +1950,7 @@ def _lookup_crossref(ref: dict[str, Any]) -> dict[str, Any]:
                 # the same gate in _lookup_doi_org / _lookup_semantic_scholar.
                 if (extracted_title and result.get("found_title")
                         and result.get("similarity") is not None
-                        and result["similarity"] < WRONG_FLAG_TITLE_FLOOR):
+                        and result["similarity"] < WRONG_ID_TITLE_FLOOR):
                     result["wrong_doi"] = doi
                     result["label"]     = "mismatch"
                 return result
@@ -3093,6 +3105,29 @@ def count_cached_refs(references: list[dict[str, Any]]) -> tuple[int, int]:
         if key and cache.get("semantic_scholar", key) is not None:
             n_cached += 1
     return n_cached, len(references)
+
+
+def fetch_abstract(doi: str) -> str:
+    """Abstract for a DOI from OpenAlex, on demand — used by citation
+    checks when the lookup route never queried an abstract-bearing source
+    (e.g. a reference confirmed by doi.org or arXiv alone)."""
+    try:
+        _bump_http_count(_OA_BASE)
+        r = _http_get_retry(f"{_OA_BASE}/https://doi.org/{doi}",
+                            params={"mailto": _OA_MAILTO,
+                                    "select": "abstract_inverted_index"},
+                            headers=_OA_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return ""
+        return _oa_reconstruct_abstract(r.json().get("abstract_inverted_index"))
+    except Exception:
+        return ""
+
+
+def forget_reference(ref: dict[str, Any]) -> int:
+    """Drop every cached source result for ``ref`` so the next lookup
+    re-queries live (the UI's per-reference "Re-check")."""
+    return _get_cache().forget([_cache_key(ref), _url_cache_key(ref)])
 
 
 def lookup_all(
