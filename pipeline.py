@@ -137,6 +137,8 @@ class PipelineReport:
     lookup_seconds: float
     parser: str
     used_llm: bool
+    # LLM repair outcome — {backend, model, n_sent, n_failed_refs, first_error, ...}
+    llm_stats: dict[str, Any] = field(default_factory=dict)
     # Claim verification block — empty when opts.verify_claims is False.
     verify_claims_seconds: float = 0.0
     n_claims:           int = 0
@@ -156,6 +158,7 @@ class PipelineReport:
             "n_missing":  self.n_missing,
             "parser":     self.parser,
             "used_llm":   self.used_llm,
+            **({"llm_repair": self.llm_stats} if self.llm_stats else {}),
             "timings_seconds": {
                 "parse":  round(self.parse_seconds, 2),
                 "repair": round(self.repair_seconds, 2),
@@ -199,15 +202,17 @@ def _run_parser(pdf_path: str, parser: str) -> tuple[list[dict[str, Any]], str]:
     )
 
 
-def _maybe_run_llm(refs: list[dict[str, Any]], opts: PipelineOptions) -> list[dict[str, Any]]:
+def _maybe_run_llm(refs: list[dict[str, Any]], opts: PipelineOptions,
+                   stats: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if not opts.use_llm:
         return refs
     # Import lazily — `llm_parser` imports anthropic / openai which are
     # only needed when the user opted in.  Saves ~150ms startup on the API.
-    from llm_parser import parse_references_with_llm, set_active_model
-    if opts.llm_backend or opts.llm_model:
-        set_active_model(opts.llm_backend, opts.llm_model)
-    return parse_references_with_llm(refs)
+    from llm_parser import parse_references_with_llm
+    # Per-call backend/model: set_active_model mutates module state and
+    # would race between concurrent API requests.
+    return parse_references_with_llm(refs, stats=stats, backend=opts.llm_backend,
+                                     model=opts.llm_model)
 
 
 def _ref_to_report(
@@ -307,7 +312,8 @@ def process_pdf(
 
     # 2. LLM repair (optional)
     t = time.time()
-    refs = _maybe_run_llm(refs, opts)
+    llm_stats: dict[str, Any] = {}
+    refs = _maybe_run_llm(refs, opts, llm_stats)
     repair_s = time.time() - t
 
     # 3. Dedupe near-duplicates introduced by the parser (e.g. one ref
@@ -351,7 +357,10 @@ def process_pdf(
         repair_seconds  = repair_s,
         lookup_seconds  = lookup_s,
         parser          = opts.parser,
-        used_llm        = opts.use_llm,
+        used_llm        = opts.use_llm and not (
+            llm_stats.get("n_sent", 0) == 0 or
+            llm_stats.get("n_failed_refs") == llm_stats.get("n_sent")),
+        llm_stats       = llm_stats,
         verify_claims_seconds = verify_s,
         n_claims           = counts["n_claims"],
         n_supported        = counts["n_supported"],

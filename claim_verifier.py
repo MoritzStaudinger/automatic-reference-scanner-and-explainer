@@ -132,10 +132,13 @@ def _build_user_message(claims: list[Claim], ft: FullText) -> str:
 _CACHE_SOURCE = "claim_verify"
 
 
-def _cache_key(claim: Claim, ft: FullText) -> str:
+def _cache_key(claim: Claim, ft: FullText, model: str = "") -> str:
     """Per-sentence key so a re-run over a different bundle still hits
-    cached verdicts on the sentences we already scored."""
+    cached verdicts on the sentences we already scored.  Includes the
+    model so switching backends doesn't serve another model's verdicts."""
     h = hashlib.sha256()
+    h.update(model.encode("utf-8"))
+    h.update(b"\0")
     h.update(claim.text.encode("utf-8"))
     h.update(b"\0")
     h.update(ft.text[:10_000].encode("utf-8"))
@@ -242,8 +245,23 @@ def _sanitize_verdict(raw: dict) -> dict:
 _LLM_TIMEOUT_S = float(os.getenv("LLM_VERIFY_TIMEOUT_S", "90"))
 
 
+# Claims per LLM call.  Each verdict is ~150-250 output tokens; larger
+# batches risked truncated JSON and an error verdict for every claim.
+_MAX_CLAIMS_PER_CALL = 6
+
+
+def _max_tokens_for(n_claims: int) -> int:
+    return min(400 + 300 * n_claims, 8000)
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """401/403 from either SDK — retrying won't help."""
+    return type(exc).__name__ in ("PermissionDeniedError", "AuthenticationError",
+                                  "PermissionError")
+
+
 def _call_llm(client, backend: str, model: str, system: str, user: str,
-              timeout_s: Optional[float] = None) -> str:
+              timeout_s: Optional[float] = None, n_claims: int = 1) -> str:
     """
     Dispatch a batched-verify call, honouring a per-call timeout.  Both
     backends surface timeout as a native exception, which the retry
@@ -258,7 +276,7 @@ def _call_llm(client, backend: str, model: str, system: str, user: str,
         scoped = client.with_options(timeout=t)
         kwargs: dict[str, Any] = {
             "model":      model,
-            "max_tokens": 700,
+            "max_tokens": _max_tokens_for(n_claims),
             "messages":   [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -269,21 +287,23 @@ def _call_llm(client, backend: str, model: str, system: str, user: str,
         resp = scoped.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
-    # Default = anthropic.  System prompt is fixed so caching helps
-    # across all verifications on the same paper.  `timeout` is a
-    # per-request kwarg supported by the SDK directly.
+    # Default = anthropic.  `timeout` is a per-request kwarg supported by
+    # the SDK directly.  Haiku 5.x thinks by default; a verdict per
+    # sentence doesn't need it (Opus/Sonnet 5.5 reject "disabled").
+    extra: dict[str, Any] = {}
+    if model.startswith("claude-haiku-5"):
+        extra["thinking"] = {"type": "disabled"}
     msg = client.messages.create(
         model=model,
-        max_tokens=700,
-        system=[{
-            "type":          "text",
-            "text":          system,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        max_tokens=_max_tokens_for(n_claims),
+        system=system,
         messages=[{"role": "user", "content": user}],
         timeout=t,
+        **extra,
     )
-    return msg.content[0].text if msg.content else ""
+    if msg.stop_reason == "refusal":
+        raise RuntimeError("model declined the request (refusal)")
+    return next((b.text for b in msg.content if b.type == "text"), "")
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +367,12 @@ def verify_batch(
     if claim_indices is None:
         claim_indices = list(range(len(claims)))
     assert len(claim_indices) == len(claims)
+    if len(claims) > _MAX_CLAIMS_PER_CALL:
+        out: list[ClaimVerification] = []
+        for k in range(0, len(claims), _MAX_CLAIMS_PER_CALL):
+            out.extend(verify_batch(claims[k:k + _MAX_CLAIMS_PER_CALL], ft,
+                                    claim_indices[k:k + _MAX_CLAIMS_PER_CALL]))
+        return out
 
     backend, model = active_model()
 
@@ -355,7 +381,7 @@ def verify_batch(
     verdicts: list[Optional[ClaimVerification]] = [None] * len(claims)
     miss_indices: list[int] = []
     for i, c in enumerate(claims):
-        key = _cache_key(c, ft)
+        key = _cache_key(c, ft, model)
         hit = _cached_get(key)
         if hit is not None:
             verdicts[i] = _mk_from_cache(c, ft, hit, model, claim_indices[i])
@@ -386,13 +412,13 @@ def verify_batch(
     last_err: Optional[str]  = None
     for attempt in range(2):
         try:
-            raw_text = _call_llm(client, backend, model, _SYSTEM_PROMPT, user_msg)
+            raw_text = _call_llm(client, backend, model, _SYSTEM_PROMPT, user_msg,
+                                 n_claims=len(miss_claims))
             break
-        except PermissionError as exc:
-            last_err = f"permission denied: {exc}"
-            break                                        # don't retry
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
+            if _is_auth_error(exc):
+                break                                    # don't retry
             if attempt == 0:
                 client = _make_client() or client        # fresh client
                 continue
@@ -409,7 +435,7 @@ def verify_batch(
         # the second attempt (temperature quirks, mid-stream truncation).
         try:
             raw_text = _call_llm(client, backend, model,
-                                 _SYSTEM_PROMPT, user_msg)
+                                 _SYSTEM_PROMPT, user_msg, n_claims=len(miss_claims))
             parsed = _parse_llm_response(raw_text)
         except Exception:
             parsed = None
@@ -427,7 +453,7 @@ def verify_batch(
         raw = parsed[slot] if isinstance(parsed[slot], dict) else {}
         sanitized = _sanitize_verdict(raw)
         sanitized["model"] = model
-        _cached_set(_cache_key(claims[i], ft), sanitized)
+        _cached_set(_cache_key(claims[i], ft, model), sanitized)
         verdicts[i] = ClaimVerification(
             claim_index=claim_indices[i],
             cited_ref_index=claims[i].cited_ref_index,

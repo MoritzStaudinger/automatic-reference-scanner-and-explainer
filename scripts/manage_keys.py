@@ -95,10 +95,19 @@ def cmd_add(args: argparse.Namespace) -> int:
     if _find_by_label(keys, args.label):
         sys.exit(f"error: a key with label {args.label!r} already exists "
                  f"(revoke it first)")
+    if args.expires:
+        try:
+            exp = datetime.datetime.fromisoformat(args.expires.replace("Z", "+00:00"))
+        except ValueError:
+            sys.exit(f"error: --expires {args.expires!r} is not ISO-8601 "
+                     f"(YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        args.expires = exp.isoformat()
     new = _new_key()
     keys[new] = {
         "label":       args.label,
-        "created_at":  datetime.datetime.now().replace(microsecond=0).isoformat(),
+        "created_at":  datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
         "expires_at":  args.expires,
     }
     _save(args.file, keys)
@@ -163,7 +172,8 @@ def main(argv: list[str] | None = None) -> int:
                             "service handle, or anything searchable).")
     p_add.add_argument("--expires",
                        help="Optional expiry as ISO-8601 (YYYY-MM-DD "
-                            "or YYYY-MM-DDTHH:MM:SS).  No expiry by default.")
+                            "or YYYY-MM-DDTHH:MM:SS, UTC unless an offset "
+                            "is given).  No expiry by default.")
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="List all keys with their metadata.")

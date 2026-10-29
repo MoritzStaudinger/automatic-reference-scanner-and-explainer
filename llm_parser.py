@@ -10,15 +10,18 @@ sees both the raw citation text AND the regex parse, and is asked to
 
 Backends
 --------
-- ``anthropic`` (default) — Claude Haiku 4.5, uses prompt caching on
-  the system prompt.  Paid; see Anthropic pricing.
+- ``anthropic`` — Claude Haiku 5.5 by default.  Paid; see Anthropic
+  pricing.
 - ``aqueduct`` — free OpenAI-compatible endpoint hosted at
   https://aqueduct.ai.datalab.tuwien.ac.at/ (TU Wien DataLab).
   Supports Qwen 3.6 35B and others.  No prompt caching.
 
 Switch via env:
     LLM_BACKEND=aqueduct LLM_MODEL=qwen-3.6-35b python ...
-    LLM_BACKEND=anthropic LLM_MODEL=claude-haiku-4-5 python ...   # default
+    LLM_BACKEND=anthropic LLM_MODEL=claude-haiku-5-5 python ...
+
+When LLM_BACKEND is unset the backend follows whichever key is configured
+(ANTHROPIC_API_KEY first, then AQUEDUCT_API_KEY) — see resolve_backend().
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 _BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE") or "20")
 
@@ -39,10 +42,32 @@ _BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE") or "20")
 # higher concurrency too, so the same default works there.
 _MAX_PARALLEL_BATCHES = int(os.getenv("LLM_PARALLEL", "8"))
 
-_BACKEND = (os.getenv("LLM_BACKEND") or "anthropic").lower()
-_MODEL = os.getenv("LLM_MODEL") or (
-    "qwen-3.6-35b" if _BACKEND == "aqueduct" else "claude-haiku-4-5"
-)
+_DEFAULT_MODELS = {"anthropic": "claude-haiku-5-5", "aqueduct": "qwen-3.6-35b"}
+
+
+def resolve_backend() -> str:
+    """The backend to use: LLM_BACKEND if set, else whichever provider has a
+    key configured.  app.py, pipeline.py and claim_verifier.py all go
+    through this, so the UI never shows one backend while another runs."""
+    explicit = (os.getenv("LLM_BACKEND") or "").strip().lower()
+    if explicit:
+        return explicit
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.getenv("AQUEDUCT_API_KEY"):
+        return "aqueduct"
+    return "anthropic"
+
+
+def llm_available() -> bool:
+    """True when the active backend has an API key configured."""
+    key = "AQUEDUCT_API_KEY" if _BACKEND == "aqueduct" else "ANTHROPIC_API_KEY"
+    return bool(os.getenv(key))
+
+
+_BACKEND = resolve_backend()
+_MODEL = os.getenv("LLM_MODEL") or _DEFAULT_MODELS.get(_BACKEND, "claude-haiku-5-5")
+_ANTHROPIC_TIMEOUT = float(os.getenv("ANTHROPIC_TIMEOUT", "90"))
 _AQUEDUCT_BASE_URL = os.getenv(
     "AQUEDUCT_BASE_URL", "https://aqueduct.ai.datalab.tuwien.ac.at/v1"
 )
@@ -64,6 +89,8 @@ def set_active_model(backend: str | None = None, model: str | None = None) -> tu
     global _BACKEND, _MODEL
     if backend:
         _BACKEND = backend.lower()
+        if not model and not os.getenv("LLM_MODEL"):
+            _MODEL = _DEFAULT_MODELS.get(_BACKEND, _MODEL)
     if model:
         _MODEL = model
     return _BACKEND, _MODEL
@@ -128,6 +155,20 @@ class _ParsedRef(BaseModel):
     venue: str | None = None
     doi: str | None = None
     url: str | None = None
+
+    # Models routinely return "year": 2020 or "authors": ["A", "B"].
+    # Pydantic v2 won't coerce those to str, and one bad item used to
+    # discard the whole 20-reference batch.
+    @field_validator("title", "authors", "year", "venue", "doi", "url", mode="before")
+    @classmethod
+    def _to_str(cls, v: Any) -> str | None:
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ", ".join(str(x) for x in v if x is not None)
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        return str(v)
 
 
 import re as _re_lp
@@ -218,11 +259,15 @@ def _parse_response_text(text: str | None, batch_len: int) -> list[_ParsedRef]:
         raise ValueError("response was only a <think>...</think> block")
     parsed_list = json.loads(text)
     out: list[_ParsedRef] = []
+    if isinstance(parsed_list, dict):
+        # Some models wrap the array: {"references": [...]}
+        parsed_list = next((v for v in parsed_list.values() if isinstance(v, list)), [])
     for item in parsed_list:
-        if isinstance(item, dict):
-            out.append(_ParsedRef(**{k: v for k, v in item.items() if k in _ParsedRef.model_fields}))
-        else:
-            out.append(_ParsedRef())
+        try:
+            out.append(_ParsedRef(**{k: v for k, v in item.items()
+                                     if k in _ParsedRef.model_fields}))
+        except Exception:
+            out.append(_ParsedRef())   # one malformed item ≠ a failed batch
     # If model returned fewer entries than asked, pad with defaults so the
     # caller's zip with idx_batch doesn't silently drop refs.
     while len(out) < batch_len:
@@ -230,23 +275,30 @@ def _parse_response_text(text: str | None, batch_len: int) -> list[_ParsedRef]:
     return out[:batch_len]
 
 
-def _call_anthropic(client, batch: list[dict[str, Any]]) -> list[_ParsedRef]:
+def _call_anthropic(client, batch: list[dict[str, Any]], model: str) -> list[_ParsedRef]:
+    kwargs: dict[str, Any] = {}
+    # Haiku 5.x thinks by default; structured field repair doesn't need it
+    # and "disabled" is accepted there at the default effort.  Opus 5.5 /
+    # Sonnet 5.5 reject "disabled" (400), so only send it for Haiku 5.x.
+    if model.startswith("claude-haiku-5"):
+        kwargs["thinking"] = {"type": "disabled"}
     msg = client.messages.create(
-        model=_MODEL,
-        max_tokens=4096,
-        system=[
-            {
-                "type": "text",
-                "text": _SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
+        model=model,
+        max_tokens=16000,
+        system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_payload(batch)}],
+        **kwargs,
     )
-    return _parse_response_text(msg.content[0].text, len(batch))
+    if msg.stop_reason == "refusal":
+        raise RuntimeError("model declined the request (refusal)")
+    # Thinking blocks may precede the answer — take the first text block.
+    text = next((b.text for b in msg.content if b.type == "text"), None)
+    if msg.stop_reason == "max_tokens":
+        raise ValueError("response truncated at max_tokens")
+    return _parse_response_text(text, len(batch))
 
 
-def _call_aqueduct(client, batch: list[dict[str, Any]]) -> list[_ParsedRef]:
+def _call_aqueduct(client, batch: list[dict[str, Any]], model: str) -> list[_ParsedRef]:
     # Qwen 3.x has a `<think>` reasoning mode that's enabled by default
     # and consumes a LOT of tokens (and wall time) before producing the
     # actual JSON.  Disabling it via vLLM's chat_template_kwargs makes
@@ -259,7 +311,7 @@ def _call_aqueduct(client, batch: list[dict[str, Any]]) -> list[_ParsedRef]:
     # 60 s, every batch fails — exactly the failure mode we saw with
     # gemma-4-e2b-it).  Whitelist the families we know it works on.
     kwargs: dict[str, Any] = {
-        "model":       _MODEL,
+        "model":       model,
         "max_tokens":  4096,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -267,23 +319,26 @@ def _call_aqueduct(client, batch: list[dict[str, Any]]) -> list[_ParsedRef]:
         ],
         "timeout":     _AQUEDUCT_TIMEOUT,
     }
-    if "qwen" in _MODEL.lower():
+    if "qwen" in model.lower():
         kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
     resp = client.chat.completions.create(**kwargs)
     return _parse_response_text(resp.choices[0].message.content, len(batch))
 
 
-def _call_llm(client, batch: list[dict[str, Any]]) -> list[_ParsedRef]:
-    """Dispatch to the active backend.  Raises so the caller can log."""
-    if _BACKEND == "aqueduct":
-        return _call_aqueduct(client, batch)
-    return _call_anthropic(client, batch)
+def _call_llm(client, batch: list[dict[str, Any]],
+              backend: str | None = None, model: str | None = None) -> list[_ParsedRef]:
+    """Dispatch to the backend.  Raises so the caller can log."""
+    backend, model = backend or _BACKEND, model or _MODEL
+    if backend == "aqueduct":
+        return _call_aqueduct(client, batch, model)
+    return _call_anthropic(client, batch, model)
 
 
-def _make_client():
-    """Construct the SDK client for the active backend, or None on missing key."""
-    if _BACKEND == "aqueduct":
+def _make_client(backend: str | None = None):
+    """Construct the SDK client for ``backend`` (default: the active one),
+    or None on missing key."""
+    if (backend or _BACKEND) == "aqueduct":
         api_key = os.getenv("AQUEDUCT_API_KEY")
         if not api_key:
             return None
@@ -294,16 +349,19 @@ def _make_client():
     if not api_key:
         return None
     import anthropic
-    return anthropic.Anthropic(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key, timeout=_ANTHROPIC_TIMEOUT, max_retries=2)
 
 
 def parse_references_with_llm(
     references: list[dict[str, Any]],
     progress_cb=None,
     repair_only: bool = False,
+    stats: dict[str, Any] | None = None,
+    backend: str | None = None,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Repair regex-parsed references with Claude.
+    Repair regex-parsed references with the active LLM backend.
 
     Parameters
     ----------
@@ -311,19 +369,33 @@ def parse_references_with_llm(
         Refs with at least ``raw`` (and usually some regex-parsed fields).
     progress_cb : callable(done, total) | None
     repair_only : bool
-        When True (default), only refs that look garbled go to the LLM —
-        clean refs pass through unchanged.  When False, every ref is sent.
+        When True, only refs that look garbled go to the LLM — clean refs
+        pass through unchanged.  When False (default), every ref is sent.
+    stats : dict | None
+        If given, filled with ``backend``, ``model``, ``n_sent``,
+        ``n_batches``, ``n_failed_batches``, ``n_failed_refs`` and
+        ``first_error`` so callers can tell the user when repair failed.
+    backend, model : str | None
+        Per-call override of the active backend / model.  Thread-safe,
+        unlike ``set_active_model`` (use this from servers).
 
     Returns
     -------
     list[dict]
         Same length; suspect refs have LLM-repaired fields merged in.
     """
+    backend = (backend or _BACKEND).lower()
+    model = model or (_MODEL if backend == _BACKEND else _DEFAULT_MODELS.get(backend, _MODEL))
+    if stats is not None:
+        stats.update(backend=backend, model=model, n_sent=0, n_batches=0,
+                     n_failed_batches=0, n_failed_refs=0, first_error=None)
     if not references:
         return references
 
-    client = _make_client()
+    client = _make_client(backend)
     if client is None:
+        if stats is not None:
+            stats["first_error"] = f"no API key for backend {backend!r}"
         return references
 
     targets_idx = (
@@ -338,6 +410,7 @@ def parse_references_with_llm(
     done = 0
 
     llm_errors: list[str] = []
+    failed_refs: list[int] = []
 
     # Build all batches up front so we can dispatch them in parallel.
     batches: list[tuple[list[int], list[dict[str, Any]]]] = []
@@ -362,21 +435,31 @@ def parse_references_with_llm(
     max_workers = min(_MAX_PARALLEL_BATCHES, len(batches))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(_call_llm, client, ref_batch): (idx_batch, ref_batch)
+            pool.submit(_call_llm, client, ref_batch, backend, model): (idx_batch, ref_batch)
             for idx_batch, ref_batch in batches
         }
         for f in as_completed(futures):
             idx_batch, ref_batch = futures[f]
             try:
                 parsed = f.result()
-            except Exception as exc:
-                llm_errors.append(str(exc)[:200])
-                parsed = [_ParsedRef() for _ in ref_batch]
+            except Exception:
+                # One retry for transient failures (malformed JSON,
+                # truncation, a dropped connection) before giving up.
+                try:
+                    parsed = _call_llm(client, ref_batch, backend, model)
+                except Exception as exc:
+                    llm_errors.append(f"{type(exc).__name__}: {exc}"[:200])
+                    failed_refs.extend(idx_batch)
+                    parsed = [_ParsedRef() for _ in ref_batch]
             _merge(idx_batch, parsed)
             done += len(idx_batch)
             if progress_cb:
                 progress_cb(done, total)
 
+    if stats is not None:
+        stats.update(n_sent=total, n_batches=len(batches),
+                     n_failed_batches=len(llm_errors), n_failed_refs=len(failed_refs),
+                     first_error=llm_errors[0] if llm_errors else None)
     if llm_errors:
         # Surface a single warning (first error message is usually enough
         # — the rest are identical, e.g. all "credit balance too low").

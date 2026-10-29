@@ -54,9 +54,11 @@ on port 8500 and nginx routes ``/api/*`` to it.
 from __future__ import annotations
 
 import datetime
+import hmac
 import json
 import logging
 import os
+import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -92,6 +94,14 @@ _KEYS_FILE      = Path(os.getenv(
     Path(__file__).resolve().parent / "data" / "api_keys.json",
 ))
 _BATCH_WORKERS  = max(1, int(os.getenv("ARES_API_WORKERS", "2")))
+# Without any key configured the API refuses requests (503) — the public
+# deployment must never run it open by accident.  Local dev opts in.
+_ALLOW_OPEN     = os.getenv("ARES_API_ALLOW_UNAUTHENTICATED", "") == "1"
+# Synchronous /process requests running at once; extra callers get 503.
+_SYNC_SLOTS     = threading.BoundedSemaphore(int(os.getenv("ARES_API_SYNC_CONCURRENCY", "2")))
+_SYNC_WAIT_S    = float(os.getenv("ARES_API_SYNC_WAIT_S", "30"))
+_SPOOL_DIR      = Path(os.getenv("ARES_API_SPOOL", Path(os.getenv(
+    "ARES_JOBS_DB", "data/jobs.sqlite")).parent / "batch_uploads"))
 _MAX_BATCH      = int(os.getenv("ARES_API_MAX_BATCH", "500"))
 _VALID_PARSERS  = {"grobid", "hybrid", "pymupdf4llm"}
 
@@ -204,36 +214,65 @@ def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
       2. A key entry in ``data/api_keys.json`` (multi-user with labels +
          optional expiry)
 
-    When neither the env var nor the file has any keys, the API runs
-    unauthenticated (dev mode).  This makes a fresh checkout usable
-    without setting up a keys file first.
+    When neither the env var nor the file has any keys, the API refuses
+    every request with 503 — unless ARES_API_ALLOW_UNAUTHENTICATED=1
+    (local development only).  Keys are compared in constant time.
     """
     keys = _load_api_keys()
     if not _API_KEY and not keys:
-        return
+        if _ALLOW_OPEN:
+            return
+        raise HTTPException(status_code=503,
+                            detail="API access is not configured on this server")
     if not x_api_key:
         raise HTTPException(status_code=401,
                             detail="invalid or missing X-API-Key")
+    given = x_api_key.encode()
 
     # Single-shared-key path (legacy).
-    if _API_KEY and x_api_key == _API_KEY:
+    if _API_KEY and hmac.compare_digest(given, _API_KEY.encode()):
         return
 
     # File-backed path with metadata + optional expiry.
-    meta = keys.get(x_api_key)
+    meta = next((m for k, m in keys.items() if hmac.compare_digest(given, k.encode())), None)
     if meta is None:
         raise HTTPException(status_code=401,
                             detail="invalid or missing X-API-Key")
-    expires_at = (meta or {}).get("expires_at")
-    if expires_at:
-        try:
-            exp = datetime.datetime.fromisoformat(str(expires_at))
-            if exp < datetime.datetime.now():
-                raise HTTPException(status_code=401, detail="API key expired")
-        except ValueError:
-            # Malformed expiry → ignore (don't lock the caller out over
-            # an operator typo).  The error log will catch it on reload.
-            pass
+    exp = parse_expiry((meta or {}).get("expires_at"))
+    if exp is not None and exp < datetime.datetime.now(datetime.timezone.utc):
+        raise HTTPException(status_code=401, detail="API key expired")
+
+
+def parse_expiry(value) -> Optional[datetime.datetime]:
+    """ISO-8601 expiry as an aware UTC datetime.  Naive values are UTC.
+    A malformed value counts as already expired — failing closed beats a
+    key that silently never expires."""
+    if not value:
+        return None
+    try:
+        exp = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        _log.error("malformed expires_at %r — treating key as expired", value)
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=datetime.timezone.utc)
+    return exp
+
+
+def _check_pdf(data: bytes) -> Optional[str]:
+    """Return an error message when ``data`` isn't a readable PDF."""
+    if not data:
+        return "empty upload"
+    if not data.startswith(b"%PDF"):
+        return "upload does not look like a PDF (missing %PDF header)"
+    try:
+        import fitz
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            if doc.page_count == 0:
+                return "PDF has no pages"
+    except Exception:
+        return "upload is not a readable PDF"
+    return None
 
 
 def _validate_parser(parser: str) -> str:
@@ -262,7 +301,7 @@ _VALID_VERIFY_DEPTH = {"abstract", "fulltext"}
 
 
 @app.post("/api/v1/process", dependencies=[Depends(require_api_key)])
-async def process_one(
+def process_one(
     file:          UploadFile = File(..., description="The PDF to process."),
     parser:        str        = Form("grobid"),
     use_llm:       bool       = Form(False),
@@ -285,15 +324,17 @@ async def process_one(
             detail=f"unknown verify_depth {verify_depth!r}; "
                    f"expected one of {sorted(_VALID_VERIFY_DEPTH)}",
         )
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="empty upload")
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise HTTPException(
-            status_code=400,
-            detail="upload does not look like a PDF (missing %PDF header)",
-        )
+    # Plain `def`: FastAPI runs this in its threadpool, so a minutes-long
+    # pipeline run no longer blocks the event loop (and /healthz with it).
+    pdf_bytes = file.file.read()
+    err = _check_pdf(pdf_bytes)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
 
+    if not _SYNC_SLOTS.acquire(timeout=_SYNC_WAIT_S):
+        raise HTTPException(status_code=503,
+                            detail="server busy — retry later or use /api/v1/batch",
+                            headers={"Retry-After": "60"})
     try:
         report = process_pdf(
             pdf_bytes,
@@ -302,7 +343,10 @@ async def process_one(
                             verify_depth=verify_depth),
         )
     except Exception as exc:    # parser/LLM/lookup failures
-        raise HTTPException(status_code=500, detail=f"pipeline error: {exc}")
+        _log.exception("pipeline error for %s", file.filename)
+        raise HTTPException(status_code=500, detail=f"pipeline error: {type(exc).__name__}")
+    finally:
+        _SYNC_SLOTS.release()
 
     return {"filename": file.filename, **report.to_dict()}
 
@@ -313,7 +357,7 @@ async def process_one(
 
 def _run_batch_job(
     job_id: str,
-    payloads: list[tuple[str, bytes]],
+    payloads: list[tuple[str, Path]],
     parser: str,
     use_llm: bool,
     verify_claims: bool = False,
@@ -331,19 +375,27 @@ def _run_batch_job(
                             verify_claims=verify_claims,
                             verify_depth=verify_depth)
     try:
-        for filename, pdf_bytes in payloads:
+        for filename, path in payloads:
             try:
+                pdf_bytes = path.read_bytes()
+                err = _check_pdf(pdf_bytes)
+                if err:
+                    raise ValueError(err)
                 report = process_pdf(pdf_bytes, opts)
                 store.add_result(job_id, filename, report.to_dict())
             except Exception as exc:
                 store.add_error(job_id, filename, str(exc))
+            finally:
+                path.unlink(missing_ok=True)
         store.finish(job_id)
     except Exception as exc:
         store.finish(job_id, error=str(exc))
+    finally:
+        shutil.rmtree(_SPOOL_DIR / job_id, ignore_errors=True)
 
 
 @app.post("/api/v1/batch", dependencies=[Depends(require_api_key)])
-async def batch_start(
+def batch_start(
     files:         list[UploadFile] = File(...),
     parser:        str              = Form("grobid"),
     use_llm:       bool             = Form(False),
@@ -371,23 +423,26 @@ async def batch_start(
             detail=f"batch too large: got {len(files)} files, limit is {_MAX_BATCH}",
         )
 
-    payloads: list[tuple[str, bytes]] = []
+    # Spool uploads to disk instead of holding up to 500 PDFs in memory
+    # until the worker reaches them.  Non-PDFs get an error row in the
+    # results rather than rejecting the whole batch.
+    job_id = uuid.uuid4().hex[:16]
+    job_dir = _SPOOL_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    payloads: list[tuple[str, Path]] = []
     for f in files:
-        data = await f.read()
-        if not data:
+        path = job_dir / f"{len(payloads):05d}.pdf"
+        with path.open("wb") as out:
+            shutil.copyfileobj(f.file, out)
+        if path.stat().st_size == 0:
+            path.unlink()
             continue
-        if not data.startswith(b"%PDF"):
-            # Be tolerant — skip non-PDFs with an error row rather than
-            # rejecting the whole batch.  Lets the caller submit a mixed
-            # directory without pre-filtering.
-            payloads.append((f.filename or "unnamed", data))   # will surface as parser error
-        else:
-            payloads.append((f.filename or f"file-{len(payloads)}.pdf", data))
+        payloads.append((f.filename or f"file-{len(payloads)}.pdf", path))
 
     if not payloads:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="no usable files in batch")
 
-    job_id = uuid.uuid4().hex[:16]
     get_job_store().create(job_id, n_total=len(payloads), parser=parser, use_llm=use_llm)
     _workers.submit(_run_batch_job, job_id, payloads, parser, use_llm,
                     verify_claims, verify_depth)

@@ -167,14 +167,11 @@ st.warning(
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
-_ANTHROPIC_KEY_PRESENT = bool(os.getenv("ANTHROPIC_API_KEY"))
-_AQUEDUCT_KEY_PRESENT  = bool(os.getenv("AQUEDUCT_API_KEY"))
-_LLM_KEY_PRESENT       = _ANTHROPIC_KEY_PRESENT or _AQUEDUCT_KEY_PRESENT
-_LLM_BACKEND           = (os.getenv("LLM_BACKEND") or
-                          ("aqueduct" if _AQUEDUCT_KEY_PRESENT else "anthropic")).lower()
-_LLM_MODEL             = os.getenv("LLM_MODEL") or (
-    "qwen-3.6-35b" if _LLM_BACKEND == "aqueduct" else "claude-haiku-4-5"
-)
+from llm_parser import active_model as _llm_active_model, llm_available as _llm_available
+
+# Same resolution as llm_parser itself, so the label shows what actually runs.
+_LLM_BACKEND, _LLM_MODEL = _llm_active_model()
+_LLM_KEY_PRESENT = _llm_available()
 _GROBID_AVAILABLE = grobid_is_available()
 
 # docling's import cost is non-trivial (loads torch eagerly) but cheaper
@@ -294,11 +291,44 @@ def run_llm_enhancement(refs_json: str, backend: str, model: str) -> str:
     providers (or topping up credits after a failed run) automatically
     re-triggers extraction instead of serving stale enhanced refs.
     """
-    _ = (backend, model)   # part of cache key, not used inside
     from llm_parser import parse_references_with_llm
     refs = json.loads(refs_json)
-    enhanced = parse_references_with_llm(refs)
+    stats: dict[str, Any] = {}
+    enhanced = parse_references_with_llm(refs, stats=stats, backend=backend, model=model)
+    if stats.get("n_failed_refs") or (stats.get("first_error") and not stats.get("n_sent")):
+        # Raising keeps a failed run out of st.cache_data; the caller uses
+        # the partial result and warns the user.
+        raise LLMRepairIncomplete(json.dumps(enhanced), stats)
     return json.dumps(enhanced)
+
+
+class LLMRepairIncomplete(Exception):
+    def __init__(self, refs_json: str, stats: dict[str, Any]):
+        super().__init__(stats.get("first_error") or "LLM repair incomplete")
+        self.refs_json, self.stats = refs_json, stats
+
+
+def _llm_repair(references: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    """Run (cached) LLM repair.  Returns (refs, warning-or-None).
+
+    Incomplete runs aren't in st.cache_data; they're memoised per session
+    instead so ordinary reruns don't re-bill the LLM, while a new session
+    (or a new upload) retries."""
+    refs_json = json.dumps(references)
+    memo_key = ("llm_fail", hash((refs_json, _LLM_BACKEND, _LLM_MODEL)))
+    if memo_key in st.session_state:
+        return st.session_state[memo_key]
+    try:
+        return json.loads(run_llm_enhancement(refs_json, _LLM_BACKEND, _LLM_MODEL)), None
+    except LLMRepairIncomplete as e:
+        st_ = e.stats
+        if st_.get("n_sent"):
+            msg = (f"LLM repair failed for {st_['n_failed_refs']} of {st_['n_sent']} "
+                   f"references ({st_.get('first_error')}). Those keep their parser fields.")
+        else:
+            msg = f"LLM repair unavailable: {st_.get('first_error')}"
+        st.session_state[memo_key] = (json.loads(e.refs_json), msg)
+        return st.session_state[memo_key]
 
 
 @st.cache_data(show_spinner=False)
@@ -645,8 +675,7 @@ def _silent_process():
     overlay) fires and the PDF doesn't jump."""
     references, debug_md = run_parser(pdf_bytes, parser)
     if use_llm:
-        refs_json = run_llm_enhancement(json.dumps(references), _LLM_BACKEND, _LLM_MODEL)
-        references = json.loads(refs_json)
+        references, _llm_warning = _llm_repair(references)
     references, _ = dedupe_references(references)
     annotated_pdf, parsed_enriched, orphan_blocks = run_highlighter(
         pdf_bytes, json.dumps(references),
@@ -706,9 +735,10 @@ else:
         if use_llm:
             _t = _time.time()
             st.write(f"**LLM repair** via `{_LLM_MODEL}` ({_LLM_BACKEND}) …")
-            refs_json = run_llm_enhancement(json.dumps(references), _LLM_BACKEND, _LLM_MODEL)
-            references = json.loads(refs_json)
+            references, _llm_warning = _llm_repair(references)
             st.write(f"   Repaired in {_time.time() - _t:.1f}s")
+            if _llm_warning:
+                st.warning(_llm_warning)
 
         # Dedupe near-duplicate parsed refs (manual refs are NOT included
         # here — they're appended after highlighting so adding one doesn't
@@ -1414,6 +1444,7 @@ with col_refs:
                 lookup_results,
                 pdf_name=uploaded_file.name,
                 parser=parser,
+                claim_verifications=st.session_state.get("claim_verifications"),
             )
             with st.expander("Quality Report", expanded=False):
                 st.markdown(report_md)

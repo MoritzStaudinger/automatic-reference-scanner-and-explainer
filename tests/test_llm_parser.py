@@ -1,0 +1,92 @@
+import json
+from types import SimpleNamespace
+
+import llm_parser
+
+
+def test_numbers_and_lists_coerced_to_str():
+    out = llm_parser._parse_response_text(json.dumps([
+        {"is_citation": True, "title": "T", "year": 2020, "authors": ["A Smith", "B Jones"]},
+        {"title": 12.0},
+    ]), 2)
+    assert out[0].year == "2020" and out[0].authors == "A Smith, B Jones"
+    assert out[1].title == "12"
+
+
+def test_malformed_item_does_not_fail_batch():
+    out = llm_parser._parse_response_text(json.dumps([{"is_citation": {"x": 1}}, {"title": "ok"}]), 2)
+    assert out[1].title == "ok"
+
+
+def test_wrapped_object_and_padding():
+    out = llm_parser._parse_response_text(json.dumps({"references": [{"title": "a"}]}), 3)
+    assert [o.title for o in out] == ["a", None, None]
+
+
+class _FakeClient:
+    def __init__(self, blocks, stop="end_turn"):
+        self.kwargs = None
+        self._msg = SimpleNamespace(content=blocks, stop_reason=stop)
+        self.messages = self
+
+    def create(self, **kw):
+        self.kwargs = kw
+        return self._msg
+
+
+def test_anthropic_skips_thinking_block_and_disables_thinking_on_haiku():
+    blocks = [SimpleNamespace(type="thinking", thinking=""),
+              SimpleNamespace(type="text", text='[{"title": "Fixed"}]')]
+    c = _FakeClient(blocks)
+    out = llm_parser._call_anthropic(c, [{"raw": "x"}], "claude-haiku-5-5")
+    assert out[0].title == "Fixed"
+    assert c.kwargs["thinking"] == {"type": "disabled"}
+    c2 = _FakeClient(blocks)
+    llm_parser._call_anthropic(c2, [{"raw": "x"}], "claude-opus-5-5")
+    assert "thinking" not in c2.kwargs
+
+
+def test_failed_batches_reported_in_stats(monkeypatch):
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+
+    def boom(*a, **k):
+        raise RuntimeError("credit balance too low")
+    monkeypatch.setattr(llm_parser, "_call_llm", boom)
+    stats = {}
+    refs = [{"raw": "r", "title": "t"}]
+    out = llm_parser.parse_references_with_llm(refs, stats=stats, backend="anthropic")
+    assert out == refs
+    assert stats["n_failed_refs"] == 1 and "credit" in stats["first_error"]
+
+
+def test_resolve_backend(monkeypatch):
+    monkeypatch.delenv("LLM_BACKEND", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("AQUEDUCT_API_KEY", "x")
+    assert llm_parser.resolve_backend() == "aqueduct"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "y")
+    assert llm_parser.resolve_backend() == "anthropic"
+    monkeypatch.setenv("LLM_BACKEND", "Aqueduct")
+    assert llm_parser.resolve_backend() == "aqueduct"
+
+
+def test_numeric_claims_survive_dedupe_and_manual_refs():
+    from claim_extractor import extract
+    from parsers import dedupe_references
+    refs = [{"raw": "A. One. Alpha paper. 2020.", "title": "Alpha paper"},
+            {"raw": "B. Two. Beta paper. 2021.", "title": "Beta paper"},
+            {"raw": "B. Two. Beta paper. 2021", "title": "Beta paper."},   # dup of #2
+            {"raw": "C. Three. Gamma paper. 2022.", "title": "Gamma paper"}]
+    refs, n = dedupe_references(refs)
+    assert n == 1 and len(refs) == 3
+    refs.append({"raw": "manual", "title": "Manual", "_user_added": True})
+    claims = extract("Gamma results are strong [4]. Beta is related [3].", refs)
+    by_marker = {c.citation_marker: refs[c.cited_ref_index]["title"].rstrip(".") for c in claims}
+    assert by_marker == {"[4]": "Gamma paper", "[3]": "Beta paper"}
+
+
+def test_numeric_claims_use_raw_labels():
+    from claim_extractor import extract
+    refs = [{"raw": "[2] B. Beta.", "title": "Beta"}, {"raw": "[5] E. Eps.", "title": "Eps"}]
+    claims = extract("As shown before [5].", refs)
+    assert refs[claims[0].cited_ref_index]["title"] == "Eps"

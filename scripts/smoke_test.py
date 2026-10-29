@@ -361,11 +361,11 @@ def test_api(pdf_path: Path) -> None:
         files={"file": ("tiny.pdf", b"%PDF-1.4\n%%EOF\n", "application/pdf")},
         data={"parser": "pymupdf4llm", "use_llm": "1"},
     )
-    # Empty PDF will produce 0 refs but the form coercion is what we're
-    # testing — anything other than 400/422 means use_llm="1" parsed.
+    # A corrupt PDF must be a clean 400 ("not a readable PDF"), never a
+    # 500; a 422 would mean use_llm="1" failed form coercion.
     check(
-        "use_llm='1' is accepted as bool by the API",
-        r.status_code not in (400, 422),
+        "use_llm='1' accepted; corrupt PDF → 400 (not 500)",
+        r.status_code == 400,
         f"status={r.status_code}",
     )
 
@@ -481,6 +481,41 @@ def test_url_verify_live() -> None:
         )
 
 
+def test_website_lookups_live() -> None:
+    section("Website lookups (GitHub, dead link, SSRF guard)")
+    from lookup import _lookup_url
+
+    r = _lookup_url({"title": "Transformers: State-of-the-art natural language processing",
+                     "url": "https://github.com/huggingface/transformers"})
+    check("GitHub repo → found/match", r.get("status") == "found" and r.get("label") == "match",
+          f"status={r.get('status')} label={r.get('label')}")
+    r = _lookup_url({"title": "A tool", "url": "https://ares-smoke-test-no-such-host.invalid/x"})
+    check("unresolvable host → dead_link", r.get("status") == "dead_link", f"status={r.get('status')}")
+    r = _lookup_url({"title": "internal", "url": "http://169.254.169.254/latest/meta-data/"})
+    check("metadata IP blocked", r.get("status") == "error" and "blocked" in (r.get("error") or ""),
+          f"{r}")
+
+
+def test_llm_repair_live(pdf_path: Path, skip_llm: bool) -> None:
+    section("LLM reference repair (live, every configured backend)")
+    if skip_llm:
+        print("  [SKIP] no LLM key configured")
+        return
+    from parsers import extract_references_pymupdf4llm
+    from llm_parser import parse_references_with_llm
+    refs = extract_references_pymupdf4llm(str(pdf_path))[:12]
+    check("parser produced refs for LLM test", len(refs) > 0, f"n={len(refs)}")
+    backends = [(b, k) for b, k in (("anthropic", "ANTHROPIC_API_KEY"),
+                                    ("aqueduct", "AQUEDUCT_API_KEY")) if os.getenv(k)]
+    for backend, _ in backends:
+        stats: dict = {}
+        out = parse_references_with_llm(refs, stats=stats, backend=backend)
+        check(f"{backend}: no failed batches", stats.get("n_failed_refs") == 0,
+              f"{stats.get('model')}: {stats.get('first_error')}")
+        check(f"{backend}: same length, titles kept", len(out) == len(refs)
+              and sum(1 for r in out if r.get("title")) >= 0.8 * len(refs))
+
+
 # ---------------------------------------------------------------------------
 # 7. Claim verification (extractor / abstract / fulltext / verifier / e2e)
 # ---------------------------------------------------------------------------
@@ -563,14 +598,15 @@ def test_claim_verifier_live(skip_llm: bool) -> None:
     from claim_verifier   import verify, _parse_llm_response, _sanitize_verdict
 
     # Unit: response parser + sanitizer (no LLM needed)
+    # The verifier batches claims, so the response is a JSON array.
     parsed = _parse_llm_response(
-        '{"verdict":"supported","evidence_passage":"q","confidence":"high","explanation":"e"}')
-    check("parser: strict JSON", parsed and parsed.get("verdict") == "supported")
+        '[{"verdict":"supported","evidence_passage":"q","confidence":"high","explanation":"e"}]')
+    check("parser: strict JSON", parsed and parsed[0].get("verdict") == "supported")
 
-    fenced = ('```json\n{"verdict":"contradicted","evidence_passage":"…",'
-              '"confidence":"medium","explanation":"…"}\n```')
+    fenced = ('```json\n[{"verdict":"contradicted","evidence_passage":"…",'
+              '"confidence":"medium","explanation":"…"}]\n```')
     parsed2 = _parse_llm_response(fenced)
-    check("parser: fenced JSON", parsed2 and parsed2.get("verdict") == "contradicted")
+    check("parser: fenced JSON", parsed2 and parsed2[0].get("verdict") == "contradicted")
 
     bad = _sanitize_verdict({"verdict": "bogus", "confidence": "super",
                              "evidence_passage": "", "explanation": ""})
@@ -696,6 +732,8 @@ def main() -> int:
         test_batch_cli(args.pdf)
     if not args.skip_network:
         test_url_verify_live()
+        test_website_lookups_live()
+        test_llm_repair_live(args.pdf, skip_llm=not llm_configured)
         test_fulltext_live()
         test_claim_verifier_live(skip_llm=not llm_configured)
         if not args.skip_verify_claims:

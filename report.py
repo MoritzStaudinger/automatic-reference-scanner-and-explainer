@@ -310,6 +310,7 @@ def generate_report(
     lookup_results: list[dict[str, Any]],
     pdf_name: str = "",
     parser: str = "",
+    claim_verifications: list[Any] | None = None,
 ) -> str:
     """
     Return a Markdown string summarising reference quality.
@@ -504,6 +505,9 @@ def generate_report(
             lines.append(f"- **[{n}]** {entry}" + (f" ({meta})" if meta else ""))
         lines.append("")
 
+    if claim_verifications:
+        lines.extend(_claims_section(refs, claim_verifications))
+
     # --- Detailed per-reference audit ---
     lines.append("---\n")
     lines.append("## Detailed Per-Reference Audit\n")
@@ -515,6 +519,40 @@ def generate_report(
         lines.append(_per_ref_audit(i + 1, ref, lr))
 
     return "\n".join(lines)
+
+
+_CLAIM_ICONS = {"supported": "🟢", "contradicted": "🔴", "not_addressed": "🟡",
+                "ambiguous": "🟡", "no_source": "⚪", "error": "⚪"}
+_CLAIM_ORDER = ("contradicted", "not_addressed", "ambiguous", "supported", "no_source", "error")
+
+
+def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str]:
+    """Citation-context check: does the cited paper support the sentence
+    that cites it?  Accepts ClaimVerification objects or their dicts."""
+    rows = [v.to_dict() if hasattr(v, "to_dict") else dict(v) for v in verdicts]
+    counts = {k: sum(1 for r in rows if r.get("verdict") == k) for k in _CLAIM_ORDER}
+    out = ["---\n", "## Citation Context Check\n",
+           "For each sentence that cites a verified reference, an LLM compared the "
+           "sentence with the cited paper (abstract or full text). Treat these as "
+           "pointers for a human reader, not judgements.\n",
+           " · ".join(f"{_CLAIM_ICONS[k]} {k.replace('_', ' ')}: {n}"
+                      for k, n in counts.items() if n) + "\n"]
+    for verdict in _CLAIM_ORDER[:3]:
+        for r in (r for r in rows if r.get("verdict") == verdict):
+            i = r.get("cited_ref_index", -1)
+            ref = refs[i] if 0 <= i < len(refs) else {}
+            title = ref.get("title") or (ref.get("raw") or "")[:80]
+            out.append(f"- {_CLAIM_ICONS[verdict]} **{verdict.replace('_', ' ')}** — "
+                       f"cites [{i + 1}] *{title}*")
+            out.append(f"  > {' '.join(str(r.get('claim_text', '')).split())}")
+            if r.get("explanation"):
+                out.append(f"  - {r['explanation']}")
+            if r.get("evidence_passage"):
+                out.append(f"  - Evidence: “{r['evidence_passage']}”")
+            if r.get("is_abstract_fallback"):
+                out.append("  - _Checked against the abstract only._")
+    out.append("")
+    return out
 
 
 # ---------------------------------------------------------------------------

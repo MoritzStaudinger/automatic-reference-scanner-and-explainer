@@ -634,10 +634,17 @@ def dedupe_references(
     venues sometimes get truncated in one source but full in another).
     Each kept ref gains a `_merged_from` list of duplicate raws so the
     user can see what was folded together.
+
+    Each ref also gets ``_orig_index`` (its position in the parser output)
+    and merged refs collect ``_merged_orig_indices``, so numeric citation
+    markers ("[12]") still resolve to the right entry after merging.
     """
     from rapidfuzz import fuzz as _fuzz
     if not refs:
         return [], 0
+    for i, r in enumerate(refs):
+        if not r.get("_user_added") and not r.get("_auto_added"):
+            r.setdefault("_orig_index", i)
 
     kept: list[dict[str, Any]] = []
     kept_titles_norm: list[str] = []
@@ -654,6 +661,8 @@ def dedupe_references(
         canonical.setdefault("_merged_from", []).append(
             (dup.get("raw") or "")[:200]
         )
+        if "_orig_index" in dup:
+            canonical.setdefault("_merged_orig_indices", []).append(dup["_orig_index"])
 
     for ref in refs:
         # User-added refs are NEVER auto-merged — they're explicit user input.

@@ -202,13 +202,14 @@ def extract(body_text: str, refs: list[dict[str, Any]]) -> list[Claim]:
     body = _MD_HEADING_RE.sub("", body_text)
 
     ay_index = _build_author_year_index(refs)
+    num_index = build_numeric_index(refs)
     claims:  list[Claim] = []
-    n_refs = len(refs)
 
     # 1. Numeric markers
     for m in _NUMERIC_MARKER_RE.finditer(body):
         payload = m.group(1)
-        indices = _parse_numeric_payload(payload, n_refs)
+        numbers = _parse_numeric_payload(payload, 10_000)
+        indices = list(dict.fromkeys(num_index[n + 1] for n in numbers if n + 1 in num_index))
         if not indices:
             continue
         sentence = _sentences_around(body, m.start(), m.end())
@@ -259,6 +260,40 @@ def extract(body_text: str, refs: list[dict[str, Any]]) -> list[Claim]:
         ))
 
     return _dedupe(claims)
+
+
+_REF_LABEL_RE = re.compile(r"^\s*(?:\[(\d{1,4})\]|(\d{1,4})[.)]\s)")
+
+
+def build_numeric_index(refs: list[dict[str, Any]]) -> dict[int, int]:
+    """
+    Map a numeric citation label (the 12 in "[12]") to a position in
+    ``refs``.  Using ``n - 1`` directly broke whenever the parser skipped
+    an entry, dedupe merged two, or manual / auto-detected refs were
+    appended.
+
+    1. If most refs carry their own label in the raw text ("[12] …" or
+       "12. …"), trust those labels.
+    2. Otherwise use the parser's original position (``_orig_index``,
+       recorded by ``dedupe_references``), including merged duplicates.
+    3. Refs the user or the orphan detector added are never targets.
+    """
+    candidates = [(p, r) for p, r in enumerate(refs)
+                  if not r.get("_user_added") and not r.get("_auto_added")]
+    labelled: dict[int, int] = {}
+    for p, r in candidates:
+        m = _REF_LABEL_RE.match(r.get("raw") or "")
+        if m:
+            labelled.setdefault(int(m.group(1) or m.group(2)), p)
+    if candidates and len(labelled) >= 0.6 * len(candidates):
+        return labelled
+
+    by_pos: dict[int, int] = {}
+    for p, r in candidates:
+        by_pos.setdefault(r.get("_orig_index", p) + 1, p)
+        for oi in r.get("_merged_orig_indices", []):
+            by_pos.setdefault(oi + 1, p)
+    return by_pos
 
 
 def _parse_numeric_payload(payload: str, n_refs: int) -> list[int]:
