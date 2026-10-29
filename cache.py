@@ -29,8 +29,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 CACHE_PATH    = Path(os.getenv(
     "ARES_CACHE", _PROJECT_ROOT / "data" / "cache.sqlite"))
 
-_CACHEABLE_STATUSES = {"found", "not_found", "not_in_anthology"}
-_NEGATIVE_STATUSES  = {"not_found", "not_in_anthology"}
+_CACHEABLE_STATUSES = {"found", "not_found", "not_in_anthology", "dead_link"}
+_NEGATIVE_STATUSES  = {"not_found", "not_in_anthology", "dead_link"}
 NEG_TTL_SECONDS     = int(float(os.getenv("ARES_NEG_TTL_DAYS", "14")) * 86400)
 
 log = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class _LookupCache:
         """Delete negative results older than ``older_than_s`` seconds."""
         cutoff = int(time.time()) - older_than_s
         sql = ("DELETE FROM cache WHERE ts <= ? AND "
-               "json_extract(value, '$.status') IN ('not_found','not_in_anthology')")
+               "json_extract(value, '$.status') IN ('not_found','not_in_anthology','dead_link')")
         params: list[Any] = [cutoff]
         if source:
             sql += " AND source = ?"

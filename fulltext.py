@@ -107,38 +107,25 @@ def _http_get_pdf(url: str) -> Optional[bytes]:
     """
     Fetch a URL that we expect to return a PDF.  Returns bytes on
     success, None on any failure (network error, non-2xx, wrong
-    content-type, oversize).  Silent — the caller cascades to the next
-    source in the priority chain.
+    content-type, oversize, or a URL the SSRF guard refuses).  Silent —
+    the caller cascades to the next source in the priority chain.
     """
+    import netguard
     try:
-        r = _SESSION.get(
+        r = netguard.safe_get(
             url,
             headers={"User-Agent": _UA, "Accept": "application/pdf"},
             timeout=_FETCH_TIMEOUT_S,
-            allow_redirects=True,
-            stream=True,
+            max_bytes=_FETCH_MAX_BYTES + 1,
         )
-    except Exception:
+    except netguard.FetchError:
         return None
-    if not r.ok:
+    if not r.ok or r.truncated:
         return None
-    ctype = (r.headers.get("Content-Type") or "").lower()
     # Some OA hosts serve PDFs with generic octet-stream content type.
-    if "pdf" not in ctype and "octet-stream" not in ctype:
+    if "pdf" not in r.content_type and "octet-stream" not in r.content_type:
         return None
-    try:
-        # Read in chunks to enforce the size cap without buffering
-        # arbitrarily large responses.
-        buf = bytearray()
-        for chunk in r.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            buf.extend(chunk)
-            if len(buf) > _FETCH_MAX_BYTES:
-                return None
-        return bytes(buf) if buf else None
-    finally:
-        r.close()
+    return r.content or None
 
 
 def _pdf_bytes_to_text(pdf_bytes: bytes) -> Optional[str]:

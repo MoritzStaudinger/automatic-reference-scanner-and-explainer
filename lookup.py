@@ -970,39 +970,64 @@ def _cited_arxiv_id(ref: dict[str, Any]) -> str | None:
     return None
 
 
-_URL_FOLLOW_HEADERS = {"User-Agent": USER_AGENT}
+_URL_FOLLOW_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept":     "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+}
+
+# Short-lived per-process memo of page fetches.  The DOI-resolution
+# pre-step and the url_verify source both need the same page; this makes
+# that one request instead of two.  Values are FetchResult or FetchError.
+_PAGE_MEMO: dict[str, tuple[float, Any]] = {}
+_PAGE_MEMO_LOCK = threading.Lock()
+_PAGE_MEMO_TTL = 600
+_PAGE_MEMO_MAX = 512
+
+
+def _fetch_page(url: str):
+    """SSRF-safe GET via netguard, memoised for ``_PAGE_MEMO_TTL`` seconds.
+    Returns a ``netguard.FetchResult`` or a ``netguard.FetchError``."""
+    import netguard
+    now = time.time()
+    with _PAGE_MEMO_LOCK:
+        hit = _PAGE_MEMO.get(url)
+        if hit and now - hit[0] < _PAGE_MEMO_TTL:
+            return hit[1]
+    _bump_http_count(url)
+    try:
+        res: Any = netguard.safe_get(url, headers=_URL_FOLLOW_HEADERS,
+                                     timeout=10, max_bytes=512 * 1024)
+    except netguard.FetchError as e:
+        res = e
+    with _PAGE_MEMO_LOCK:
+        if len(_PAGE_MEMO) >= _PAGE_MEMO_MAX:
+            for k, _ in sorted(_PAGE_MEMO.items(), key=lambda kv: kv[1][0])[:_PAGE_MEMO_MAX // 4]:
+                _PAGE_MEMO.pop(k, None)
+        _PAGE_MEMO[url] = (now, res)
+    return res
 
 
 def _resolve_url_doi(url: str) -> str | None:
     """
     Follow a URL and try to extract a DOI from:
-      1. The final redirect URL (e.g. publisher → doi.org/…)
+      1. Any redirect hop or the final URL (e.g. publisher → doi.org/…)
       2. HTML <meta> citation tags (citation_doi, dc.identifier)
-    Returns a DOI string or None.  Silently swallows all errors.
+    Returns a DOI string or None.  Never raises.
     """
-    try:
-        r = _SESSION.get(url, allow_redirects=True, timeout=5,
-                          headers=_URL_FOLLOW_HEADERS)
-        # Redirect landed on a doi.org URL
-        m = _DOI_FROM_URL_RE.search(r.url)
+    import netguard
+    r = _fetch_page(url)
+    if isinstance(r, netguard.FetchError):
+        return None
+    for hop in [*r.history, r.url]:
+        m = _DOI_FROM_URL_RE.search(hop)
         if m:
             return m.group(1).rstrip(".,)")
-        # Scan HTML meta tags (first 30 KB is enough)
-        if "html" in r.headers.get("content-type", "").lower():
-            chunk = r.text[:30_000]
-            for pattern in (
-                r'<meta[^>]+name=["\']citation_doi["\'][^>]+content=["\']([^"\']+)["\']',
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_doi["\']',
-                r'<meta[^>]+name=["\']dc\.identifier["\'][^>]+'
-                r'content=["\'](?:doi:)?(10\.\d{4,}/[^"\']+)["\']',
-            ):
-                m2 = re.search(pattern, chunk, re.IGNORECASE)
-                if m2:
-                    doi_val = m2.group(1).strip().lstrip("doi:").strip()
-                    if re.match(r"10\.\d{4,}/", doi_val):
-                        return doi_val
-    except Exception:
-        pass
+    if r.ok and "html" in r.content_type:
+        meta = _parse_html_metadata(r.text[:60_000])
+        doi_val = (meta.get("doi") or "").strip()
+        doi_val = re.sub(r"^(?:doi:|https?://(?:dx\.)?doi\.org/)", "", doi_val, flags=re.I)
+        if re.match(r"10\.\d{4,}/", doi_val):
+            return doi_val
     return None
 
 
@@ -2459,6 +2484,10 @@ def _parse_html_metadata(html_text: str) -> dict[str, Any]:
             meta.setdefault("venue", val)
         elif key == "citation_doi":
             meta.setdefault("doi", val)
+        elif key in ("dc.identifier", "dc.identifier.doi", "prism.doi"):
+            m_doi = re.search(r"10\.\d{4,}/\S+", val)
+            if m_doi:
+                meta.setdefault("doi", m_doi.group(0))
         elif key == "citation_publication_date":
             year = val[:4]
             if year.isdigit():
@@ -2492,72 +2521,42 @@ def _html_unescape(s: str) -> str:
     return _h.unescape(s)
 
 
-_URL_VERIFY_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept":     "text/html,application/xhtml+xml",
-}
+_GITHUB_REPO_RE = re.compile(
+    r"^https?://(?:www\.)?github\.com/([A-Za-z0-9][\w.-]*)/([\w.-]+?)(?:\.git)?(?:[/#?].*)?$",
+    re.IGNORECASE,
+)
+_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+# Host-name decorations that sites put around the real title.
+_TITLE_DECOR_RE = re.compile(r"^(?:GitHub|GitLab|Hugging Face|PyPI)\s*[-–—:]\s*", re.IGNORECASE)
+
+# Statuses that mean "the URL itself is gone" — distinct from 403/429/5xx,
+# which are usually bot-blocking or a temporary outage, not a dead link.
+_DEAD_HTTP_STATUSES = {404, 410}
 
 
-@_cached("url_verify", postprocess=_refresh_label)
-def _lookup_url(ref: dict[str, Any]) -> dict[str, Any]:
-    """
-    Fetch an arbitrary URL from a citation, parse its HTML metadata, and
-    score it against the cited title / authors / venue.
-
-    Mirrors the contract of every other source: returns a dict with
-    ``status`` in {found, not_found, skipped, error} and (when found) the
-    standard ``similarity`` / ``authors_sim`` / ``venue_sim`` / ``label``
-    fields plus the ``wrong_authors`` / ``wrong_venue`` flags.
-    """
+def _url_cache_key(ref: dict[str, Any]) -> str | None:
+    """url_verify results depend on the URL, not just title/year."""
     url = _extract_ref_url(ref)
     if not url:
-        return {"status": "skipped"}
-    # Routes that other sources already handle authoritatively — don't
-    # double-fetch (and don't produce a noisy lower-quality verification
-    # competing with the canonical S2/Crossref result).
-    if _URL_ROUTE_COVERED_RE.search(url):
-        return {"status": "skipped"}
+        return None
+    return f"url={url.strip().rstrip('/')}|{_cache_key(ref) or ''}"
 
+
+def _score_page(ref: dict[str, Any], meta: dict[str, Any],
+                alt_titles: list[str] | None = None) -> dict[str, Any]:
+    """Score page metadata against the cited fields like any other source."""
     extracted_title   = ref.get("title", "") or ""
     extracted_venue   = ref.get("venue", "") or ""
     extracted_authors = ref.get("authors", "") or ""
-
-    try:
-        r = _SESSION.get(
-            url,
-            headers=_URL_VERIFY_HEADERS,
-            timeout=10,
-            allow_redirects=True,
-        )
-        _bump_http_count(url)
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)[:120]}
-
-    if not r.ok:
-        # 4xx / 5xx — could be paywall, dead link, or fabricated URL.
-        # Surface as error so the orchestrator can escalate; the caller
-        # decides whether to treat a 404 here as a "fabricated URL" signal.
-        return {"status": "error", "error": f"HTTP {r.status_code}", "url": r.url}
-
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "html" not in ctype and "xml" not in ctype:
-        # PDF / image / JSON — page exists but we can't extract a
-        # paper title from it.  Treat as resolved-but-uninformative.
-        return {"status": "not_found", "url": r.url}
-
-    # Cap HTML at 256 KB — the head of any modern paper page carries the
-    # citation tags; trailing body / scripts would inflate cache size
-    # without adding signal.
-    html_text = r.text[:262144]
-    meta = _parse_html_metadata(html_text)
-    if not meta.get("title"):
-        return {"status": "not_found", "url": r.url}
-
-    found_title   = meta["title"]
+    found_title   = meta.get("title", "")
     found_authors = meta.get("authors", "")
     found_venue   = meta.get("venue", "")
 
-    tsim = title_similarity(extracted_title, found_title)      if (extracted_title and found_title) else None
+    tsim = None
+    if extracted_title:
+        cands = [t for t in [found_title, *(alt_titles or [])] if t]
+        if cands:
+            tsim = max(title_similarity(extracted_title, t) for t in cands)
     asim = author_similarity(extracted_authors, found_authors) if (extracted_authors and found_authors) else None
     vsim = venue_similarity(extracted_venue, found_venue)      if (extracted_venue and found_venue) else None
 
@@ -2574,12 +2573,145 @@ def _lookup_url(ref: dict[str, Any]) -> dict[str, Any]:
         "venue_label":   finalised["venue_label"],
         "year":          meta.get("year", ""),
         "doi":           meta.get("doi", ""),
-        "url":           r.url,    # final URL after redirects — useful for the UI
     }
     if finalised.get("wrong_authors"):
         out["wrong_authors"] = True
     if finalised.get("wrong_venue"):
         out["wrong_venue"] = True
+    return out
+
+
+def _github_repo(url: str) -> dict[str, Any] | None:
+    """Repo metadata from the GitHub API, ``{"_dead": True}`` for a 404,
+    or None when the API is unavailable (rate limit, network)."""
+    m = _GITHUB_REPO_RE.match(url)
+    if not m or m.group(1).lower() in ("orgs", "topics", "features", "about", "sponsors"):
+        return None
+    owner, repo = m.group(1), m.group(2)
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
+    if _GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {_GITHUB_TOKEN}"
+    try:
+        _bump_http_count("https://api.github.com/")
+        r = _SESSION.get(f"https://api.github.com/repos/{owner}/{repo}",
+                         headers=headers, timeout=8)
+    except Exception:
+        return None
+    if r.status_code == 404:
+        return {"_dead": True}
+    if not r.ok:
+        return None
+    return r.json()
+
+
+def _wayback_snapshot(url: str) -> dict[str, str] | None:
+    """Closest Internet Archive snapshot for a dead URL, or None."""
+    try:
+        _bump_http_count("https://archive.org/")
+        r = _SESSION.get("https://archive.org/wayback/available",
+                         params={"url": url}, headers={"User-Agent": USER_AGENT},
+                         timeout=10)
+        snap = (r.json().get("archived_snapshots") or {}).get("closest") or {}
+    except Exception:
+        return None
+    if snap.get("available") and snap.get("url"):
+        ts = snap.get("timestamp", "")
+        return {"url": snap["url"].replace("http://", "https://", 1), "date": ts[:4]}
+    return None
+
+
+def _dead_link_result(ref: dict[str, Any], url: str, reason: str) -> dict[str, Any]:
+    """URL is gone.  If the Wayback Machine has it, score the archived page
+    (a real-but-moved resource then still verifies); otherwise report a
+    dead link, which the UI surfaces as a warning — not as a mismatch."""
+    import netguard
+    snap = _wayback_snapshot(url)
+    if snap:
+        page = _fetch_page(snap["url"])
+        if isinstance(page, netguard.FetchResult) and page.ok and "html" in page.content_type:
+            meta = _parse_html_metadata(page.text)
+            if meta.get("title"):
+                out = _score_page(ref, meta)
+                out.update(url=snap["url"], archived=True, dead_url=url,
+                           note=f"cited URL is dead ({reason}); archived copy from {snap['date']}")
+                return out
+        return {"status": "dead_link", "url": url, "archived_url": snap["url"],
+                "note": f"cited URL is dead ({reason}); archived copy from {snap['date']} exists"}
+    return {"status": "dead_link", "url": url,
+            "note": f"cited URL is dead ({reason}); no archived copy"}
+
+
+@_cached("url_verify", postprocess=_refresh_label, key_fn=_url_cache_key)
+def _lookup_url(ref: dict[str, Any]) -> dict[str, Any]:
+    """
+    Verify a web resource cited by URL (project pages, GitHub repos, blog
+    posts, tech reports, workshop pages …).
+
+    Returns ``status`` in:
+      found      page (or its archived copy) parsed; standard similarity /
+                 label fields, plus ``archived``/``dead_url`` when it came
+                 from the Wayback Machine
+      dead_link  404 / 410 / host does not resolve, no usable archive
+      not_found  page exists but carries no usable title (PDF, image …)
+      error      blocked by the SSRF guard, timeout, 403/429/5xx
+      skipped    no URL, or a URL an authoritative source already covers
+    """
+    import netguard
+
+    url = _extract_ref_url(ref)
+    if not url:
+        return {"status": "skipped"}
+    if _URL_ROUTE_COVERED_RE.search(url):
+        return {"status": "skipped"}
+
+    # GitHub: the API gives a clean repo name + description, where the HTML
+    # <title> is "GitHub - owner/repo: description" and scores badly.
+    gh = _github_repo(url)
+    if gh is not None:
+        if gh.get("_dead"):
+            return _dead_link_result(ref, url, "GitHub repository not found")
+        name, desc = gh.get("name", ""), gh.get("description") or ""
+        full = gh.get("full_name", name)
+        meta = {
+            "title":   f"{full}: {desc}" if desc else full,
+            "authors": (gh.get("owner") or {}).get("login", ""),
+            "venue":   "GitHub",
+            "year":    (gh.get("created_at") or "")[:4],
+        }
+        spaced = re.sub(r"[_\-.]+", " ", name)
+        out = _score_page(ref, meta, alt_titles=[name, spaced, desc, full,
+                                                 f"{spaced}: {desc}" if desc else ""])
+        out["url"] = gh.get("html_url", url)
+        # Owner logins rarely equal cited author names; don't flag on that.
+        out.pop("wrong_authors", None)
+        out["authors_sim"] = None
+        if out["label"] == "mismatch" and not out.get("wrong_venue"):
+            out["label"] = "fuzzy"
+        return out
+
+    page = _fetch_page(url)
+    if isinstance(page, netguard.FetchError):
+        if page.kind == "dns":
+            return _dead_link_result(ref, url, "host does not resolve")
+        return {"status": "error", "error": f"{page.kind}: {page}"[:160], "url": url}
+    if page.status_code in _DEAD_HTTP_STATUSES:
+        return _dead_link_result(ref, url, f"HTTP {page.status_code}")
+    if not page.ok:
+        # 401/403/429/5xx — paywall, bot protection or outage, not proof
+        # the resource is gone.
+        return {"status": "error", "error": f"HTTP {page.status_code}", "url": page.url}
+
+    if "html" not in page.content_type and "xml" not in page.content_type:
+        # PDF / image / JSON — the resource exists but has no title to compare.
+        return {"status": "not_found", "url": page.url, "note": "resource exists (not an HTML page)"}
+
+    meta = _parse_html_metadata(page.text)
+    if meta.get("title"):
+        meta["title"] = _TITLE_DECOR_RE.sub("", meta["title"]).strip()
+    if not meta.get("title"):
+        return {"status": "not_found", "url": page.url, "note": "page has no title"}
+    out = _score_page(ref, meta)
+    out["url"] = page.url    # final URL after redirects — useful for the UI
     return out
 
 
@@ -2771,6 +2903,28 @@ def lookup_reference(ref: dict[str, Any],
                      scholar_budget: ScholarBudget | None = None,
                      ) -> dict[str, Any]:
     """
+    Look up a single reference (see ``_lookup_reference_core``), then make
+    sure a cited non-academic URL is always checked — even when a DOI or
+    title route already confirmed the paper, the reader should learn that
+    the link in the citation is dead or points somewhere else.
+    """
+    results = _lookup_reference_core(ref, scholar_budget)
+    if results.get("_router_path") == "junk_filter":
+        return results
+    url = _extract_ref_url(ref)
+    if (url and not _URL_ROUTE_COVERED_RE.search(url)
+            and (results.get("url_verify") or {}).get("status") in (None, "skipped")):
+        try:
+            results["url_verify"] = _lookup_url(ref)
+        except Exception as exc:
+            results["url_verify"] = {"status": "error", "error": str(exc)[:160]}
+    return results
+
+
+def _lookup_reference_core(ref: dict[str, Any],
+                           scholar_budget: ScholarBudget | None = None,
+                           ) -> dict[str, Any]:
+    """
     Look up a single reference through a tiered pipeline:
 
       Phase 1  Source router — pick 1-2 APIs based on identifiers/venue.
@@ -2792,7 +2946,8 @@ def lookup_reference(ref: dict[str, Any],
     ref_url = ref.get("url", "") or ""
     if (ref_url
             and not _DOI_FROM_URL_RE.search(ref_url)
-            and not _ARXIV_ID_RE.search(ref_url)):
+            and not _ARXIV_ID_RE.search(ref_url)
+            and not _extract_doi(ref)):
         fetched_doi = _resolve_url_doi(ref_url)
         if fetched_doi:
             ref = {**ref, "doi": fetched_doi}
