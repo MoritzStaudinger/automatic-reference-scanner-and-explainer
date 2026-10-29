@@ -114,8 +114,8 @@ def claims_html(verdicts: list[dict]) -> str:
                   if conf and verdict not in ("no_source", "error") else "")
         evidence = (f'<blockquote>“{esc((v.get("evidence_passage") or "")[:300])}”</blockquote>'
                     if v.get("evidence_passage") else "")
-        expl = (f'<div class="muted">{esc((v.get("explanation") or "")[:300])}</div>'
-                if v.get("explanation") else "")
+        note = v.get("explanation") or (v.get("error") if verdict == "error" else "")
+        expl = f'<div class="muted">{esc(str(note)[:300])}</div>' if note else ""
         rows.append(f'<li>{badge}{conf_s}{src}<div class="claim">“{esc((v.get("claim_text") or "")[:400])}”'
                     f'</div>{evidence}{expl}</li>')
     return (f'<div class="sect"><div class="sect-h">Citation context ({len(verdicts)})</div>'
