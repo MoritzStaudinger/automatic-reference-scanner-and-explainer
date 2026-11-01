@@ -39,12 +39,14 @@ def add_citation(text: str, page: int | None = None, rect: list | None = None) -
 
 def render(doc: Document, lookup_results: list | None, doc_id: str) -> None:
     refs = doc.refs
-    # Consume a "Show in PDF" request once, so later reruns don't snap back.
-    scroll_page = None
+    # Card → PDF backlink: each "Show in PDF" click carries a new nonce, so
+    # the viewer jumps (and flashes the reference) every time — also when
+    # it is on the page already in view.
+    focus = None
     sel = st.session_state.get("selected_ref")
-    if sel is not None and sel != st.session_state.get("last_scrolled_ref") and sel < len(refs):
-        scroll_page = refs[sel].get("page")
-        st.session_state.last_scrolled_ref = sel
+    if isinstance(sel, int) and 0 <= sel < len(refs) and refs[sel].get("page"):
+        focus = {"page": refs[sel]["page"], "rect": refs[sel].get("rect"),
+                 "nonce": st.session_state.get("focus_nonce", 0)}
 
     annots = []
     for i, r in enumerate(refs):
@@ -59,7 +61,7 @@ def render(doc: Document, lookup_results: list | None, doc_id: str) -> None:
         })
 
     event = pdf_selector(
-        pdf_bytes=doc.pdf, annotations=annots, height=860, scroll_to_page=scroll_page,
+        pdf_bytes=doc.pdf, annotations=annots, height=860, focus=focus,
         emit_page_changes=bool(st.session_state.get("page_only")),
         key=f"pdf_{doc_id}",     # stable per document: remounting re-sends the PDF
     )

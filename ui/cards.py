@@ -40,6 +40,17 @@ def _link(url: str, text: str) -> str:
     return f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(text)}</a>'
 
 
+def _scores(r: dict) -> str:
+    """'title 98% · authors 67% · venue 40%' — the inputs to the verdict."""
+    parts = [f"{name} {_pct(r.get(key))}" for name, key in
+             (("title", "similarity"), ("authors", "authors_sim"), ("venue", "venue_sim"))
+             if isinstance(r.get(key), (int, float))]
+    return " · ".join(parts)
+
+
+_LABEL_WORD = {"match": "match", "fuzzy": "weak", "mismatch": "mismatch"}
+
+
 def source_rows(lr: dict, ref: dict) -> str:
     """One row per source that found something, plus warnings."""
     rows: list[str] = []
@@ -63,10 +74,10 @@ def source_rows(lr: dict, ref: dict) -> str:
         label = r.get("label")
         found_t = r.get("found_title") or ""
         note = f' — <i>{esc(found_t)}</i>' if label != "match" and found_t else ""
-        archived = (f' <span class="chip">archived copy</span>' if r.get("archived") else "")
+        archived = (' <span class="chip">archived copy</span>' if r.get("archived") else "")
         rows.append(f'<li><span class="dot {_LABEL_DOT.get(label, "muted")}"></span>'
-                    f'<b>{_link(url, name)}</b> <span class="muted">{_pct(r.get("similarity"))}'
-                    f'</span>{note}{archived}</li>')
+                    f'<b>{_link(url, name)}</b> <span class="chip">{_LABEL_WORD.get(label, label or "?")}</span>'
+                    f' <span class="muted">{_scores(r)}</span>{note}{archived}</li>')
         if r.get("wrong_doi"):
             rows.append(f'<li class="warnrow">Cited DOI <code>{esc(r["wrong_doi"])}</code> '
                         f'points to a different paper</li>')

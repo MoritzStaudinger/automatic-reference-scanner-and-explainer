@@ -435,6 +435,28 @@ function scrollWrapTo(el, behavior) {
   wrap.scrollTo({ top: Math.max(0, top - 8), behavior });
 }
 
+// Scroll a reference into view and flash an outline around it — the
+// card → PDF backlink.  Works when the reference is on the current page
+// too (the page-only jump did nothing then).
+let _lastFocusNonce = null;
+function focusOn(focus) {
+  if (!focus || focus.nonce === _lastFocusNonce) return;
+  const pi = state.pageElements[(focus.page || 1) - 1];
+  if (!pi) return;
+  _lastFocusNonce = focus.nonce;
+  const wrap = document.getElementById("pages-wrap");
+  if (!focus.rect) { scrollWrapTo(pi.el, "smooth"); return; }
+  const r = annotViewportRect({ rect: focus.rect }, pi.viewport);
+  const pageTop = pi.el.getBoundingClientRect().top - wrap.getBoundingClientRect().top + wrap.scrollTop;
+  wrap.scrollTo({ top: Math.max(0, pageTop + r.top - wrap.clientHeight * 0.12), behavior: "smooth" });
+  const flash = document.createElement("div");
+  flash.className = "focus-flash";
+  Object.assign(flash.style, { left: `${r.left - 4}px`, top: `${r.top - 4}px`,
+                               width: `${r.w + 8}px`, height: `${r.h + 8}px` });
+  pi.annotLayer.appendChild(flash);
+  setTimeout(() => flash.remove(), 2400);
+}
+
 function scrollToPage(n) {
   if (n < 1 || n > state.totalPages) return;
   const pi = state.pageElements[n - 1];
@@ -656,8 +678,11 @@ function onRender(event) {
   const annotKey = JSON.stringify(args.annotations || []);
   const pdfUnchanged   = pdfKey   === _lastPdfKey;
   const annotUnchanged = annotKey === _lastAnnotKey;
+  const focus = args.focus || null;
+  const focusIsNew = !!focus && focus.nonce !== _lastFocusNonce;
   if (pdfUnchanged && annotUnchanged && !args.scroll_to_page) {
-    // Truly nothing to do.
+    // Nothing to re-render; maybe a backlink jump.
+    if (focusIsNew) focusOn(focus);
     return;
   }
   _lastPdfKey   = pdfKey;
@@ -666,7 +691,9 @@ function onRender(event) {
   const pdfBytes = b64ToBytes(args.pdf_b64 || "");
   const annotations = args.annotations || [];
   const scrollTarget = args.scroll_to_page || null;
-  loadPdf(pdfBytes, annotations, scrollTarget).catch((err) => {
+  loadPdf(pdfBytes, annotations, scrollTarget).then(() => {
+    if (focusIsNew) requestAnimationFrame(() => focusOn(focus));
+  }).catch((err) => {
     document.getElementById("pages").innerHTML =
       `<pre style="color:red; padding:1em;">PDF render error: ${err.message}\n${err.stack}</pre>`;
     Streamlit.setFrameHeight();

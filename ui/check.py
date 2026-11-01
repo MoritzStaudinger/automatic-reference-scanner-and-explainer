@@ -14,7 +14,7 @@ from pathlib import Path
 import streamlit as st
 
 from lookup import forget_reference, lookup_all
-from ui import cards, jobs, state, viewer
+from ui import cards, explain, jobs, state, viewer
 from ui.processing import (
     LLM_BACKEND, LLM_MODEL, LLM_READY, PARSER_HELP, Document, annotated_pdf,
     parser_options, process, with_manual,
@@ -374,19 +374,26 @@ def workspace() -> None:
     with left:
         f1, f2 = st.columns([3, 2], vertical_alignment="bottom")
         with f1:
-            chosen = st.pills(
-                "Status", [k for k in ("mismatch", "missing", "match", "pending")
-                           if k != "pending" or "pending" in statuses],
-                selection_mode="multi", key="status_filter", label_visibility="collapsed",
-                format_func=lambda s: f"{STATUS_LABEL[s]} {statuses.count(s)}")
+            opts = ["all"] + [k for k in ("mismatch", "missing", "match", "pending")
+                              if k != "pending" or "pending" in statuses]
+            if st.session_state.get("status_filter") not in opts:
+                st.session_state.status_filter = "all"
+            chosen = st.segmented_control(
+                "Filter by status", opts, key="status_filter", required=True,
+                format_func=lambda s: (f"All {len(statuses)}" if s == "all"
+                                       else f"{STATUS_LABEL[s]} {statuses.count(s)}"))
         with f2:
-            query = st.text_input("Search", key="search", placeholder="Search references",
-                                  label_visibility="collapsed", icon=":material/search:")
-        page_only = st.toggle("Only references on the visible PDF page", key="page_only")
+            query = st.text_input("Search", key="search",
+                                  placeholder="Title, author, venue …",
+                                  icon=":material/search:")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            page_only = st.toggle("Only references on the visible PDF page", key="page_only")
+            with st.popover("How is this decided?", icon=":material/help:", type="tertiary"):
+                st.markdown(explain.MATCHING_MD)
 
         visible = list(range(len(refs)))
-        if chosen:
-            visible = [i for i in visible if statuses[i] in chosen]
+        if chosen and chosen != "all":
+            visible = [i for i in visible if statuses[i] == chosen]
         if query:
             q = query.lower()
             visible = [i for i in visible
@@ -421,10 +428,10 @@ def workspace() -> None:
                             unsafe_allow_html=True)
                 with st.container(horizontal=True, gap="small"):
                     if ref.get("found") and ref.get("page"):
-                        if st.button(f"Show on p. {ref['page']}", key=f"go_{i}",
+                        if st.button(f"Show in PDF (p. {ref['page']})", key=f"go_{i}",
                                      type="tertiary", icon=":material/my_location:"):
                             st.session_state.selected_ref = i
-                            st.session_state.last_scrolled_ref = None
+                            st.session_state.focus_nonce = st.session_state.get("focus_nonce", 0) + 1
                     if lr is not None and overall_status(lr) != "match" and not jobs.busy():
                         if st.button("Re-check", key=f"re_{i}", type="tertiary",
                                      icon=":material/refresh:",

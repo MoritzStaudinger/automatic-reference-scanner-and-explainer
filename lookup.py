@@ -779,7 +779,11 @@ def _composite_label(
     # Tier 1: strong title (≥ 0.90) — title is essentially identical.
     if tsim >= MATCH_THRESHOLD:
         if asim is not None and asim < AUTHOR_MATCH_THRESHOLD:
-            return "mismatch"   # wrong paper at the exact title
+            # Wrong paper at the same title — only when the titles are
+            # practically identical (same floor as wrong_authors); between
+            # 0.90 and the floor it is more often a different paper with a
+            # similar title, i.e. "not found", not "wrong".
+            return "mismatch" if tsim >= WRONG_FLAG_TITLE_FLOOR else "fuzzy"
         return "match"
 
     # Tier 2: medium title (0.70 – 0.90).  Likely word overlap; only

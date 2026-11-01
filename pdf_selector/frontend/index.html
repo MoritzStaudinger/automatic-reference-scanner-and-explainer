@@ -65,6 +65,20 @@
       text-align: center;
     }
     /* The prominent "+ Add" button — always visible, label changes by state */
+    /* Backlink target: outline that pulses, then fades. */
+    .focus-flash {
+      position: absolute;
+      border: 3px solid var(--accent);
+      border-radius: 4px;
+      pointer-events: none;
+      box-shadow: 0 0 0 4px rgba(39, 84, 197, 0.25);
+      animation: focus-flash 2.4s ease-out forwards;
+    }
+    @keyframes focus-flash {
+      0%, 15%, 35% { opacity: 1; }
+      25% { opacity: 0.35; }
+      100% { opacity: 0; }
+    }
     #add-btn {
       background: var(--accent) !important;
       color: white !important;

@@ -55,6 +55,10 @@ st.markdown("""
    cite it.
 """)
 
+st.header("How matching is scored")
+from ui.explain import MATCHING_MD  # noqa: E402
+st.markdown(MATCHING_MD)
+
 st.header("Sources")
 st.table({
     "Source": ["doi.org", "Semantic Scholar", "Crossref", "OpenAlex", "arXiv", "DBLP",

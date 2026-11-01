@@ -23,7 +23,7 @@ import streamlit as st
 # Keys reset whenever a different document is loaded.
 _DOC_KEYS = (
     "manual_refs", "lookup_results", "claim_verifications",
-    "selected_ref", "last_scrolled_ref", "focused_ref", "pdf_current_page",
+    "selected_ref", "focus_nonce", "focused_ref", "pdf_current_page",
     "last_pdf_event_id", "processed_key", "n_base", "status_filter",
     "search", "page_only", "job", "auto_lookup_done",
 )

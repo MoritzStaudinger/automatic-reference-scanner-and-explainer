@@ -42,6 +42,7 @@ def pdf_selector(
     height: int = 900,
     scroll_to_page: int | None = None,
     emit_page_changes: bool = False,
+    focus: dict[str, Any] | None = None,
     key: str | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -60,6 +61,10 @@ def pdf_selector(
         Viewer height in CSS pixels.
     scroll_to_page : int | None
         1-based page to scroll into view on render.
+    focus : dict | None
+        ``{"page", "rect", "nonce"}`` — scroll to that rectangle and flash
+        it.  Runs once per new ``nonce`` (repeat clicks on the same
+        reference need a fresh nonce).
     key : str | None
         Streamlit component key for state separation.
 
@@ -75,6 +80,7 @@ def pdf_selector(
         height             = height,
         scroll_to_page     = scroll_to_page,
         emit_page_changes  = bool(emit_page_changes),
+        focus              = focus,
         default            = None,
         key                = key,
     )
