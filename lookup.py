@@ -689,6 +689,12 @@ def refresh_result_against_ref(
         if cited_id:
             wrong_arxiv_id = cited_id
 
+    # Same rule for DOIs: only blame the citation for a DOI it prints.
+    # A DOI the LLM repair added, or one GROBID took from a hidden PDF
+    # link, still routes the lookup but can't produce "wrong DOI".
+    if result.get("wrong_doi") and not _doi_in_citation(ref or {}, result["wrong_doi"]):
+        result = {k: v for k, v in result.items() if k != "wrong_doi"}
+
     # wrong_doi / wrong_arxiv_id / wrong_authors / wrong_venue all force
     # mismatch — when a cited identifier resolves to a different paper,
     # or when authors / venue clearly disagree at a high-enough title sim
@@ -964,6 +970,14 @@ def _extract_arxiv_id(ref: dict[str, Any]) -> str | None:
         if m:
             return m.group(1) or m.group(2)
     return None
+
+
+def _doi_in_citation(ref: dict[str, Any], doi: str) -> bool:
+    """True when ``doi`` is printed in this reference's own raw text
+    (line breaks and case ignored)."""
+    squash = lambda s: re.sub(r"\s+", "", s or "").lower()
+    d = squash(doi).rstrip(".,;)")
+    return bool(d) and d in squash(_ref_raw_segment(ref))
 
 
 def _cited_arxiv_id(ref: dict[str, Any]) -> str | None:
