@@ -29,12 +29,12 @@ st.html(f"<style>{(Path(__file__).parent / 'style.css').read_text()}</style>")
 # ---------------------------------------------------------------------------
 
 st.html("""
-<div class="ares-hero">
+<div class="arse-hero">
   <h1>Check the references in a paper</h1>
-  <p>Upload a PDF. ARES extracts its bibliography, looks every reference up in
+  <p>Upload a PDF. ARSE extracts its bibliography, looks every reference up in
   Semantic Scholar, Crossref, OpenAlex, DBLP, arXiv, ACL Anthology and doi.org,
   checks cited web pages and repositories, and highlights the results in the PDF.</p>
-  <div class="ares-steps"><span>1 · Extract references</span><span>2 · Verify each one</span>
+  <div class="arse-steps"><span>1 · Extract references</span><span>2 · Verify each one</span>
   <span>3 · Review flagged items</span><span>4 · Export a report</span></div>
 </div>
 """)
@@ -47,7 +47,7 @@ def _landing() -> None:
                 "arXiv ID, but the details disagree — often a wrong or invented citation.")
     c3.markdown("**:material/help: Not found**  \nNo source knows it. Common for "
                 "software, datasets, blogs and very new papers.")
-    st.info("**Human review is required.** ARES points you to references worth checking; "
+    st.info("**Human review is required.** ARSE points you to references worth checking; "
             "it does not decide whether a citation is correct. Databases are incomplete "
             "and matching has limits.", icon=":material/person_search:")
 
@@ -403,5 +403,5 @@ if lookup_results is not None:
     with st.expander("Full report", icon=":material/description:"):
         st.markdown(report_md)
 
-st.caption("ARES surfaces candidates for human review — always confirm a flagged "
+st.caption("ARSE surfaces candidates for human review — always confirm a flagged "
            "reference against the original source before acting on it.")

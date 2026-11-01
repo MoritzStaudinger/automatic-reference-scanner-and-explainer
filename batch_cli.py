@@ -1,5 +1,5 @@
 """
-ARES batch CLI — process a directory of PDFs locally without the API.
+ARSE batch CLI — process a directory of PDFs locally without the API.
 
 Two modes:
 
@@ -9,7 +9,7 @@ running on the same host as the model + cache.
     python batch_cli.py <input_dir> <output_dir> [--parser grobid] [--use-llm]
                        [--concurrency 4] [--glob '*.pdf']
 
-Remote — POST PDFs to a running ARES API and collect results.  Best when
+Remote — POST PDFs to a running ARSE API and collect results.  Best when
 the API runs on a separate machine (e.g. the institutional VM).
 
     python batch_cli.py <input_dir> <output_dir> --remote https://host/api/v1
@@ -46,7 +46,7 @@ def _process_local(pdf_path: Path, parser: str, use_llm: bool) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Remote mode — talk to the ARES HTTP API
+# Remote mode — talk to the ARSE HTTP API
 # ---------------------------------------------------------------------------
 
 def _process_remote(
@@ -81,8 +81,8 @@ def _process_remote(
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        prog="ares-batch",
-        description="Batch-process PDFs through the ARES pipeline.",
+        prog="arse-batch",
+        description="Batch-process PDFs through the ARSE pipeline.",
     )
     p.add_argument("input_dir",  type=Path, help="Directory of PDFs to process.")
     p.add_argument("output_dir", type=Path, help="Where to write per-PDF JSON and summary.csv.")
@@ -96,11 +96,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--glob",     default="*.pdf",
                    help="File pattern in input_dir (default *.pdf).")
     p.add_argument("--remote",   default=None,
-                   help=("Base URL of an ARES API (e.g. "
+                   help=("Base URL of an ARSE API (e.g. "
                          "https://reference-cleaner.ds-ifs.tuwien.ac.at/api/v1). "
                          "When unset, runs the pipeline locally."))
     p.add_argument("--api-key",  default=os.getenv("ARES_API_KEY"),
-                   help="X-API-Key for the remote ARES API.  Defaults to $ARES_API_KEY.")
+                   help="X-API-Key for the remote ARSE API.  Defaults to $ARES_API_KEY.")
     p.add_argument("--overwrite", action="store_true",
                    help="Overwrite existing per-PDF JSONs in output_dir.")
     args = p.parse_args(argv)

@@ -1,4 +1,4 @@
-/* ARES UI — layered on the Streamlit theme in .streamlit/config.toml.
+/* ARSE UI — layered on the Streamlit theme in .streamlit/config.toml.
    Colours are translucent tints over the theme background and text
    inherits the theme colour, so the same rules work in light and dark. */
 
@@ -13,10 +13,10 @@
 }
 
 /* Header */
-.ares-hero h1 { font-size: 2rem; margin: 0 0 .25rem 0; letter-spacing: -.02em; }
-.ares-hero p  { color: var(--muted-fg); margin: 0; max-width: 46rem; }
-.ares-steps { display: flex; gap: .5rem; flex-wrap: wrap; margin: .9rem 0 .2rem; }
-.ares-steps span { font-size: .8rem; padding: .2rem .65rem; border-radius: 999px;
+.arse-hero h1 { font-size: 2rem; margin: 0 0 .25rem 0; letter-spacing: -.02em; }
+.arse-hero p  { color: var(--muted-fg); margin: 0; max-width: 46rem; }
+.arse-steps { display: flex; gap: .5rem; flex-wrap: wrap; margin: .9rem 0 .2rem; }
+.arse-steps span { font-size: .8rem; padding: .2rem .65rem; border-radius: 999px;
                    background: var(--tint); border: 1px solid var(--hair); }
 
 /* Reference cards */
@@ -84,7 +84,7 @@
 /* Metric tiles: tighter on narrow screens */
 [data-testid="stMetric"] { padding: .55rem .8rem; }
 @media (max-width: 640px) {
-  .ares-hero h1 { font-size: 1.5rem; }
+  .arse-hero h1 { font-size: 1.5rem; }
   .refcard .body { padding-left: .8rem; }
   .refcard .meta { margin-left: 0; }
 }

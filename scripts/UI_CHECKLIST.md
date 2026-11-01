@@ -1,4 +1,4 @@
-# ARES manual UI checklist
+# ARSE manual UI checklist
 
 `pytest tests/` and `python scripts/smoke_test.py` cover the pipeline, API and
 page rendering. These checks need a browser: run them after changing anything

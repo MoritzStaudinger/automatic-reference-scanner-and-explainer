@@ -1,5 +1,5 @@
 """
-Mint, list, and revoke API keys for the ARES HTTP API.
+Mint, list, and revoke API keys for the ARSE HTTP API.
 
 The keys live in ``data/api_keys.json`` (override with the
 ``ARES_API_KEYS_FILE`` env var).  The running API watches the file's
@@ -160,7 +160,7 @@ def cmd_revoke(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="manage_keys",
-        description="Mint, list, and revoke ARES API keys.",
+        description="Mint, list, and revoke ARSE API keys.",
     )
     p.add_argument("--file", type=Path, default=DEFAULT_PATH,
                    help=f"Path to the keys JSON (default: {DEFAULT_PATH}).")

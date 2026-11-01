@@ -1,5 +1,5 @@
 """
-ARES HTTP API — drive the pipeline remotely and process PDFs in batch.
+ARSE HTTP API — drive the pipeline remotely and process PDFs in batch.
 
 Endpoints
 ---------
@@ -81,7 +81,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from job_store import get_job_store
 from pipeline import PipelineOptions, process_pdf
 
-_log = logging.getLogger("ares.api")
+_log = logging.getLogger("arse.api")
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ def _load_api_keys() -> dict[str, dict]:
 # thread per PDF.
 _workers = ThreadPoolExecutor(
     max_workers=_BATCH_WORKERS,
-    thread_name_prefix="ares-batch",
+    thread_name_prefix="arse-batch",
 )
 
 
@@ -188,10 +188,10 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="ARES API",
+    title="ARSE API",
     version="1.0",
     description=(
-        "Automatic Reference Explainer and Scanner — programmatic interface "
+        "Automatic Reference Scanner and Explainer — programmatic interface "
         "for headless PDF reference validation and batch processing."
     ),
     lifespan=lifespan,

@@ -1,16 +1,16 @@
-"""About: what ARES checks, how, and where it falls short.  Static page."""
+"""About: what ARSE checks, how, and where it falls short.  Static page."""
 
 import streamlit as st
 
-st.title("About ARES")
+st.title("About ARSE")
 st.markdown(
-    "The **Automatic Reference Explainer and Scanner** extracts the bibliography "
+    "The **Automatic Reference Scanner and Explainer** extracts the bibliography "
     "from an academic PDF, checks every reference against scholarly indexes and the "
     "web pages it cites, and points out the ones that don't add up: DOIs and arXiv IDs "
     "that lead to a different paper, real titles with the wrong authors, dead links, "
     "and citations no index has ever seen."
 )
-st.info("**Every result needs human review.** ARES reports what databases and web pages "
+st.info("**Every result needs human review.** ARSE reports what databases and web pages "
         "say; it does not decide whether a citation is correct.",
         icon=":material/person_search:")
 
@@ -91,7 +91,7 @@ st.markdown("""
 - **Citation context** verdicts from abstracts are partial by nature; *not addressed*
   often just means the abstract is silent.
 
-ARES surfaces candidates for review. It is not a citation auditor of record, and a clean
+ARSE surfaces candidates for review. It is not a citation auditor of record, and a clean
 result does not replace reading what you cite.
 """)
 

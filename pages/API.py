@@ -29,7 +29,7 @@ with st.container(border=True):
     st.markdown(
         "**:material/key: Access** — every `/api/*` call needs an `X-API-Key` header. "
         "To request a key, email "
-        "[moritz.staudinger@tuwien.ac.at](mailto:moritz.staudinger@tuwien.ac.at?subject=ARES%20API%20key%20request) "
+        "[moritz.staudinger@tuwien.ac.at](mailto:moritz.staudinger@tuwien.ac.at?subject=ARSE%20API%20key%20request) "
         "with a line about what you want to use it for."
     )
 

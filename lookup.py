@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 # ARES_CONTACT_EMAIL; the per-source OPENALEX_MAILTO / DOI_ORG_MAILTO
 # variables still win when set.
 CONTACT_EMAIL = os.getenv("ARES_CONTACT_EMAIL", "moritz.staudinger@tuwien.ac.at")
-USER_AGENT    = f"ARES/1.0 (+https://reference-cleaner.ds-ifs.tuwien.ac.at; mailto:{CONTACT_EMAIL})"
+USER_AGENT    = f"ARSE/1.0 (+https://reference-cleaner.ds-ifs.tuwien.ac.at; mailto:{CONTACT_EMAIL})"
 
 # Connection-pooled HTTP session — every source uses this so TCP+TLS
 # handshakes amortise across the ~200 calls per paper.
@@ -2233,7 +2233,7 @@ def _lookup_scholarly(ref: dict[str, Any],
 
 _DOI_ORG_MAILTO  = os.getenv("DOI_ORG_MAILTO") or _OA_MAILTO
 _DOI_ORG_HEADERS = {
-    "User-Agent": f"ARES/1.0 (mailto:{_DOI_ORG_MAILTO})",
+    "User-Agent": f"ARSE/1.0 (mailto:{_DOI_ORG_MAILTO})",
     "Accept":     "application/vnd.citationstyles.csl+json",
 }
 

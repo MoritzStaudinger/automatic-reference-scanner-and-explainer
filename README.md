@@ -1,4 +1,4 @@
-# Automatic Reference Explainer and Scanner
+# Automatic Reference Scanner and Explainer
 
 A pipeline + Streamlit UI for extracting references from academic PDFs and
 auditing them against multiple authoritative databases. The tool surfaces
@@ -66,7 +66,7 @@ streamlit run app.py
 
 ## HTTP API and batch mode
 
-ARES exposes a headless HTTP API for programmatic use and batch
+ARSE exposes a headless HTTP API for programmatic use and batch
 processing of large PDF collections.
 
 The Docker Compose deployment ships with an `ares-api` service alongside
@@ -113,7 +113,7 @@ wraps both the local pipeline and the remote API:
 python batch_cli.py /path/to/pdfs/ /path/to/output/ \
        --parser grobid --concurrency 4
 
-# Remote (against a deployed ARES):
+# Remote (against a deployed ARSE):
 python batch_cli.py /path/to/pdfs/ /path/to/output/ \
        --remote https://your-host/api/v1 \
        --api-key $ARES_API_KEY \

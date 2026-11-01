@@ -1,5 +1,5 @@
 """
-End-to-end smoke test for ARES.
+End-to-end smoke test for ARSE.
 
 Exercises every code path that can run without a browser:
   - matching helpers (wrong_authors / wrong_venue / preprint exclusion)
@@ -494,7 +494,7 @@ def test_website_lookups_live() -> None:
                      "url": "https://github.com/huggingface/transformers"})
     check("GitHub repo → found/match", r.get("status") == "found" and r.get("label") == "match",
           f"status={r.get('status')} label={r.get('label')}")
-    r = _lookup_url({"title": "A tool", "url": "https://ares-smoke-test-no-such-host.invalid/x"})
+    r = _lookup_url({"title": "A tool", "url": "https://arse-smoke-test-no-such-host.invalid/x"})
     check("unresolvable host → dead_link", r.get("status") == "dead_link", f"status={r.get('status')}")
     r = _lookup_url({"title": "internal", "url": "http://169.254.169.254/latest/meta-data/"})
     check("metadata IP blocked", r.get("status") == "error" and "blocked" in (r.get("error") or ""),

@@ -26,12 +26,12 @@ proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 
 # HTTP API.  Longest-prefix match wins over "/".
-set $ares_ui  ares:8501;      # variables → re-resolved via `resolver`
-set $ares_api ares-api:8500;
+set $arse_ui  ares:8501;      # variables → re-resolved via `resolver`
+set $arse_api ares-api:8500;
 
 location /api/ {
     limit_req zone=ares_api burst=20 nodelay;
-    proxy_pass http://$ares_api;
+    proxy_pass http://$arse_api;
     # Sync /api/v1/process can take minutes for an uncached paper.
     proxy_read_timeout 600s;
     proxy_send_timeout 600s;
@@ -42,20 +42,20 @@ location /api/ {
 location = /api/v1/batch {
     limit_req zone=ares_api burst=5 nodelay;
     client_max_body_size 200m;
-    proxy_pass http://$ares_api;
+    proxy_pass http://$arse_api;
     proxy_read_timeout 600s;
     proxy_send_timeout 600s;
     proxy_request_buffering off;
 }
 
 location = /api-health {
-    proxy_pass http://$ares_api/healthz;
+    proxy_pass http://$arse_api/healthz;
 }
 
 # Streamlit UI.
 location / {
     limit_req zone=ares_ui burst=100 nodelay;
-    proxy_pass http://$ares_ui;
+    proxy_pass http://$arse_ui;
     # Streamlit's live UI runs over a WebSocket (/_stcore/stream).
     proxy_set_header Upgrade    $http_upgrade;
     proxy_set_header Connection $connection_upgrade;

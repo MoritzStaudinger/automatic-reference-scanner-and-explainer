@@ -1,4 +1,4 @@
-# Deploying ARES
+# Deploying ARSE
 
 Production runs on one VM with Docker Compose: `grobid`, `ares` (Streamlit
 UI), `ares-api` (FastAPI) and `nginx` (TLS, the only service on the host

@@ -1,5 +1,5 @@
 """
-Headless ARES pipeline — parse → (LLM repair) → dedupe → lookup → report.
+Headless ARSE pipeline — parse → (LLM repair) → dedupe → lookup → report.
 
 Used by both:
   - the Streamlit UI (app.py) for interactive single-PDF runs, and
@@ -510,7 +510,7 @@ def _verify_claims_stage(
                                        depth=opts.verify_depth)
         except Exception:
             return idx, None
-    with _TPE(max_workers=6, thread_name_prefix="ares-fetch") as pool:
+    with _TPE(max_workers=6, thread_name_prefix="arse-fetch") as pool:
         for fut in as_completed(pool.submit(_fetch_one, i) for i in claims_by_ref):
             idx, ft = fut.result()
             fulltexts[idx] = ft
@@ -564,7 +564,7 @@ def _verify_claims_stage(
             )))
         return out
 
-    with _TPE(max_workers=llm_parallel, thread_name_prefix="ares-verify") as pool:
+    with _TPE(max_workers=llm_parallel, thread_name_prefix="arse-verify") as pool:
         for fut in as_completed(pool.submit(_verify_one_ref, ri) for ri in claims_by_ref):
             for pi, v in fut.result():
                 verdicts[pi] = v

@@ -70,7 +70,7 @@ def start(kind: str, label: str, fn: Callable[..., Any], *args,
             finally:
                 job.finished = time.time()
 
-    threading.Thread(target=_run, name=f"ares-{kind}", daemon=True).start()
+    threading.Thread(target=_run, name=f"arse-{kind}", daemon=True).start()
     st.session_state.job = job
     return job
 

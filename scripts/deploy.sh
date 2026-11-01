@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy / update ARES on the VM and verify it.  Run from the repo root:
+# Deploy / update ARSE on the VM and verify it.  Run from the repo root:
 #
 #   scripts/deploy.sh            # pull, build, restart, verify
 #   scripts/deploy.sh --no-pull  # deploy the working tree as-is

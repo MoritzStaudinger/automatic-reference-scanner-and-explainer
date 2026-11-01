@@ -1,5 +1,5 @@
 """
-ARES — Automatic Reference Explainer and Scanner.
+ARSE — Automatic Reference Scanner and Explainer.
 
 Entry point and router: `streamlit run app.py`.  Pages:
   ui/check.py      Check a PDF (the tool)
@@ -13,10 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 st.set_page_config(
-    page_title="ARES · Reference checker",
+    page_title="ARSE · Reference checker",
     page_icon=":material/fact_check:",
     layout="wide",
-    menu_items={"About": "ARES checks the references in academic PDFs against "
+    menu_items={"About": "ARSE checks the references in academic PDFs against "
                          "scholarly indexes. Built at TU Wien."},
 )
 

@@ -1,5 +1,5 @@
 """
-SQLite-backed job store for the ARES batch API.
+SQLite-backed job store for the ARSE batch API.
 
 Two tables:
   jobs     — one row per submitted batch (status, progress counters)
