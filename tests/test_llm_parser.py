@@ -128,3 +128,25 @@ def test_no_fallback_without_opt_in(monkeypatch):
     stats = {}
     llm_parser.parse_references_with_llm([{"raw": "r"}], stats=stats, backend="aqueduct")
     assert stats["n_failed_refs"] == 1 and stats["fallback"] is None
+
+
+def test_circuit_breaker_skips_down_backend(monkeypatch):
+    monkeypatch.setenv("LLM_FALLBACK_BACKEND", "anthropic")
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+    calls = []
+
+    class InternalServerError(Exception):
+        pass
+
+    def call(client, batch, backend=None, model=None):
+        calls.append(backend)
+        if backend == "aqueduct":
+            raise InternalServerError("500")
+        return [llm_parser._ParsedRef(title="ok") for _ in batch]
+    monkeypatch.setattr(llm_parser, "_call_llm", call)
+    monkeypatch.setattr(llm_parser, "_DOWN_UNTIL", {})
+    llm_parser.parse_references_with_llm([{"raw": "r"}], backend="aqueduct")
+    assert llm_parser.is_down("aqueduct")
+    calls.clear()
+    llm_parser.parse_references_with_llm([{"raw": "r"}], backend="aqueduct")
+    assert calls == ["anthropic"]          # primary skipped while down

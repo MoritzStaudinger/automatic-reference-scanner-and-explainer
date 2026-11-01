@@ -59,6 +59,32 @@ def resolve_backend() -> str:
     return "anthropic"
 
 
+# Circuit breaker: after a server / connection failure a backend is skipped
+# for a few minutes when a fallback is configured, instead of every batch
+# (and every claim check) waiting for its own timeout + retries.
+_DOWN_UNTIL: dict[str, float] = {}
+_DOWN_SECONDS = 300
+
+
+def mark_down(backend: str, exc: Exception) -> None:
+    name = type(exc).__name__
+    if name in ("InternalServerError", "APIConnectionError", "APITimeoutError",
+                "ServiceUnavailableError", "ConnectionError", "Timeout"):
+        import time
+        _DOWN_UNTIL[backend] = time.monotonic() + _DOWN_SECONDS
+
+
+def is_down(backend: str) -> bool:
+    import time
+    return time.monotonic() < _DOWN_UNTIL.get(backend, 0.0)
+
+
+def fallback_backend(primary: str) -> str | None:
+    """The configured LLM_FALLBACK_BACKEND if usable for ``primary``."""
+    fb = (os.getenv("LLM_FALLBACK_BACKEND") or "").strip().lower()
+    return fb if fb and fb != primary and _make_client(fb) is not None else None
+
+
 def llm_available() -> bool:
     """True when the active backend has an API key configured."""
     key = "AQUEDUCT_API_KEY" if _BACKEND == "aqueduct" else "ANTHROPIC_API_KEY"
@@ -343,7 +369,8 @@ def _make_client(backend: str | None = None):
         if not api_key:
             return None
         from openai import OpenAI
-        return OpenAI(base_url=_AQUEDUCT_BASE_URL, api_key=api_key)
+        # One SDK retry: the circuit breaker + fallback handle real outages.
+        return OpenAI(base_url=_AQUEDUCT_BASE_URL, api_key=api_key, max_retries=1)
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -392,6 +419,10 @@ def parse_references_with_llm(
     """
     backend = (backend or _BACKEND).lower()
     model = model or (_MODEL if backend == _BACKEND else _DEFAULT_MODELS.get(backend, _MODEL))
+    if _allow_fallback and is_down(backend) and (fb := fallback_backend(backend)):
+        return parse_references_with_llm(
+            references, progress_cb, repair_only, stats, backend=fb,
+            model=os.getenv("LLM_FALLBACK_MODEL") or None, _allow_fallback=False)
     if stats is not None:
         stats.update(backend=backend, model=model, n_sent=0, n_batches=0,
                      n_failed_batches=0, n_failed_refs=0, first_error=None)
@@ -454,6 +485,7 @@ def parse_references_with_llm(
                 try:
                     parsed = _call_llm(client, ref_batch, backend, model)
                 except Exception as exc:
+                    mark_down(backend, exc)
                     llm_errors.append(f"{type(exc).__name__}: {exc}"[:200])
                     failed_refs.extend(idx_batch)
                     parsed = [_ParsedRef() for _ in ref_batch]
@@ -463,8 +495,8 @@ def parse_references_with_llm(
                 progress_cb(done, total)
 
     fallback_note = None
-    fb = (os.getenv("LLM_FALLBACK_BACKEND") or "").strip().lower()
-    if failed_refs and _allow_fallback and fb and fb != backend and _make_client(fb):
+    fb = fallback_backend(backend) if _allow_fallback else None
+    if failed_refs and fb:
         sub_stats: dict[str, Any] = {}
         fixed = parse_references_with_llm(
             [references[i] for i in failed_refs], stats=sub_stats, backend=fb,

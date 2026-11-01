@@ -39,6 +39,19 @@ st.html("""
 </div>
 """)
 
+def _landing() -> None:
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("**:material/verified: Verified**  \nA database or the cited page "
+                "confirms title and authors.")
+    c2.markdown("**:material/report: Mismatch**  \nA paper exists at that title, DOI or "
+                "arXiv ID, but the details disagree — often a wrong or invented citation.")
+    c3.markdown("**:material/help: Not found**  \nNo source knows it. Common for "
+                "software, datasets, blogs and very new papers.")
+    st.info("**Human review is required.** ARES points you to references worth checking; "
+            "it does not decide whether a citation is correct. Databases are incomplete "
+            "and matching has limits.", icon=":material/person_search:")
+
+
 up_col, opt_col = st.columns([5, 1], vertical_alignment="center")
 with up_col:
     uploaded = st.file_uploader("Paper (PDF, up to 25 MB)", type=["pdf"],
@@ -66,23 +79,26 @@ with opt_col:
                  "to one query every few seconds.")
         show_debug = st.toggle("Show parser output", value=False, key="opt_debug")
 
+# One slot shared by the landing content and (after upload) the processing
+# log.  Streamlit keeps an element from the previous run on screen until
+# something new is written at its position, so with separate elements the
+# greyed-out landing page lingered under the progress log and the page
+# jumped when processing finished.  Writing into the same slot replaces the
+# landing page the moment the upload run starts.
+slot = st.empty()
+
 if uploaded is None:
     st.session_state.pop("doc_id", None)
-    c1, c2, c3 = st.columns(3)
-    c1.markdown("**:material/verified: Verified**  \nA database or the cited page "
-                "confirms title and authors.")
-    c2.markdown("**:material/report: Mismatch**  \nA paper exists at that title, DOI or "
-                "arXiv ID, but the details disagree — often a wrong or invented citation.")
-    c3.markdown("**:material/help: Not found**  \nNo source knows it. Common for "
-                "software, datasets, blogs and very new papers.")
-    st.info("**Human review is required.** ARES points you to references worth checking; "
-            "it does not decide whether a citation is correct. Databases are incomplete "
-            "and matching has limits.", icon=":material/person_search:")
+    # A single child inside the slot: the first notice written after an
+    # upload (the processing status) then replaces all of it at once.
+    with slot.container(), st.container():
+        _landing()
     st.stop()
 
 pdf_bytes = uploaded.getvalue()
 doc_id = state.file_hash(pdf_bytes)
 state.bind_document(doc_id)
+
 
 
 # ---------------------------------------------------------------------------
@@ -94,12 +110,22 @@ state.bind_document(doc_id)
 # custom component is remounted when its position in the page changes, so
 # a status block present on one run and gone on the next used to reload
 # the PDF viewer and lose the reader's scroll position.
-notices = st.container()
+notices = slot.container()
 
 proc_key = (doc_id, parser, bool(use_llm))
 cached = st.session_state.get("doc_cache")
 if cached and cached[0] == proc_key:
     base_doc: Document = cached[1]
+    # Same collapsed status line the processing run ends with, so the page
+    # doesn't shift up when later reruns no longer process anything.
+    if base_doc.refs:
+        with notices, st.status(f"Found {len(base_doc.refs)} references in "
+                                f"{base_doc.timings['total']:.0f}s",
+                                state="complete", expanded=False):
+            t = base_doc.timings
+            st.write(f"Parsed with **{parser}** in {t.get('parse', 0):.1f}s"
+                     + (f" · LLM repair {t['repair']:.1f}s" if "repair" in t else "")
+                     + f" · located in PDF {t.get('locate', 0):.1f}s")
 else:
     with notices, st.status("Reading the paper …", expanded=True) as status:
         base_doc = process(pdf_bytes, parser, bool(use_llm), log=st.write)

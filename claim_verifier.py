@@ -32,7 +32,8 @@ from typing import Any, Optional
 from cache import get_cache
 from claim_extractor import Claim
 from fulltext     import FullText
-from llm_parser   import _make_client, active_model
+from llm_parser   import (_DEFAULT_MODELS, _make_client, active_model,
+                          fallback_backend, is_down, mark_down)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +376,11 @@ def verify_batch(
         return out
 
     backend, model = active_model()
+    # Primary known to be down and a fallback configured: use the fallback
+    # directly rather than waiting out timeouts on every batch.
+    if is_down(backend) and (fb := fallback_backend(backend)):
+        backend = fb
+        model = os.getenv("LLM_FALLBACK_MODEL") or _DEFAULT_MODELS.get(fb, model)
 
     # Cache lookup per sentence.  Any hits get pulled out; misses go to
     # the LLM in a single batched call.
@@ -391,7 +397,7 @@ def verify_batch(
     if not miss_indices:
         return [v for v in verdicts if v is not None]
 
-    client = _make_client()
+    client = _make_client(backend)
     if client is None:
         err = (f"LLM backend '{backend}' is not configured — set "
                f"ANTHROPIC_API_KEY (anthropic) or AQUEDUCT_API_KEY "
@@ -417,11 +423,25 @@ def verify_batch(
             break
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
+            mark_down(backend, exc)
             if _is_auth_error(exc):
                 break                                    # don't retry
             if attempt == 0:
-                client = _make_client() or client        # fresh client
+                client = _make_client(backend) or client  # fresh client
                 continue
+    if raw_text is None:
+        # Opt-in backup backend (same LLM_FALLBACK_BACKEND as LLM repair),
+        # e.g. Anthropic while the Aqueduct endpoint is down.
+        fb = fallback_backend(backend)
+        fb_client = _make_client(fb) if fb else None
+        if fb_client is not None:
+            fb_model = os.getenv("LLM_FALLBACK_MODEL") or _DEFAULT_MODELS.get(fb, model)
+            try:
+                raw_text = _call_llm(fb_client, fb, fb_model, _SYSTEM_PROMPT, user_msg,
+                                     n_claims=len(miss_claims))
+                client, backend, model = fb_client, fb, fb_model
+            except Exception as exc:
+                last_err = f"{last_err}; fallback {fb}: {type(exc).__name__}: {exc}"
     if raw_text is None:
         for i in miss_indices:
             verdicts[i] = _mk_error(claims[i], ft, model,

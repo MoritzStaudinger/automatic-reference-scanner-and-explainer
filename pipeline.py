@@ -32,7 +32,7 @@ from parsers import (
 )
 from lookup import lookup_all
 from report import _best_found, _categorise_suspicious
-from verdict import overall_status as _overall_status
+from verdict import overall_status as _overall_status, status_reason
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,7 @@ class RefReport:
     raw: str
     page: Optional[int]
     overall_status: str                     # match | mismatch | missing | pending
+    reason: str                             # one-line explanation, as shown in the UI
     category: Optional[str]                 # wrong_doi / wrong_arxiv_id / wrong_authors / ...
     best_source: Optional[str]              # the source that returned the best hit
     best_url: Optional[str]                 # URL of the best candidate (clickable)
@@ -123,6 +124,7 @@ class ClaimVerificationReport:
     model:                str
     citation_marker:      str          # the raw marker as it appears in text
     style:                str          # numeric | paren | narrative
+    error:                str = ""     # why the check failed (verdict == "error")
 
 
 @dataclass
@@ -253,6 +255,7 @@ def _ref_to_report(
             wrong_venue    = wrong_venue    or bool(r.get("wrong_venue"))
 
     return RefReport(
+        reason            = status_reason(lr),
         index             = i,
         title             = ref.get("title", "") or "",
         authors           = ref.get("authors", "") or "",
@@ -557,6 +560,7 @@ def _verify_claims_stage(
                 model                = raw.model,
                 citation_marker      = c.citation_marker,
                 style                = c.style,
+                error                = raw.error or "",
             )))
         return out
 
