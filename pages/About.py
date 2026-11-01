@@ -91,11 +91,4 @@ ARES surfaces candidates for review. It is not a citation auditor of record, and
 result does not replace reading what you cite.
 """)
 
-st.header("Cite")
-st.code("""@software{ares2026,
-  author = {Staudinger, Moritz},
-  title  = {Automatic Reference Explainer and Scanner},
-  year   = {2026},
-  url    = {https://github.com/MoritzStaudinger/automatic-reference-scanner-and-explainer}
-}""", language="bibtex")
 st.caption("Built at TU Wien.")
