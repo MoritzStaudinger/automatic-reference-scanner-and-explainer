@@ -335,11 +335,15 @@ async function renderAllPages() {
         if (a.page !== n || typeof a.ref_index !== "number") continue;
         const r = annotViewportRect(a, viewport);
         if (x >= r.left && x <= r.left + r.w && y >= r.top && y <= r.top + r.h) {
-          Streamlit.setComponentValue({
-            kind: "ref_click",
-            ref_index: a.ref_index,
-            id: `ref-${Date.now()}-${a.ref_index}`,
-          });
+          if (list.items) {
+            focusCard(a.ref_index);
+          } else {
+            Streamlit.setComponentValue({
+              kind: "ref_click",
+              ref_index: a.ref_index,
+              id: `ref-${Date.now()}-${a.ref_index}`,
+            });
+          }
           e.stopPropagation();
           return;
         }
@@ -398,6 +402,7 @@ function setupPageObserver() {
     if (best.pageNum !== state.pageNum) {
       state.pageNum = best.pageNum;
       updatePageBar();
+      if (list.items && list.pageOnly) renderList();
       emitPageChange();
     }
   }
@@ -632,10 +637,135 @@ function _clearSelecting() {
   });
 })();
 
+// ─────────  Reference list (client-side)  ─────────
+// Items come from Python with pre-rendered, escaped card HTML.  Filtering,
+// search, the page filter, opening cards and "Show in PDF" all happen here
+// without a Streamlit rerun; only server actions are sent back.
+const list = {
+  items: null, labels: {}, order: [], filter: "all", query: "", pageOnly: false,
+  open: new Set(), keyHtml: "",
+};
+
+function itemVisible(it) {
+  if (list.filter !== "all" && it.status !== list.filter) return false;
+  if (list.query && !it.text.includes(list.query)) return false;
+  if (list.pageOnly && it.page !== state.pageNum) return false;
+  return true;
+}
+
+function renderFilterButtons() {
+  const counts = { all: list.items.length };
+  for (const it of list.items) counts[it.status] = (counts[it.status] || 0) + 1;
+  const box = document.getElementById("status-filter");
+  box.innerHTML = "";
+  for (const key of ["all", ...list.order]) {
+    if (key !== "all" && !counts[key]) continue;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = `${key === "all" ? "All" : list.labels[key]} ${counts[key] || 0}`;
+    b.setAttribute("aria-pressed", String(list.filter === key));
+    b.onclick = () => { list.filter = key; renderFilterButtons(); renderList(); };
+    box.appendChild(b);
+  }
+}
+
+function renderList() {
+  const el = document.getElementById("list");
+  const scroll = el.scrollTop;
+  const vis = list.items.filter(itemVisible);
+  document.getElementById("list-count").textContent =
+    `${vis.length} of ${list.items.length} references`;
+  if (!vis.length) {
+    el.innerHTML = '<div class="empty">No references match these filters.</div>';
+    return;
+  }
+  el.innerHTML = vis.map((it) => {
+    const acts = [];
+    if (it.page) acts.push(`<button data-act="show" data-i="${it.i}">◎ Show in PDF (p. ${it.page})</button>`);
+    for (const a of it.actions) {
+      acts.push(`<button data-act="${a.act}" data-i="${it.i}"${a.disabled ? " disabled" : ""}>${a.label}</button>`);
+    }
+    return `<div class="item" id="item-${it.i}">${it.html}<div class="actions">${acts.join("")}</div></div>`;
+  }).join("");
+  for (const d of el.querySelectorAll("details.refcard")) {
+    const i = Number(d.closest(".item").id.slice(5));
+    if (list.open.has(i)) d.open = true;
+    d.addEventListener("toggle", () => { d.open ? list.open.add(i) : list.open.delete(i); });
+  }
+  el.scrollTop = scroll;
+}
+
+function focusCard(i) {
+  // PDF highlight → card: make sure it is visible, open it, scroll to it.
+  const it = (list.items || []).find((x) => x.i === i);
+  if (!it) return;
+  if (!itemVisible(it)) {
+    list.filter = "all"; list.query = ""; list.pageOnly = false;
+    document.getElementById("search").value = "";
+    document.getElementById("page-only").checked = false;
+    renderFilterButtons();
+  }
+  list.open.add(i);
+  renderList();
+  const node = document.getElementById(`item-${i}`);
+  if (!node) return;
+  // Scroll #list itself — scrollIntoView would also scroll the app page.
+  const box = document.getElementById("list");
+  box.scrollTo({ top: node.offsetTop - 8, behavior: "smooth" });
+  node.classList.add("flash");
+  setTimeout(() => node.classList.remove("flash"), 1600);
+}
+
+function setupList() {
+  const search = document.getElementById("search");
+  let t = null;
+  search.addEventListener("input", () => {
+    clearTimeout(t);
+    t = setTimeout(() => { list.query = search.value.trim().toLowerCase(); renderList(); }, 120);
+  });
+  document.getElementById("page-only").addEventListener("change", (e) => {
+    list.pageOnly = e.target.checked; renderList();
+  });
+  document.getElementById("list").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (!b || b.disabled) return;
+    const i = Number(b.dataset.i);
+    const it = list.items.find((x) => x.i === i);
+    if (b.dataset.act === "show") {
+      focusOn({ page: it.page, rect: it.rect, nonce: `show-${Date.now()}` });
+      return;
+    }
+    b.disabled = true;     // server action: one click, then wait for the rerun
+    Streamlit.setComponentValue({ kind: "action", action: b.dataset.act, ref_index: i,
+                                  id: `act-${Date.now()}-${i}` });
+  });
+}
+
+function updateList(args) {
+  const pane = document.getElementById("list-pane");
+  if (!args.items) { pane.hidden = true; return; }
+  pane.hidden = false;
+  if (args.cards_css && document.getElementById("cards-css").textContent !== args.cards_css) {
+    document.getElementById("cards-css").textContent = args.cards_css;
+  }
+  const key = JSON.stringify(args.items);
+  if (key === list.keyHtml) return;          // nothing changed → keep DOM, scroll, focus
+  list.keyHtml = key;
+  list.items = args.items;
+  list.labels = args.status_labels || {};
+  list.order = args.status_order || [];
+  if (list.filter !== "all" && !list.items.some((x) => x.status === list.filter)) list.filter = "all";
+  renderFilterButtons();
+  renderList();
+}
+
 function applyTheme(theme) {
   if (!theme) return;
   const root = document.documentElement;
   root.classList.toggle("dark", theme.base === "dark");
+  if (theme.backgroundColor) root.style.setProperty("--bg", theme.backgroundColor);
+  if (theme.textColor) root.style.setProperty("--fg", theme.textColor);
+  if (theme.font) root.style.setProperty("font-family", theme.font);
   if (theme.primaryColor) {
     root.style.setProperty("--accent", theme.primaryColor);
     root.style.setProperty("--accent-hover", theme.primaryColor);
@@ -645,6 +775,8 @@ function applyTheme(theme) {
 function onRender(event) {
   const args = event.detail.args || {};
   applyTheme(event.detail.theme);
+  updateList(args);
+  if (args.height) Streamlit.setFrameHeight(args.height);
   // Always update the emit flag — it controls JS-side behaviour for
   // page-change emissions and doesn't itself require a re-render.
   state.emitPageChanges = !!args.emit_page_changes;
@@ -704,4 +836,5 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
 Streamlit.setComponentReady();
 setupNavButtons();
 setupSelectionWatcher();
+setupList();
 Streamlit.setFrameHeight(900);

@@ -21,7 +21,12 @@ the uncached path.
 - [ ] When it finishes, the PDF **keeps its scroll position** and the highlights
       recolour in place.
 
-## 2. Results
+## 2. Results (no page reruns)
+- [ ] Status filter, search, page filter, opening cards, **Show in PDF** and
+      clicking a highlight do **not** rerun the page (no "Running…" indicator,
+      the PDF keeps its position). They are handled inside the component.
+- [ ] Every highlight covers the whole reference, including references that
+      continue in the next column or on the next page.
 - [ ] Tiles show References / Verified / Mismatch / Not found / Dead links.
 - [ ] Status pills and search narrow the list ("n of N references"). The
       Pending pill is hidden when nothing is pending.

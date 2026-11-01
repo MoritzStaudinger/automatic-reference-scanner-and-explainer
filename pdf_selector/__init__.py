@@ -43,6 +43,10 @@ def pdf_selector(
     scroll_to_page: int | None = None,
     emit_page_changes: bool = False,
     focus: dict[str, Any] | None = None,
+    items: list[dict[str, Any]] | None = None,
+    status_labels: dict[str, str] | None = None,
+    status_order: list[str] | None = None,
+    cards_css: str = "",
     key: str | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -65,6 +69,12 @@ def pdf_selector(
         ``{"page", "rect", "nonce"}`` — scroll to that rectangle and flash
         it.  Runs once per new ``nonce`` (repeat clicks on the same
         reference need a fresh nonce).
+    items : list[dict] | None
+        When given, the component also shows the reference list (filters,
+        search, page filter, cards) and handles it client-side.  Each item:
+        ``{"i", "status", "page", "rect", "html", "text", "actions": [{"act",
+        "label", "disabled"}]}``.  Server actions come back as
+        ``{"kind": "action", "action", "ref_index", "id"}``.
     key : str | None
         Streamlit component key for state separation.
 
@@ -81,6 +91,10 @@ def pdf_selector(
         scroll_to_page     = scroll_to_page,
         emit_page_changes  = bool(emit_page_changes),
         focus              = focus,
+        items              = items,
+        status_labels      = status_labels or {},
+        status_order       = status_order or [],
+        cards_css          = cards_css,
         default            = None,
         key                = key,
     )

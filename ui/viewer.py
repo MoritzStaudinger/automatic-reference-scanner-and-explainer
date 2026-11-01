@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
 
 import streamlit as st
 
 from parsers import ParserError
 from pdf_selector import pdf_selector
-from ui import state
+from ui import cards, state
 from ui.processing import Document, structure_citation
-from verdict import overall_status, status_rgba
+from verdict import STATUS_LABEL, overall_status, status_rgba
 
 GROBID_DOWN = ("GROBID (the citation parser service) is unreachable right now — "
                "try again in a minute.")
@@ -37,52 +38,65 @@ def add_citation(text: str, page: int | None = None, rect: list | None = None) -
     return True
 
 
-def render(doc: Document, lookup_results: list | None, doc_id: str) -> None:
-    refs = doc.refs
-    # Card → PDF backlink: each "Show in PDF" click carries a new nonce, so
-    # the viewer jumps (and flashes the reference) every time — also when
-    # it is on the page already in view.
-    focus = None
-    sel = st.session_state.get("selected_ref")
-    if isinstance(sel, int) and 0 <= sel < len(refs) and refs[sel].get("page"):
-        focus = {"page": refs[sel]["page"], "rect": refs[sel].get("rect"),
-                 "nonce": st.session_state.get("focus_nonce", 0)}
+_CARDS_CSS = (Path(__file__).parent / "style.css").read_text()
 
-    annots = []
+
+def render(doc: Document, lookup_results: list | None, doc_id: str,
+           claims_by_ref: dict[int, list[dict]], busy: bool) -> dict | None:
+    """The reference list + PDF, as one component.  Filtering, search, the
+    page filter, opening cards, "Show in PDF" and PDF → card jumps run in
+    the browser (no rerun).  Returns a server action
+    ``{"action": "recheck" | "fulltext" | "remove", "ref_index": i}`` or None."""
+    refs = doc.refs
+    statuses = [overall_status(lookup_results[i] if lookup_results and i < len(lookup_results)
+                               else None) for i in range(len(refs))]
+
+    annots, items = [], []
     for i, r in enumerate(refs):
-        if not r.get("rect") or not r.get("page"):
-            continue
         lr = lookup_results[i] if lookup_results and i < len(lookup_results) else None
-        status = overall_status(lr)
-        annots.append({
-            "page": r["page"], "rect": r["rect"], "color": status_rgba(status),
-            "opacity": 1.0, "kind": "filled", "ref_index": i,
-            "label": f"[{i + 1}] {(r.get('title') or '')[:80]} · {status} — click for details",
+        status = statuses[i]
+        label = f"[{i + 1}] {(r.get('title') or '')[:80]} · {STATUS_LABEL[status]}"
+        pieces = r.get("rects") or ([{"page": r["page"], "rect": r["rect"]}]
+                                    if r.get("rect") and r.get("page") else [])
+        for pc in pieces:    # a reference split over columns / pages has several
+            annots.append({"page": pc["page"], "rect": pc["rect"], "color": status_rgba(status),
+                           "opacity": 1.0, "kind": "filled", "ref_index": i,
+                           "label": label + " — click to open its card"})
+        mine = claims_by_ref.get(i, [])
+        actions = []
+        if lr is not None and status != "match":
+            actions.append({"act": "recheck", "label": "↻ Re-check", "disabled": busy})
+        if (n := len(cards.escalatable(mine))):
+            actions.append({"act": "fulltext", "label": f"📖 Full text ({n})", "disabled": busy})
+        if r.get("_user_added"):
+            actions.append({"act": "remove", "label": "🗑 Remove", "disabled": False})
+        items.append({
+            "i": i, "status": status,
+            "page": r.get("page") if r.get("found") else None,
+            "rect": r.get("rect"),
+            "html": cards.card_html(i, r, lr, mine),
+            "text": " ".join(str(r.get(k) or "") for k in ("title", "authors", "venue", "raw")).lower(),
+            "actions": actions,
         })
 
     event = pdf_selector(
-        pdf_bytes=doc.pdf, annotations=annots, height=860, focus=focus,
-        emit_page_changes=bool(st.session_state.get("page_only")),
+        pdf_bytes=doc.pdf, annotations=annots, height=900, items=items,
+        status_labels=STATUS_LABEL, status_order=["mismatch", "missing", "match", "pending"],
+        cards_css=_CARDS_CSS,
         key=f"pdf_{doc_id}",     # stable per document: remounting re-sends the PDF
     )
     if not (isinstance(event, dict) and event.get("id")
             and event["id"] != st.session_state.get("last_pdf_event_id")):
-        return
+        return None
     st.session_state.last_pdf_event_id = event["id"]
     kind = event.get("kind")
-    if kind == "page":
-        if event.get("page") and event["page"] != st.session_state.get("pdf_current_page"):
-            st.session_state.pdf_current_page = event["page"]
-            st.rerun()
-    elif kind == "ref_click":
-        idx = event.get("ref_index")
-        if isinstance(idx, int) and 0 <= idx < len(refs):
-            st.session_state.focused_ref = idx
-            st.rerun()
-    elif kind == "selection":
+    if kind == "action" and isinstance(event.get("ref_index"), int):
+        return {"action": event["action"], "ref_index": event["ref_index"]}
+    if kind == "selection":
         text = (event.get("text") or "").strip()
         if text and add_citation(text, event.get("page"), event.get("rect")):
             st.rerun()
+    return None
 
 
 def visible_orphans(doc: Document) -> list[dict]:

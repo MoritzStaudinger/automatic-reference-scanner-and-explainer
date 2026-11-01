@@ -141,12 +141,91 @@ def _orphan_confidence(text: str) -> str:
     return "low"
 
 
+# ---------------------------------------------------------------------------
+# Line-level locating
+# ---------------------------------------------------------------------------
+# PyMuPDF often splits one reference over several text blocks (at a
+# hyperlinked DOI / URL, a font change, a column or page break), so
+# highlighting the single best-matching block left references partially
+# boxed or not boxed at all.  Instead: find the line where the reference
+# starts, follow it line by line in reading order (across columns and
+# pages), and draw one rectangle per contiguous piece.
+
+def _collect_lines(doc) -> list[tuple[int, "fitz.Rect", str]]:
+    lines = []
+    for page in doc:
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for line in b.get("lines") or []:
+                t = "".join(sp.get("text", "") for sp in line.get("spans") or [])
+                n = _clean_for_search(t).lower()
+                if n:
+                    lines.append((page.number, fitz.Rect(line["bbox"]), n))
+    return lines
+
+
+def _locate_by_lines(ref_norm: str, lines, used: list[bool]) -> list[int] | None:
+    """Indices of the lines that make up ``ref_norm`` (best start wins)."""
+    from rapidfuzz import fuzz
+    if len(ref_norm) < 25:
+        return None
+    head = ref_norm[:60]
+    budget = len(ref_norm) * 1.15
+    best: tuple[float, list[int]] | None = None
+    for i, (_pn, _r, n) in enumerate(lines):
+        if used[i] or len(n) < 8:
+            continue
+        # The reference must *start* on this line.
+        if fuzz.partial_ratio(n[:30], head) < 88:
+            continue
+        if fuzz.ratio(n[:40], ref_norm[:min(len(n), 40)]) < 75:
+            continue
+        run, acc, j, skipped = [i], len(n), i + 1, False
+        while j < len(lines) and acc < budget and not used[j]:
+            nj = lines[j][2]
+            if fuzz.partial_ratio(nj, ref_norm) >= 88:
+                run.append(j)
+                acc += len(nj) + 1
+                skipped = False
+            elif len(nj) < 15 and not skipped:
+                skipped = True       # page number / running header between pieces
+            else:
+                break
+            j += 1
+        text = " ".join(lines[k][2] for k in run)
+        score = fuzz.ratio(text, ref_norm)
+        if best is None or score > best[0]:
+            best = (score, run)
+    return best[1] if best and best[0] >= 75 else None
+
+
+def _group_rects(run: list[int], lines) -> list[tuple[int, "fitz.Rect"]]:
+    """Merge consecutive lines into one rectangle per column / page piece."""
+    groups: list[tuple[int, fitz.Rect]] = []
+    for k in run:
+        pn, r, _ = lines[k]
+        if groups:
+            gpn, g = groups[-1]
+            if (gpn == pn and abs(r.x0 - g.x0) < 40
+                    and -3 <= r.y0 - g.y1 < 8):
+                groups[-1] = (gpn, fitz.Rect(g) | r)   # `g |= r` doesn't update the list
+                continue
+        groups.append((pn, fitz.Rect(r)))
+    return groups
+
+
+def _pdf_native(rect: "fitz.Rect", page_h: float) -> list[float]:
+    """PyMuPDF top-down y → PDF-native bottom-up y (what PDF.js expects)."""
+    return [rect.x0, page_h - rect.y1, rect.x1, page_h - rect.y0]
+
+
 def highlight_references(
     pdf_bytes: bytes,
     references: list[dict[str, Any]],
     statuses: list[str] | None = None,
     bake_color: bool = True,
-) -> tuple[bytes, list[dict[str, Any]]]:
+) -> tuple[bytes, list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Add highlights for each reference found in the PDF.
 
@@ -265,6 +344,8 @@ def highlight_references(
             blocks.append((page.number, rect, text, norm))
 
     used_block_idx: set[int] = set()  # blocks already claimed by an earlier ref
+    lines = _collect_lines(doc)
+    line_used = [False] * len(lines)
 
     for ref, status in zip(references, statuses):
         entry = dict(ref)
@@ -278,7 +359,25 @@ def highlight_references(
             enriched.append(entry)
             continue
 
-        # Score every block by best fuzzy match on raw OR title.
+        run = _locate_by_lines(ref_raw, lines, line_used) if ref_raw else None
+        if run:
+            for k in run:
+                line_used[k] = True
+            pieces = _group_rects(run, lines)
+            rects = []
+            for pn, rect in pieces:
+                page = doc[pn]
+                if bake_color:
+                    page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
+                                   width=0, overlay=True)
+                rects.append({"page": pn + 1, "rect": _pdf_native(rect, page.rect.height)})
+            entry.update(found=True, page=rects[0]["page"], rect=rects[0]["rect"],
+                         rects=rects, status=status)
+            enriched.append(entry)
+            continue
+
+        # Fallback: best-matching block.  Score every block by best fuzzy
+        # match on raw OR title.
         # Use partial_ratio so a short ref title still scores high against
         # a longer block (block can contain title + venue etc.).
         best_score = 0
@@ -329,6 +428,7 @@ def highlight_references(
                 rect.x1,
                 page_h - rect.y0,   # top of pymupdf box → y1 in PDF native
             ]
+            entry["rects"] = [{"page": entry["page"], "rect": entry["rect"]}]
             entry["status"] = status
 
         enriched.append(entry)
@@ -343,6 +443,16 @@ def highlight_references(
     # confident enough to auto-add it as a ref (callers can do this
     # without user review); "low" means it goes to the "possible missed
     # references" panel for manual triage.
+    lines_by_page: dict[int, list[int]] = {}
+    for k, (lpn, _lr, _) in enumerate(lines):
+        lines_by_page.setdefault(lpn, []).append(k)
+    for bi, (pn, rect, _t, _n) in enumerate(blocks):
+        inside = [k for k in lines_by_page.get(pn, [])
+                  if rect.contains(fitz.Point((lines[k][1].x0 + lines[k][1].x1) / 2,
+                                              (lines[k][1].y0 + lines[k][1].y1) / 2))]
+        if inside and sum(line_used[k] for k in inside) >= 0.5 * len(inside):
+            used_block_idx.add(bi)
+
     pages_with_refs = {e["page"] for e in enriched if e.get("page")}
     orphans: list[dict[str, Any]] = []
     import re as _re_h

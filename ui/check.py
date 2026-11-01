@@ -19,7 +19,7 @@ from ui.processing import (
     LLM_BACKEND, LLM_MODEL, LLM_READY, PARSER_HELP, Document, annotated_pdf,
     parser_options, process, with_manual,
 )
-from verdict import SOURCE_NAMES, STATUS_LABEL, overall_status, status_reason
+from verdict import SOURCE_NAMES, overall_status, status_reason
 
 st.html(f"<style>{(Path(__file__).parent / 'style.css').read_text()}</style>")
 
@@ -357,109 +357,40 @@ if verdicts:
 
 
 # ---------------------------------------------------------------------------
-# Workspace: reference list + PDF.
+# Workspace: reference list + PDF, both inside one custom component.
 #
-# Not a fragment on purpose: a custom component inside a fragment is
-# remounted on every full-page rerun (e.g. when a job finishes), which
-# reloads the PDF and loses the reader's scroll position.  Full reruns are
-# cheap here — the processed document is memoised in session state.
+# Streamlit reruns the script on every widget interaction, which the reader
+# experiences as the page refreshing.  So filters, search, opening cards and
+# jumps between cards and PDF are handled in the component's own JavaScript;
+# only server actions (re-check, remove, full text, add) cause a rerun.
+# Not a fragment: a component inside a fragment is remounted on full reruns.
 # ---------------------------------------------------------------------------
 
 def workspace() -> None:
     lrs = state.lookup_results()
-    claims_by_ref = cards.by_ref(st.session_state.get("claim_verifications"))
-    statuses = cards.counts(lrs, len(refs))["statuses"]
-    left, right = st.columns([5, 6], gap="medium")
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption("Click a highlight in the PDF to open its card · "
+                   "**Show in PDF** jumps the other way.")
+        with st.popover("How is this decided?", icon=":material/help:", type="tertiary"):
+            st.markdown(explain.MATCHING_MD)
+    act = viewer.render(doc, lrs, doc_id,
+                        cards.by_ref(st.session_state.get("claim_verifications")),
+                        busy=jobs.busy())
+    if act:
+        i = act["ref_index"]
+        if act["action"] == "recheck" and 0 <= i < len(refs) and not jobs.busy():
+            forget_reference(refs[i])
+            start_lookup([i], f"Re-checking reference [{i + 1}]")
+        elif act["action"] == "fulltext" and not jobs.busy():
+            start_claims("fulltext", [i])
+        elif act["action"] == "remove" and i >= doc.n_base:
+            state.remove_manual_ref(i - doc.n_base)
+        st.rerun()
 
-    with left:
-        f1, f2 = st.columns([3, 2], vertical_alignment="bottom")
-        with f1:
-            opts = ["all"] + [k for k in ("mismatch", "missing", "match", "pending")
-                              if k != "pending" or "pending" in statuses]
-            if st.session_state.get("status_filter") not in opts:
-                st.session_state.status_filter = "all"
-            chosen = st.segmented_control(
-                "Filter by status", opts, key="status_filter", required=True,
-                format_func=lambda s: (f"All {len(statuses)}" if s == "all"
-                                       else f"{STATUS_LABEL[s]} {statuses.count(s)}"))
-        with f2:
-            query = st.text_input("Search", key="search",
-                                  placeholder="Title, author, venue …",
-                                  icon=":material/search:")
-        with st.container(horizontal=True, vertical_alignment="center"):
-            page_only = st.toggle("Only references on the visible PDF page", key="page_only")
-            with st.popover("How is this decided?", icon=":material/help:", type="tertiary"):
-                st.markdown(explain.MATCHING_MD)
-
-        visible = list(range(len(refs)))
-        if chosen and chosen != "all":
-            visible = [i for i in visible if statuses[i] == chosen]
-        if query:
-            q = query.lower()
-            visible = [i for i in visible
-                       if q in " ".join(str(refs[i].get(k) or "") for k in
-                                        ("title", "authors", "raw", "venue")).lower()]
-        if page_only:
-            page = st.session_state.get("pdf_current_page") or 1
-            visible = [i for i in visible if refs[i].get("page") == page]
-
-        focused = st.session_state.get("focused_ref")
-        if isinstance(focused, int) and 0 <= focused < len(refs):
-            with st.container(horizontal=True, vertical_alignment="center"):
-                st.markdown(f"Showing reference **[{focused + 1}]** from the PDF")
-                if st.button("Show all", type="tertiary", icon=":material/close:"):
-                    st.session_state.focused_ref = None
-                    st.rerun()
-            visible = [focused]
-        else:
-            focused = None
-            st.caption(f"{len(visible)} of {len(refs)} references")
-
-        with st.container(height=760, border=False):
-            if not visible:
-                st.caption("No references match these filters.")
-            for i in visible:
-                ref = refs[i]
-                lr = lrs[i] if lrs and i < len(lrs) else None
-                mine = claims_by_ref.get(i, [])
-                # st.markdown, not st.html: the latter's sanitiser strips
-                # target="_blank", so source links would leave the app.
-                st.markdown(cards.card_html(i, ref, lr, mine, expanded=(i == focused)),
-                            unsafe_allow_html=True)
-                with st.container(horizontal=True, gap="small"):
-                    if ref.get("found") and ref.get("page"):
-                        if st.button(f"Show in PDF (p. {ref['page']})", key=f"go_{i}",
-                                     type="tertiary", icon=":material/my_location:"):
-                            st.session_state.selected_ref = i
-                            st.session_state.focus_nonce = st.session_state.get("focus_nonce", 0) + 1
-                    if lr is not None and overall_status(lr) != "match" and not jobs.busy():
-                        if st.button("Re-check", key=f"re_{i}", type="tertiary",
-                                     icon=":material/refresh:",
-                                     help="Query every source again, bypassing the cache."):
-                            forget_reference(ref)
-                            start_lookup([i], f"Re-checking reference [{i + 1}]")
-                            st.rerun()
-                    esc = cards.escalatable(mine)
-                    if esc and not jobs.busy():
-                        if st.button(f"Full text ({len(esc)})", key=f"ft_{i}", type="tertiary",
-                                     icon=":material/menu_book:",
-                                     help="Re-check these citing sentences against the "
-                                          "cited paper's open-access full text."):
-                            start_claims("fulltext", [i])
-                            st.rerun()
-                    if ref.get("_user_added"):
-                        if st.button("Remove", key=f"del_{i}", type="tertiary",
-                                     icon=":material/delete:"):
-                            state.remove_manual_ref(i - doc.n_base)
-                            st.rerun()
-
-    with right:
-        viewer.render(doc, lrs, doc_id)
-        n_orph = len(viewer.visible_orphans(doc))
-        if n_orph:
-            with st.expander(f"Possibly missed references ({n_orph})",
-                             icon=":material/lightbulb:"):
-                viewer.orphan_list(doc, "ws")
+    n_orph = len(viewer.visible_orphans(doc))
+    if n_orph:
+        with st.expander(f"Possibly missed references ({n_orph})", icon=":material/lightbulb:"):
+            viewer.orphan_list(doc, "ws")
 
 
 workspace()
