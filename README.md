@@ -246,20 +246,6 @@ benchmark/              Evaluation harness against HalluCitation
                         per-run intermediates are gitignored)
 ```
 
-## Citing the tool
-
-If you use the Automatic Reference Explainer and Scanner in academic
-work, please cite it as:
-
-```bibtex
-@software{referenceexplainer2026,
-  author = {Staudinger, Moritz},
-  title  = {Automatic Reference Explainer and Scanner},
-  year   = {2026},
-  url    = {https://github.com/<your-org>/reference-explainer}
-}
-```
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
