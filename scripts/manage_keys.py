@@ -27,7 +27,7 @@ In Docker
 ---------
 ::
 
-    docker compose exec ares-api \\
+    docker compose exec arse-api \\
         python /app/scripts/manage_keys.py add alice
 """
 

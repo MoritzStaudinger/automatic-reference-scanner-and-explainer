@@ -1,7 +1,7 @@
 # Deploying ARSE
 
-Production runs on one VM with Docker Compose: `grobid`, `ares` (Streamlit
-UI), `ares-api` (FastAPI) and `nginx` (TLS, the only service on the host
+Production runs on one VM with Docker Compose: `grobid`, `arse` (Streamlit
+UI), `arse-api` (FastAPI) and `nginx` (TLS, the only service on the host
 network). It serves two hostnames:
 
 - `reference-cleaner.ds-ifs.tuwien.ac.at`
@@ -12,8 +12,8 @@ Both DNS names resolve to the VM (128.131.169.216).
 ## Requirements
 
 - Docker with Compose v2.24+
-- About 12 GB RAM for the containers: GROBID needs up to 6 GB, and ares and
-  ares-api need up to 4 GB each under load. GROBID is the one that matters;
+- About 12 GB RAM for the containers: GROBID needs up to 6 GB, and arse and
+  arse-api need up to 4 GB each under load. GROBID is the one that matters;
   with less memory it is OOM-killed while parsing.
 - Full-chain TLS certificates for both hostnames. See TLS below.
 
@@ -37,10 +37,16 @@ The script runs these steps in order:
 
 The script exits non-zero if any check fails.
 
+The services, containers and data volume were renamed from `ares*` to
+`arse*`. On the first deploy after that, `deploy.sh` copies the old
+`<project>_ares-data` volume (lookup cache, API keys) into the new
+`<project>_arse-data` and keeps the old one as a backup. Once everything
+works, remove it with `docker volume rm <project>_ares-data`.
+
 The first deploy after the cache-poisoning fix needs one extra command:
 
 ```bash
-docker compose exec ares python scripts/purge_negative_cache.py
+docker compose exec arse python scripts/purge_negative_cache.py
 ```
 
 ## TLS
@@ -86,9 +92,9 @@ The HTTP API refuses all requests (503) until at least one key exists.
 `/healthz` is the only exception.
 
 ```bash
-docker compose exec ares-api python scripts/manage_keys.py add alice --expires 2027-06-30
-docker compose exec ares-api python scripts/manage_keys.py list
-docker compose exec ares-api python scripts/manage_keys.py revoke alice
+docker compose exec arse-api python scripts/manage_keys.py add alice --expires 2027-06-30
+docker compose exec arse-api python scripts/manage_keys.py list
+docker compose exec arse-api python scripts/manage_keys.py revoke alice
 ```
 
 Keys are stored in `/app/data/api_keys.json` on the shared volume. Changes
@@ -124,7 +130,7 @@ TLS_CERT=$PWD/dev.pem TLS_KEY=$PWD/dev.key \
 
 - `docker compose ps` shows the health of every service.
 - `docker compose logs --tail 100 <service>` shows recent logs.
-- `docker inspect ares-grobid --format '{{.State.OOMKilled}}'` returns
+- `docker inspect arse-grobid --format '{{.State.OOMKilled}}'` returns
   `true` when GROBID ran out of memory. Raise its `mem_limit`, or lower
   `ARES_GROBID_FULLTEXT_CONCURRENCY`.
 - When GROBID is down, the UI falls back to the pymupdf4llm parser and

@@ -2,7 +2,7 @@
 # Deployment targets: reference-cleaner.ds-ifs.tuwien.ac.at
 #                     arse.ds-ifs.tuwien.ac.at
 #
-# Only nginx is exposed on the host (80 + 443).  ares, ares-api and grobid
+# Only nginx is exposed on the host (80 + 443).  arse, arse-api and grobid
 # talk over the compose-internal network.  See DEPLOY.md for the full
 # runbook; `scripts/deploy.sh` performs and verifies a deploy.
 #
@@ -25,7 +25,7 @@ services:
     # CRF-only build — skips DeLFT (deep-learning) initialization, which
     # is what the app uses anyway.
     image: lfoppiano/grobid:0.9.0-crf
-    container_name: ares-grobid
+    container_name: arse-grobid
     restart: unless-stopped
     # The JVM heap is 2 GB, but GROBID's native PDF layer allocates outside
     # it: one 3 MB paper peaked at ~3.8 GB total.  At 4g the container was
@@ -42,10 +42,10 @@ services:
       retries: 10
       start_period: 240s
 
-  ares:
+  arse:
     build: .
-    image: ares:latest
-    container_name: ares-app
+    image: arse:latest
+    container_name: arse-app
     restart: unless-stopped
     depends_on:
       grobid:
@@ -58,7 +58,7 @@ services:
       - ARES_CACHE=/app/data/cache.sqlite
     volumes:
       # SQLite lookup cache, persists across restarts.
-      - ares-data:/app/data
+      - arse-data:/app/data
     mem_limit: 4g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
@@ -70,10 +70,10 @@ services:
   # Headless HTTP API (api.py) for programmatic / batch use.  Same image,
   # uvicorn entry point.  Shares the cache volume with the UI.  Without
   # ARES_API_KEY or a keys file it answers 503 to everything but /healthz.
-  ares-api:
+  arse-api:
     build: .
-    image: ares:latest
-    container_name: ares-api
+    image: arse:latest
+    container_name: arse-api
     restart: unless-stopped
     depends_on:
       grobid:
@@ -86,7 +86,7 @@ services:
       - ARES_JOBS_DB=/app/data/jobs.sqlite
       - ARES_API_KEYS_FILE=/app/data/api_keys.json
     volumes:
-      - ares-data:/app/data
+      - arse-data:/app/data
     mem_limit: 4g
     command: ["uvicorn", "api:app",
               "--host", "0.0.0.0",
@@ -103,12 +103,12 @@ services:
 
   nginx:
     image: nginx:1.27-alpine
-    container_name: ares-nginx
+    container_name: arse-nginx
     restart: unless-stopped
     depends_on:
-      ares:
+      arse:
         condition: service_healthy
-      ares-api:
+      arse-api:
         condition: service_healthy
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
@@ -145,4 +145,4 @@ services:
       retries: 3
 
 volumes:
-  ares-data:
+  arse-data:

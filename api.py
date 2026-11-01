@@ -47,7 +47,7 @@ Running locally
 
     uvicorn api:app --host 0.0.0.0 --port 8500 --reload
 
-Inside the docker-compose deployment the ares-api service runs uvicorn
+Inside the docker-compose deployment the arse-api service runs uvicorn
 on port 8500 and nginx routes ``/api/*`` to it.
 """
 

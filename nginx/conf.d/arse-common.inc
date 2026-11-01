@@ -26,8 +26,8 @@ proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 
 # HTTP API.  Longest-prefix match wins over "/".
-set $arse_ui  ares:8501;      # variables → re-resolved via `resolver`
-set $arse_api ares-api:8500;
+set $arse_ui  arse:8501;      # variables → re-resolved via `resolver`
+set $arse_api arse-api:8500;
 
 location /api/ {
     limit_req zone=ares_api burst=20 nodelay;

@@ -21,8 +21,8 @@ COPY . .
 
 # Cache + uploads live on a volume mounted at /app/data
 # Run as an unprivileged user; it owns only the data volume mount point.
-RUN useradd --create-home --uid 1000 ares && mkdir -p /app/data && chown ares:ares /app/data
-USER ares
+RUN useradd --create-home --uid 1000 arse && mkdir -p /app/data && chown arse:arse /app/data
+USER arse
 
 ENV PYTHONUNBUFFERED=1 \
     ARES_CACHE=/app/data/cache.sqlite \

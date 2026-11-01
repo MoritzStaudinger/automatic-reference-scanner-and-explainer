@@ -69,7 +69,7 @@ streamlit run app.py
 ARSE exposes a headless HTTP API for programmatic use and batch
 processing of large PDF collections.
 
-The Docker Compose deployment ships with an `ares-api` service alongside
+The Docker Compose deployment ships with an `arse-api` service alongside
 the Streamlit container; nginx routes `/api/*` to it. For local
 development you can also run it standalone:
 

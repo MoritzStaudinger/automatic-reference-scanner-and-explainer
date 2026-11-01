@@ -3,7 +3,7 @@ SSRF-safe HTTP fetching for URLs that come from user-uploaded PDFs.
 
 Citations carry arbitrary URLs, and the deployed instance is public, so a
 crafted PDF could otherwise make the server fetch `http://grobid:8070/…`,
-`http://ares-api:8500/…`, cloud metadata endpoints (169.254.169.254) or
+`http://arse-api:8500/…`, cloud metadata endpoints (169.254.169.254) or
 anything else on the internal network — and echo the page title back in
 the UI.  ``safe_get`` refuses that:
 

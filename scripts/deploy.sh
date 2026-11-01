@@ -67,9 +67,25 @@ fi
 echo "== build"
 docker compose build
 
+# ── 3a. One-off: the data volume was renamed ares-data → arse-data.  Copy
+#        the lookup cache and API keys over so nothing is lost; the old
+#        volume stays as a backup (remove it with `docker volume rm`).
+project=$(docker compose config 2>/dev/null | awk '/^name:/{print $2; exit}')
+old_vol="${project}_ares-data"
+new_vol="${project}_arse-data"
+if docker volume inspect "$old_vol" >/dev/null 2>&1 \
+        && ! docker volume inspect "$new_vol" >/dev/null 2>&1; then
+    echo "== migrating data volume $old_vol -> $new_vol"
+    docker compose stop ares ares-api 2>/dev/null || true
+    docker volume create "$new_vol" >/dev/null
+    docker run --rm -v "$old_vol":/from:ro -v "$new_vol":/to alpine \
+        sh -c 'cp -a /from/. /to/'
+    echo "   done; old volume kept as backup: $old_vol"
+fi
+
 # ── 3. Data volume ownership (one-off after the switch to a non-root image)
 echo "== data volume ownership"
-docker compose run --rm --no-deps --user root --entrypoint sh ares \
+docker compose run --rm --no-deps --user root --entrypoint sh arse \
     -c 'chown -R 1000:1000 /app/data'
 
 # ── 4. Start + wait for health ──────────────────────────────────────────
@@ -111,4 +127,4 @@ if (( FAILED )); then
 fi
 green "Deploy OK."
 echo "If this deploy includes the cache-poisoning fix, purge stale negatives once:"
-echo "  docker compose exec ares python scripts/purge_negative_cache.py"
+echo "  docker compose exec arse python scripts/purge_negative_cache.py"

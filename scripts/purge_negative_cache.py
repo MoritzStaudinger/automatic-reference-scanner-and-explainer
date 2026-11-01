@@ -8,7 +8,7 @@ whenever you want indexes to be re-queried for papers they now carry.
     python scripts/purge_negative_cache.py --source openalex
 
 Inside Docker:
-    docker compose exec ares python scripts/purge_negative_cache.py
+    docker compose exec arse python scripts/purge_negative_cache.py
 """
 
 from __future__ import annotations

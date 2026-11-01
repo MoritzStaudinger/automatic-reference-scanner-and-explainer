@@ -24,11 +24,11 @@ services:
     ports:
       - "127.0.0.1:8070:8070"
 
-  ares:
+  arse:
     ports:
       - "127.0.0.1:8501:8501"
 
-  ares-api:
+  arse-api:
     ports:
       - "127.0.0.1:8500:8500"
     environment:
