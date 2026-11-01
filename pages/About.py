@@ -39,10 +39,13 @@ st.markdown("""
 1. **Extract.** The `hybrid` parser merges GROBID's full-document parse with the
    bibliography section structured citation by citation, then looks for reference-like
    text no extracted entry covers. `grobid`, `pymupdf4llm` and (if installed) `docling`
-   are available under **Options**.
+   are available under **Options**. Author names and titles are then checked against the
+   printed citation text, which fixes most scrambled names without an LLM.
 2. **Repair (optional, on by default when configured).** An LLM fixes swapped or truncated
-   fields and drops body text that was mistaken for a reference. Identifier checks only
-   trust identifiers present in the original citation text, never ones the LLM added.
+   fields and drops body text that was mistaken for a reference. A repaired value is only
+   accepted when the citation text contains it, so the model can't add a venue, DOI or
+   author from its own knowledge, and identifier checks only trust identifiers printed in
+   the citation.
 3. **Verify.** Each reference is routed by what it carries: DOIs go to doi.org first
    (with Crossref, Semantic Scholar and OpenAlex as a vote), arXiv IDs to arXiv, CS venues
    to DBLP, books to Open Library, and title-only references fan out to several indexes.

@@ -111,12 +111,13 @@ def test_fallback_backend_recovers_failed_batches(monkeypatch):
     def call(client, batch, backend=None, model=None):
         if backend == "aqueduct":
             raise RuntimeError("500 connection error")
-        return [llm_parser._ParsedRef(title="Fixed") for _ in batch]
+        return [llm_parser._ParsedRef(title="Fixed title of a paper") for _ in batch]
     monkeypatch.setattr(llm_parser, "_call_llm", call)
     stats = {}
-    out = llm_parser.parse_references_with_llm([{"raw": "r", "title": "t"}], stats=stats,
-                                               backend="aqueduct")
-    assert out[0]["title"] == "Fixed"
+    out = llm_parser.parse_references_with_llm(
+        [{"raw": "A. Author. Fixed title of a paper. Venue, 2020.", "title": "t"}],
+        stats=stats, backend="aqueduct")
+    assert out[0]["title"] == "Fixed title of a paper"
     assert stats["n_failed_refs"] == 0 and "fallback anthropic" in stats["fallback"]
 
 
@@ -150,3 +151,33 @@ def test_circuit_breaker_skips_down_backend(monkeypatch):
     calls.clear()
     llm_parser.parse_references_with_llm([{"raw": "r"}], backend="aqueduct")
     assert calls == ["anthropic"]          # primary skipped while down
+
+
+# ── Grounding of repaired values ────────────────────────────────────────────
+
+def test_repaired_values_must_appear_in_the_citation(monkeypatch):
+    raw = ("[10] Peter G. Anick and Rex A. Flynn. Versioning a full-text information "
+           "retrieval system. In Proceedings of SIGIR, pages 98-111, 1992.")
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+    monkeypatch.setattr(llm_parser, "_call_llm", lambda c, batch, b=None, m=None: [
+        llm_parser._ParsedRef(title="Versioning a full-text information retrieval system",
+                              authors="Peter G. Anick, Rex A. Flynn",
+                              venue="BMJ Open",                    # invented
+                              doi="10.1145/133160.133183",         # not printed
+                              year="1992")])
+    out = llm_parser.parse_references_with_llm(
+        [{"raw": raw, "title": "Versioning", "authors": "G Peter, Rex Anick, Flynn",
+          "venue": "Proceedings of SIGIR"}], backend="anthropic")[0]
+    assert out["authors"] == "Peter G. Anick, Rex A. Flynn"
+    assert out["title"] == "Versioning a full-text information retrieval system"
+    assert out["venue"] == "Proceedings of SIGIR"
+    assert not out.get("doi")
+
+
+def test_shortened_author_list_is_rejected():
+    raw = "A. One, B. Two, C. Three, and D. Four. Title. 2020."
+    assert not llm_parser._grounded("authors", "A. One, et al.", raw,
+                                    "A. One, B. Two, C. Three, D. Four")
+    assert llm_parser._grounded("authors", "A. One, B. Two, C. Three, D. Four", raw, "")
+    assert llm_parser._grounded("url", "https://arxiv.org/abs/2311.12474",
+                                "Kusa. Csmed. arXiv preprint arXiv:2311.12474, 2023.", "")

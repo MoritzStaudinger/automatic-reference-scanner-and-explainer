@@ -445,7 +445,8 @@ def _clean_doi(value: str) -> str:
 
 _ORG_WORD_RE = re.compile(
     r"\b(?:Committee|Group|Organi[sz]ation|Institute|Consortium|Association|"
-    r"Alliance|Observatory|Foundation|Council|Agency|Society|Working)\b")
+    r"Alliance|Observatory|Foundation|Council|Agency|Society|Working|Standardi[sz]ation|"
+    r"Team|Contributors|Project|Initiative|Lab|Laboratory|Inc|Ltd|Corporation|Office)\b")
 _NAME_LIST_WORDS = {"and", "of", "for", "the", "on", "&", "others", "et", "al", "al."}
 _VENUE_TITLE_RE = re.compile(
     r"^(?:In\s+)?(?:Proceedings\b|Proc\.|Advances in\b|arXiv\b|Transactions\b|Journal of\b|"
@@ -702,8 +703,10 @@ def _split_plaintext_bibliography(section: str) -> list[str]:
     earlier `". [A-Z]"` candidates in that span are typically inside the
     title or venue (subtitles, "vol. N", "arXiv:NNNN.").
     """
-    # Un-hyphenate: word- continued on next line
-    text = re.sub(r"-\s*\n\s*", "", section)
+    # Un-hyphenate: word- continued on next line ("evalu-\nation"), but
+    # keep real hyphens before a capital ("Callison-\nBurch").
+    text = re.sub(r"-\s*\n\s*(?=[a-zà-ÿ])", "", section)
+    text = re.sub(r"-\s*\n\s*", "-", text)
     # Drop page footers (a line that is just digits, often a page number)
     text = re.sub(r"\n\s*\d{1,5}\s*\n", "\n", text)
     # Collapse all whitespace
@@ -1013,6 +1016,145 @@ def _merge_ref_lists(
     return merged
 
 
+# ---------------------------------------------------------------------------
+# Deterministic repair against the printed citation text
+# ---------------------------------------------------------------------------
+# GROBID's CRF splits "Peter G. Anick and Rex A. Flynn" into forename /
+# surname pairs that drift across names ("G Peter, Rex Anick, Flynn") and
+# sometimes stops a title at a comma.  With the real citation text in
+# ``raw`` both can be checked and fixed without an LLM.
+
+_NAME_TOKEN_RE = re.compile(r"^(?:[A-ZÀ-ÖØ-Þ][\w'’\-]*\.?|[A-Z]\.(?:-?[A-Z]\.)*|"
+                            r"de|van|von|der|den|da|di|du|la|le|dos|del|bin|al|el|ter|ten)$")
+
+
+def _dehyphenate(text: str) -> str:
+    """Undo line-break hyphenation: "Sori- cut" → "Soricut"; keep real
+    hyphens before a capital ("Klaus- Robert" → "Klaus-Robert")."""
+    text = re.sub(r"(\w)- (?=[a-zà-ÿ])", r"\1", text)
+    return re.sub(r"(\w)- (?=[A-ZÀ-Þ])", r"\1-", text)
+
+
+def _norm_loose(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return " ".join(re.sub(r"[^\w\s]", " ", s).split())
+
+
+def _title_start(body: str, title: str) -> int:
+    """Index of ``title`` in ``body`` (loose match on its first words), or -1."""
+    words = re.findall(r"\w+", title)[:6]
+    if len(words) < 2:
+        return -1
+    pat = r"[\W_]+".join(re.escape(w) for w in words)
+    m = re.search(pat, body, re.I)
+    return m.start() if m else -1
+
+
+def _names_from_raw(raw: str, title: str) -> list[str] | None:
+    """Author names as printed before the title, when they are written
+    "First Middle Last" (ACM, ACL, IEEE).  None when the segment can't be
+    read that way — "Last, F." styles, editors, no title found."""
+    body = _dehyphenate(re.sub(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*", "", raw))
+    i = _title_start(body, title)
+    if i <= 0:
+        return None
+    seg = body[:i].strip()
+    seg = re.sub(r"[“\"'‘(]+$", "", seg).strip()
+    # Trailing year ("2024b.", "(2020).") of author-year styles
+    seg = re.sub(r"[.,]?\s*\(?(?:19|20)\d{2}[a-z]?\)?[.,:]?$", "", seg).strip()
+    seg = seg.rstrip(".,:; ")
+    if not seg or len(seg) > 2000:
+        return None
+    parts = [p.strip() for p in re.split(r",\s*(?:and\s+|&\s+)?|\s+and\s+|\s+&\s+", seg) if p.strip()]
+    names = [p for p in parts if not re.fullmatch(r"(?:\d+\s+)?others|et\s+al\.?", p, re.I)]
+    if not names:
+        return None
+    for n in names:
+        toks = n.split()
+        if not 2 <= len(toks) <= 6:
+            return None             # "Smith", "J." → a "Last, F." style
+        if not all(_NAME_TOKEN_RE.match(t) for t in toks):
+            return None
+        last = toks[-1]
+        if len(last.rstrip(".")) < 2 or last.endswith("."):
+            return None             # ends in an initial → "Last, F. M." style
+    return names
+
+
+def _surname_set(names: list[str]) -> set[str]:
+    return {(_norm_loose(n).split() or [""])[-1] for n in names if _norm_loose(n)}
+
+
+def _extend_title(raw: str, title: str) -> str:
+    """Complete a title GROBID ended at a comma: "… High-Impact Pediatrics"
+    → "… High-Impact Pediatrics, Cardiology and Surgery Journals: A
+    Cross-Sectional Study".  Only within the same sentence, and only when
+    the continuation doesn't look like a venue, pages or a year."""
+    body = _dehyphenate(" ".join(raw.split()))
+    words = re.findall(r"\w+", title)
+    if len(words) < 2:
+        return title
+    whole = re.search(r"[\W_]+".join(re.escape(w) for w in words), body, re.I)
+    if not whole:
+        return title
+    rest = body[whole.end():]
+    if not rest.startswith(", "):
+        return title
+    stop = re.search(r"[.?!](?:\s|$)", rest)
+    extra = rest[: stop.start()] if stop else ""
+    if (not extra or len(extra.split()) > 15 or re.search(r"\d", extra)
+            or re.search(r"\b(?:In|Proceedings|Proc|Journal|Conference|vol|pp|pages|"
+                         r"Springer|ACM|IEEE|arXiv|Press|University)\b", extra)):
+        return title
+    return (title.rstrip(".") + extra).strip()
+
+
+def _org_author_from_raw(raw: str, title: str) -> str:
+    """"International Organization for Standardization (ISO)" — a corporate
+    author GROBID left empty.  Only short segments naming an organisation."""
+    body = re.sub(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*", "", " ".join(raw.split()))
+    i = _title_start(body, title)
+    if i <= 0:
+        return ""
+    seg = re.sub(r"[.,]?\s*\(?(?:19|20)\d{2}[a-z]?\)?[.,:]?$", "", body[:i].strip()).rstrip(".,:; ")
+    if 3 <= len(seg) <= 160 and (_ORG_WORD_RE.search(seg) or re.search(r"\([A-Z]{2,}\)", seg)):
+        return seg
+    return ""
+
+
+def _repair_from_raw(ref: dict[str, Any]) -> dict[str, Any]:
+    raw, title = ref.get("raw") or "", (ref.get("title") or "").strip()
+    if not raw or not title:
+        return ref
+    out = ref
+    # Publisher / organisation appended to the title:
+    # "Data Citation of Evolving Data. Research Data Alliance"
+    head, sep, tail = title.rpartition(". ")
+    if sep and len(head.split()) >= 3 and len(tail.split()) <= 5 and (
+            _ORG_WORD_RE.search(tail) or _looks_like_venue(tail)):
+        title = head
+        out = {**out, "title": title}
+    names = _names_from_raw(raw, title)
+    if names:
+        grobid = [a for a in (ref.get("authors") or "").split(", ") if a]
+        # A scramble re-assigns the same name tokens; a different token set
+        # means raw holds a neighbouring citation — leave GROBID's names.
+        g_tokens = set(_norm_loose(" ".join(grobid)).split())
+        r_tokens = set(_norm_loose(" ".join(names)).split())
+        same_people = not g_tokens or len(g_tokens & r_tokens) >= 0.6 * len(g_tokens)
+        if same_people and _surname_set(names) != _surname_set(grobid):
+            out = {**out, "authors": ", ".join(names), "_authors_from_raw": True}
+    elif not (ref.get("authors") or "").strip():
+        org = _org_author_from_raw(raw, title)
+        if org:
+            out = {**out, "authors": org}
+    longer = _extend_title(raw, title)
+    if longer != title:
+        out = {**out, "title": longer}
+    return out
+
+
 def _better_title(primary: str, secondary: str) -> str:
     """The citation-list title when it fixes a typical full-document error:
     the venue glued on ("Title. Advances in Neural …") or a leading
@@ -1069,7 +1211,7 @@ def extract_references_hybrid(
             errors.append(str(e))
             section_refs = []
     merged = _merge_ref_lists(grobid_refs, section_refs)
-    merged = [r for r in merged if _is_plausible_reference(r)]
+    merged = [_repair_from_raw(r) for r in merged if _is_plausible_reference(r)]
     if errors and not merged:
         # Both halves need GROBID; silently returning [] used to show
         # "no references found" when the real problem was GROBID.

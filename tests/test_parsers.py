@@ -188,3 +188,63 @@ def test_hyphenation_number_loss_is_not_a_different_work():
     assert _distinct_refs({"title": "Clef 2017 overview"}, {"title": "Clef 2018 overview"})
     assert _better_title("Yuxuan Lyu and 1 others", "Deepseek-r1: Incentivizing reasoning") \
         == "Deepseek-r1: Incentivizing reasoning"
+
+
+# ── Repair against the printed citation text ────────────────────────────────
+
+from parsers import _repair_from_raw, _names_from_raw, _extend_title
+
+
+def test_scrambled_grobid_authors_are_read_from_raw():
+    ref = {"title": "Versioning a full-text information retrieval system",
+           "authors": "G Peter, Rex Anick, Flynn",
+           "raw": "[5] Peter G. Anick and Rex A. Flynn. Versioning a full-text information "
+                  "retrieval system. In Proceedings of SIGIR, 1992."}
+    assert _repair_from_raw(ref)["authors"] == "Peter G. Anick, Rex A. Flynn"
+
+
+def test_acl_author_list_with_others_and_hyphenation():
+    raw = ("Zaid Vayani, Zhong Ding, Yiyi Shen, and Radu Sori- cut. 2024b. All languages "
+           "matter: Evaluating lmms on culturally diverse 100 languages.")
+    assert _names_from_raw(raw, "All languages matter: Evaluating lmms") == \
+        ["Zaid Vayani", "Zhong Ding", "Yiyi Shen", "Radu Soricut"]
+    assert _names_from_raw("Tom Brown, Amanda Askell, and others. 2020. Language models are "
+                           "few-shot learners.", "Language models are few-shot learners") == \
+        ["Tom Brown", "Amanda Askell"]
+
+
+def test_last_first_style_is_left_to_grobid():
+    raw = "Smith, J., & Doe, K. (2020). A study of things. Journal of Stuff, 3(2), 1-10."
+    assert _names_from_raw(raw, "A study of things") is None
+
+
+def test_correct_grobid_authors_are_kept():
+    ref = {"title": "Pyserini: A Python Toolkit", "authors": "Jimmy Lin, Xueguang Ma",
+           "raw": "[44] Jimmy Lin and Xueguang Ma. Pyserini: A Python Toolkit. In SIGIR, 2021."}
+    assert _repair_from_raw(ref) is ref
+
+
+def test_title_cut_at_comma_is_completed():
+    raw = ("[38] Jonathan B. Koffel and Melissa L. Rethlefsen. Reproducibility of Search "
+           "Strategies Is Poor in Systematic Reviews Published in High-Impact Pediatrics, "
+           "Cardiology and Surgery Journals: A Cross-Sectional Study. PLOS ONE, 11(9), 2016.")
+    t = "Reproducibility of Search Strategies Is Poor in Systematic Reviews Published in High-Impact Pediatrics"
+    assert _extend_title(raw, t).endswith("Cardiology and Surgery Journals: A Cross-Sectional Study")
+    # A comma followed by the venue is not part of the title.
+    raw2 = "A. Author. A good title, In Proceedings of ACL, pages 1-9, 2020."
+    assert _extend_title(raw2, "A good title") == "A good title"
+    # Repeated words in the title don't duplicate it.
+    raw3 = "A. Author and B. Author. Data, models and data. Venue, 2020."
+    assert _extend_title(raw3, "Data, models and data") == "Data, models and data"
+
+
+def test_org_author_and_appended_publisher():
+    ref = {"title": "Data Citation of Evolving Data. Research Data Alliance", "authors": "",
+           "raw": "[52] Andreas Rauber and Ari Asmi. Data Citation of Evolving Data. Research "
+                  "Data Alliance, 2015."}
+    assert _repair_from_raw(ref)["title"] == "Data Citation of Evolving Data"
+    iso = {"title": "Information and documentation -Guidelines for bibliographic references",
+           "authors": "",
+           "raw": "[28] International Organization for Standardization (ISO). Information and "
+                  "documentation - Guidelines for bibliographic references, June 2010."}
+    assert _repair_from_raw(iso)["authors"] == "International Organization for Standardization (ISO)"

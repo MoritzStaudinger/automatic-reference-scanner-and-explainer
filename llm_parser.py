@@ -127,49 +127,50 @@ def active_model() -> tuple[str, str]:
     return _BACKEND, _MODEL
 
 _SYSTEM_PROMPT = """\
-You are an expert bibliographer.  For each input you'll receive a raw citation
-string plus an initial regex parse of its fields (some of which may be wrong).
+You are an expert bibliographer.  Each input has the raw text of one entry
+from a paper's reference list (as printed in the PDF) and the fields an
+automatic parser (GROBID) extracted from it.  Some fields are wrong.
 
-Your job is to return the *corrected* fields PLUS a classification of whether
-the raw text is actually a bibliographic reference at all.
+Return the corrected fields and whether the raw text is a bibliographic
+reference at all.
 
-Common failure modes to watch for:
-  - **Body text mistaken for a reference**: paragraphs from the paper's methods
-    or appendix that got dragged into the bibliography (e.g. starts with
-    "We", "Our", "Representing", "Similarly", "VSAs support…").  These have
-    no author-year structure.  Set is_citation=false for these.
-  - **Table/equation captions**: short notation strings like
-    "Notation. n: sequence length…" — also is_citation=false.
-  - **Title ↔ authors swap**: authors_field="Amir R", title_field="Kachooei
-    and Mohammad H" — the real title is in the venue or after the swap.
-    Fix the swap.
-  - **Title ↔ venue swap**: title="Manning", venue="A structural probe for
-    finding syntax in word representations" — the real title is the long
-    descriptive string in venue.  Swap them.
-  - A year token like "2024b" promoted to title
-  - A DOI dragged into the venue field
-  - Authors truncated at a period inside an initial ("J.")
-  - Missing fields the regex couldn't find but the raw text contains
+Typical parser errors to fix:
+  - Author names scrambled across given / family names:
+    "G Peter, Rex Anick, Flynn" for "Peter G. Anick and Rex A. Flynn";
+    "Thaer Hannes Mühleisen, Jimmy Samar, Lin" for "Hannes Mühleisen,
+    Thaer Samar, Jimmy Lin".  Rewrite the list from the raw text.
+  - Two references' author lists run together, or authors missing.
+  - Author names or "and others. 2024." glued to the front of the title.
+  - The venue or publisher appended to the title ("… models. Advances in
+    Neural Information Processing Systems"), or the title cut short at a
+    comma or colon.
+  - A venue, an author list or a year token in the title field.
+  - An organisation as author ("International Organization for
+    Standardization (ISO)") left empty.
+  - Body text, captions or equations mistaken for a reference
+    (is_citation=false).
 
 Return a JSON array (same length, same order) where each element has:
-  - "is_citation": boolean.  True if the raw text is a bibliographic reference
-                   (has author + year + title, even if scrambled).  False if
-                   it's body text, an equation, a table caption, or otherwise
-                   not actually a citation.
-  - "title":   the paper or book title.  Must be the real title — never a year
-               token, never an author name.  Null if is_citation=false.
-  - "authors": author names, comma- or "and"-separated.  Null if not a citation.
-  - "year":    4-digit year as a string, or null.
-  - "venue":   journal / conference name with no DOI or page-range tail, or null.
-  - "doi":     DOI string without URL prefix, or null.
-  - "url":     any explicit URL in the raw string, or null.
+  - "is_citation": boolean.  False only for text that is clearly not a
+                   reference (body text, captions, notation).
+  - "title":   the title, copied from the raw text.
+  - "authors": all author names in printed order, as printed, separated by
+               ", ".  Drop "and others" / "et al." markers.
+  - "year":    4-digit year as a string.
+  - "venue":   journal / conference / publisher, without pages, volume or DOI.
+  - "doi":     DOI without URL prefix.
+  - "url":     a URL printed in the raw text.
 
 Rules:
+- Use ONLY the raw text.  Never add a venue, DOI, URL, year or author from
+  your own knowledge of the paper; a field the raw text doesn't contain is
+  null, even if the parser filled it.
+- Copy titles and names verbatim: keep spelling, capitalisation and
+  accents; only undo line-break hyphenation ("evalu- ation").
+- List every author the raw text lists — never shorten a long list to
+  "et al.".
+- When the parser's value is already right, return it unchanged.
 - Return ONLY the JSON array.  No prose, no markdown fences.
-- Keep array length identical to input.
-- Prefer the LONGER, more complete version of a field when the regex got a
-  truncated piece of it.
-- When swapping fields, swap them — don't just blank out the wrong one.
 """
 
 
@@ -252,11 +253,67 @@ def _looks_garbled(ref: dict[str, Any]) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Grounding: accept a repaired value only when the citation text backs it
+# ---------------------------------------------------------------------------
+# Models fill fields from their own knowledge of a paper ("BMJ Open" for a
+# citation that names no venue) and shorten long author lists to "et al.".
+# Either corrupts the lookup: an invented venue can trigger "wrong venue",
+# a truncated list weakens the author check.
+
+def _loose(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    s = _re_lp.sub(r"(\w)-\s+(\w)", r"\1\2", s)          # line-break hyphens
+    return " ".join(_re_lp.sub(r"[^\w\s]", " ", s).split())
+
+
+def _squash(s: str) -> str:
+    return _re_lp.sub(r"\s+", "", s or "").lower()
+
+
+def _surnames(authors: str) -> list[str]:
+    names = [n for n in _re_lp.split(r",\s*(?:and\s+)?|\s+and\s+|;\s*", authors or "") if n.strip()]
+    out = []
+    for n in names:
+        toks = _loose(n).split()
+        if toks and toks[-1] not in {"al", "others"}:
+            out.append(toks[-1])
+    return out
+
+
+def _grounded(field: str, value: str, raw: str, original: str) -> bool:
+    from rapidfuzz import fuzz
+    if not raw:
+        return True                     # nothing to check against
+    lraw = _loose(raw)
+    if field in ("title", "venue"):
+        v = _loose(value)
+        return bool(v) and fuzz.partial_ratio(v, lraw) >= (90 if field == "title" else 85)
+    if field == "year":
+        return value in raw
+    if field == "doi":
+        return _squash(value).rstrip(".") in _squash(raw)
+    if field == "url":
+        if _squash(value) in _squash(raw):
+            return True
+        m = _re_lp.search(r"(\d{4}\.\d{4,5})", value)          # canonical arXiv URL
+        return bool(m and m.group(1) in raw)
+    if field == "authors":
+        if _re_lp.search(r"\bet\s+al\b|\bothers\b", value) and \
+                len(_surnames(value)) < len(_surnames(original)):
+            return False                # a shortened list
+        sur = _surnames(value)
+        words = set(lraw.split())
+        return bool(sur) and sum(s in words for s in sur) >= 0.8 * len(sur)
+    return True
+
+
 def _build_user_payload(batch: list[dict[str, Any]]) -> str:
     inputs = [
         {
             "raw": r.get("raw", "")[:1500],
-            "regex_parse": {
+            "parsed": {
                 k: r.get(k)
                 for k in ("title", "authors", "year", "venue", "doi", "url")
                 if r.get(k)
@@ -464,10 +521,13 @@ def parse_references_with_llm(
                 enhanced[i]["doi"] = ""
                 enhanced[i]["url"] = ""
                 continue
+            raw = references[i].get("raw") or ""
             for field in ("title", "authors", "year", "venue", "doi", "url"):
-                val = getattr(p, field, None)
-                if val:
+                val = (getattr(p, field, None) or "").strip()
+                if val and val != (references[i].get(field) or "") \
+                        and _grounded(field, val, raw, references[i].get(field) or ""):
                     enhanced[i][field] = val
+                    enhanced[i].setdefault("_llm_fields", []).append(field)
 
     max_workers = min(_MAX_PARALLEL_BATCHES, len(batches))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
