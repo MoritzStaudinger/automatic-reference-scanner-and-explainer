@@ -34,3 +34,11 @@ def test_counts_include_dead_links():
     lrs = [{"url_verify": {"status": "dead_link"}}, None]
     c = cards.counts(lrs, 2)
     assert c["dead"] == 1 and c["pending"] == 1 and c["missing"] == 1
+
+
+def test_orphans_only_from_bibliography_pages():
+    from ui.processing import bibliography_orphans
+    located = [{"found": True, "page": 2}] + [{"found": True, "page": 5}] * 3
+    orphans = [{"page": 2, "text": "body"}, {"page": 5, "text": "ref"}, {"page": 6, "text": "ref2"}]
+    assert [o["page"] for o in bibliography_orphans(located, orphans)] == [5, 6]
+    assert bibliography_orphans([{"found": True, "page": 2}], orphans) == orphans

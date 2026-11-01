@@ -136,6 +136,20 @@ def run_highlighter(pdf_bytes: bytes, refs_json: str, statuses_json: str = "[]",
                                 json.loads(statuses_json) or None, bake_color=bake_color)
 
 
+def bibliography_orphans(located: list[dict], orphans: list[dict]) -> list[dict]:
+    """Keep orphan blocks from the bibliography onwards.  The bibliography
+    starts at the first page holding >= 3 located references; a single
+    reference "located" earlier is usually a match inside body text."""
+    per_page: dict[int, int] = {}
+    for r in located:
+        if r.get("found") and r.get("page"):
+            per_page[r["page"]] = per_page.get(r["page"], 0) + 1
+    starts = [p for p, n in sorted(per_page.items()) if n >= 3]
+    if not starts:
+        return orphans
+    return [o for o in orphans if (o or {}).get("page", 0) >= starts[0]]
+
+
 @st.cache_data(**_CACHE)
 def auto_add_orphans(orphans_json: str) -> str:
     """Structure high-confidence orphan blocks (bibliography text no parsed
@@ -242,6 +256,10 @@ def process(pdf_bytes: bytes, parser: str, use_llm: bool,
     t = time.time()
     say("Locating references in the PDF …")
     pdf, located, orphans = run_highlighter(pdf_bytes, json.dumps(refs))
+    # Missed references can only sit on the bibliography pages.  Body-text
+    # paragraphs earlier in the paper (which cite papers and so "look like"
+    # references) were being auto-added as references.
+    orphans = bibliography_orphans(located, orphans)
     auto = json.loads(auto_add_orphans(json.dumps(orphans)))
     orphans = [o for o in orphans if (o or {}).get("confidence") != "high"]
     if auto:
