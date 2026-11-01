@@ -359,6 +359,7 @@ def parse_references_with_llm(
     stats: dict[str, Any] | None = None,
     backend: str | None = None,
     model: str | None = None,
+    _allow_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Repair regex-parsed references with the active LLM backend.
@@ -378,6 +379,11 @@ def parse_references_with_llm(
     backend, model : str | None
         Per-call override of the active backend / model.  Thread-safe,
         unlike ``set_active_model`` (use this from servers).
+
+    Refs whose batches fail are retried on LLM_FALLBACK_BACKEND (optional
+    LLM_FALLBACK_MODEL) when that is set and has a key — e.g. keep the free
+    Aqueduct endpoint as primary and Anthropic as backup.  Opt-in, since
+    the fallback may be a paid API.
 
     Returns
     -------
@@ -456,10 +462,24 @@ def parse_references_with_llm(
             if progress_cb:
                 progress_cb(done, total)
 
+    fallback_note = None
+    fb = (os.getenv("LLM_FALLBACK_BACKEND") or "").strip().lower()
+    if failed_refs and _allow_fallback and fb and fb != backend and _make_client(fb):
+        sub_stats: dict[str, Any] = {}
+        fixed = parse_references_with_llm(
+            [references[i] for i in failed_refs], stats=sub_stats, backend=fb,
+            model=os.getenv("LLM_FALLBACK_MODEL") or None, _allow_fallback=False)
+        for i, r in zip(failed_refs, fixed):
+            enhanced[i] = r
+        recovered = len(failed_refs) - sub_stats.get("n_failed_refs", len(failed_refs))
+        fallback_note = f"{recovered} repaired via fallback {fb}/{sub_stats.get('model')}"
+        failed_refs = failed_refs[:sub_stats.get("n_failed_refs", 0)]
     if stats is not None:
         stats.update(n_sent=total, n_batches=len(batches),
                      n_failed_batches=len(llm_errors), n_failed_refs=len(failed_refs),
-                     first_error=llm_errors[0] if llm_errors else None)
+                     first_error=(llm_errors[0] if llm_errors and failed_refs else None),
+                     primary_error=llm_errors[0] if llm_errors else None,
+                     fallback=fallback_note)
     if llm_errors:
         # Surface a single warning (first error message is usually enough
         # — the rest are identical, e.g. all "credit balance too low").

@@ -102,3 +102,29 @@ def test_hybrid_raises_parser_error_when_grobid_down(monkeypatch, tmp_path):
     import pytest
     with pytest.raises(parsers.ParserError):
         parsers.extract_references_hybrid(str(pdf))
+
+
+def test_fallback_backend_recovers_failed_batches(monkeypatch):
+    monkeypatch.setenv("LLM_FALLBACK_BACKEND", "anthropic")
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+
+    def call(client, batch, backend=None, model=None):
+        if backend == "aqueduct":
+            raise RuntimeError("500 connection error")
+        return [llm_parser._ParsedRef(title="Fixed") for _ in batch]
+    monkeypatch.setattr(llm_parser, "_call_llm", call)
+    stats = {}
+    out = llm_parser.parse_references_with_llm([{"raw": "r", "title": "t"}], stats=stats,
+                                               backend="aqueduct")
+    assert out[0]["title"] == "Fixed"
+    assert stats["n_failed_refs"] == 0 and "fallback anthropic" in stats["fallback"]
+
+
+def test_no_fallback_without_opt_in(monkeypatch):
+    monkeypatch.delenv("LLM_FALLBACK_BACKEND", raising=False)
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+    monkeypatch.setattr(llm_parser, "_call_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    stats = {}
+    llm_parser.parse_references_with_llm([{"raw": "r"}], stats=stats, backend="aqueduct")
+    assert stats["n_failed_refs"] == 1 and stats["fallback"] is None
