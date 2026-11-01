@@ -64,3 +64,11 @@ def test_near_title_different_authors_is_not_mismatch():
     assert not r.get("wrong_authors") and r["label"] != "mismatch"
     r = lookup._finalize_match(0.99, 0.0, None, "", "")
     assert r.get("wrong_authors") and r["label"] == "mismatch"
+
+
+def test_short_fragment_title_never_wrong_authors():
+    r = {"status": "found", "similarity": 1.0, "authors_sim": 0.0, "label": "mismatch",
+         "found_title": "Baronian", "found_authors": "A Person, B Person, C Person",
+         "wrong_authors": True}
+    out = lookup.refresh_result_against_ref(r, {"title": "Baronian", "authors": "Luc Baronian"})
+    assert out["label"] == "fuzzy" and "wrong_authors" not in out

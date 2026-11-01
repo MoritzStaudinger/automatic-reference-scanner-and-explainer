@@ -716,6 +716,13 @@ def refresh_result_against_ref(
         out["wrong_venue"] = True
     else:
         out.pop("wrong_venue", None)
+    # A one- or two-word "title" (usually a parser fragment such as an author
+    # surname) can match some paper exactly; that is no evidence the citation
+    # names the wrong authors or venue.  Identifier flags stay authoritative.
+    if len(extracted_title.split()) < 3:
+        flagged = [out.pop(k, None) for k in ("wrong_authors", "wrong_venue")]
+        if any(flagged) and not (out.get("wrong_doi") or out.get("wrong_arxiv_id")):
+            out["label"] = "fuzzy"
     return out
 
 
