@@ -643,11 +643,19 @@ function _clearSelecting() {
 // without a Streamlit rerun; only server actions are sent back.
 const list = {
   items: null, labels: {}, order: [], filter: "all", query: "", pageOnly: false,
-  open: new Set(), keyHtml: "",
+  open: new Set(), keyHtml: "", tiles: [],
 };
 
+// A filter is a status key, "all", or an item flag behind a tile
+// ("dead" → cited link is dead, "bad_claims" → a claim was contradicted).
+function matchesFilter(it, f) {
+  if (f === "all") return true;
+  if (f === "dead" || f === "bad_claims") return Boolean(it[f]);
+  return it.status === f;
+}
+
 function itemVisible(it) {
-  if (list.filter !== "all" && it.status !== list.filter) return false;
+  if (!matchesFilter(it, list.filter)) return false;
   if (list.query && !it.text.includes(list.query)) return false;
   if (list.pageOnly && it.page !== state.pageNum) return false;
   return true;
@@ -664,7 +672,42 @@ function renderFilterButtons() {
     b.type = "button";
     b.textContent = `${key === "all" ? "All" : list.labels[key]} ${counts[key] || 0}`;
     b.setAttribute("aria-pressed", String(list.filter === key));
-    b.onclick = () => { list.filter = key; renderFilterButtons(); renderList(); };
+    b.onclick = () => { setFilter(key); };
+    box.appendChild(b);
+  }
+}
+
+function setFilter(key) {
+  list.filter = key;
+  renderFilterButtons();
+  renderTiles();
+  renderList();
+  document.getElementById("list").scrollTop = 0;
+}
+
+function renderTiles() {
+  const box = document.getElementById("tiles");
+  if (!list.tiles.length) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = "";
+  for (const t of list.tiles) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "tile";
+    b.title = t.help || "";
+    const label = document.createElement("span");
+    label.className = "t-label";
+    label.textContent = t.label;
+    const value = document.createElement("span");
+    value.className = "t-value";
+    value.textContent = String(t.value);
+    b.append(label, value);
+    const active = t.filter !== "all" && list.filter === t.filter;
+    b.setAttribute("aria-pressed", String(active));
+    // Nothing to show behind an empty tile; "References" always resets.
+    b.disabled = t.filter !== "all" && !t.value;
+    // A second click on the active tile goes back to all references.
+    b.onclick = () => setFilter(active || t.filter === "all" ? "all" : t.filter);
     box.appendChild(b);
   }
 }
@@ -704,6 +747,7 @@ function focusCard(i) {
     document.getElementById("search").value = "";
     document.getElementById("page-only").checked = false;
     renderFilterButtons();
+    renderTiles();
   }
   list.open.add(i);
   renderList();
@@ -748,14 +792,16 @@ function updateList(args) {
   if (args.cards_css && document.getElementById("cards-css").textContent !== args.cards_css) {
     document.getElementById("cards-css").textContent = args.cards_css;
   }
-  const key = JSON.stringify(args.items);
+  const key = JSON.stringify([args.items, args.tiles || []]);
   if (key === list.keyHtml) return;          // nothing changed → keep DOM, scroll, focus
   list.keyHtml = key;
   list.items = args.items;
+  list.tiles = args.tiles || [];
   list.labels = args.status_labels || {};
   list.order = args.status_order || [];
-  if (list.filter !== "all" && !list.items.some((x) => x.status === list.filter)) list.filter = "all";
+  if (!list.items.some((x) => matchesFilter(x, list.filter))) list.filter = "all";
   renderFilterButtons();
+  renderTiles();
   renderList();
 }
 

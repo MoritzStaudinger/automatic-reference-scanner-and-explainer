@@ -251,20 +251,25 @@ with notices:
 
 c = cards.counts(lookup_results, len(refs))
 verdicts = st.session_state.get("claim_verifications") or []
-m = st.columns(5 if not verdicts else 6)
-m[0].metric("References", len(refs), border=True,
-            help=f"{sum(1 for r in refs if r.get('found'))} located in the PDF")
-m[1].metric("Verified", c["match"], border=True)
-m[2].metric("Mismatch", c["mismatch"], border=True,
-            help="A paper exists at this title / DOI / arXiv ID but details disagree.")
-m[3].metric("Not found", c["missing"], border=True,
-            help="No index knows it — common for software, datasets and new papers.")
-m[4].metric("Dead links", c["dead"], border=True,
-            help="Cited URLs that no longer resolve (archived copies are checked).")
+# Rendered inside the reference-list component, so a click filters the list
+# in the browser instead of rerunning the page.
+TILES = [
+    {"label": "References", "value": len(refs), "filter": "all",
+     "help": f"{sum(1 for r in refs if r.get('found'))} located in the PDF · click to show all"},
+    {"label": "Verified", "value": c["match"], "filter": "match",
+     "help": "A database or the cited page confirms title and authors."},
+    {"label": "Mismatch", "value": c["mismatch"], "filter": "mismatch",
+     "help": "A paper exists at this title / DOI / arXiv ID but details disagree."},
+    {"label": "Not found", "value": c["missing"], "filter": "missing",
+     "help": "No index knows it — common for software, datasets and new papers."},
+    {"label": "Dead links", "value": c["dead"], "filter": "dead",
+     "help": "Cited URLs that no longer resolve (archived copies are checked)."},
+]
 if verdicts:
     n_con = sum(1 for v in verdicts if v.get("verdict") == "contradicted")
-    m[5].metric("Claims contradicted", n_con, border=True,
-                help=f"of {len(verdicts)} citing sentences checked")
+    TILES.append({"label": "Claims contradicted", "value": n_con, "filter": "bad_claims",
+                  "help": f"References with a contradicted claim, of {len(verdicts)} "
+                          f"citing sentences checked."})
 
 
 @st.dialog("Add a reference", width="large")
@@ -396,7 +401,7 @@ def workspace() -> None:
             st.markdown(explain.MATCHING_MD)
     act = viewer.render(doc, lrs, doc_id,
                         cards.by_ref(st.session_state.get("claim_verifications")),
-                        busy=jobs.busy())
+                        busy=jobs.busy(), tiles=TILES)
     if act:
         i = act["ref_index"]
         if act["action"] == "recheck" and 0 <= i < len(refs) and not jobs.busy():
