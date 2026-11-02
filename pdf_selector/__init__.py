@@ -47,6 +47,7 @@ def pdf_selector(
     status_labels: dict[str, str] | None = None,
     status_order: list[str] | None = None,
     cards_css: str = "",
+    tiles: list[dict[str, Any]] | None = None,
     key: str | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -75,6 +76,10 @@ def pdf_selector(
         ``{"i", "status", "page", "rect", "html", "text", "actions": [{"act",
         "label", "disabled"}]}``.  Server actions come back as
         ``{"kind": "action", "action", "ref_index", "id"}``.
+    tiles : list[dict] | None
+        Summary tiles shown above the list; clicking one filters it.  Each:
+        ``{"label", "value", "filter", "help"}`` where ``filter`` is "all", a
+        status key, "dead" or "bad_claims" (item flags of the same name).
     key : str | None
         Streamlit component key for state separation.
 
@@ -95,6 +100,7 @@ def pdf_selector(
         status_labels      = status_labels or {},
         status_order       = status_order or [],
         cards_css          = cards_css,
+        tiles              = tiles or [],
         default            = None,
         key                = key,
     )

@@ -42,7 +42,8 @@ _CARDS_CSS = (Path(__file__).parent / "style.css").read_text()
 
 
 def render(doc: Document, lookup_results: list | None, doc_id: str,
-           claims_by_ref: dict[int, list[dict]], busy: bool) -> dict | None:
+           claims_by_ref: dict[int, list[dict]], busy: bool,
+           tiles: list[dict] | None = None) -> dict | None:
     """The reference list + PDF, as one component.  Filtering, search, the
     page filter, opening cards, "Show in PDF" and PDF → card jumps run in
     the browser (no rerun).  Returns a server action
@@ -77,10 +78,14 @@ def render(doc: Document, lookup_results: list | None, doc_id: str,
             "html": cards.card_html(i, r, lr, mine),
             "text": " ".join(str(r.get(k) or "") for k in ("title", "authors", "venue", "raw")).lower(),
             "actions": actions,
+            # Extra filters behind the "Dead links" / "Claims contradicted" tiles.
+            "dead": ((lr or {}).get("url_verify") or {}).get("status") == "dead_link",
+            "bad_claims": any(v.get("verdict") == "contradicted" for v in mine),
         })
 
     event = pdf_selector(
-        pdf_bytes=doc.pdf, annotations=annots, height=900, items=items,
+        pdf_bytes=doc.pdf, annotations=annots, height=990 if tiles else 900, items=items,
+        tiles=tiles,
         status_labels=STATUS_LABEL, status_order=["mismatch", "missing", "match", "pending"],
         cards_css=_CARDS_CSS,
         key=f"pdf_{doc_id}",     # stable per document: remounting re-sends the PDF
