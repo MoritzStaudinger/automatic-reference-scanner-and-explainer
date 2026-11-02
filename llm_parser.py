@@ -282,6 +282,14 @@ def _surnames(authors: str) -> list[str]:
     return out
 
 
+def _same_text(a: str, b: str) -> bool:
+    """Equal up to case, spaces, hyphens and punctuation.  Such a change is
+    no repair — and it used to undo the parser's restored hyphens
+    ("few-shot" → "fewshot", copied from the line-broken raw text)."""
+    norm = lambda s: _re_lp.sub(r"[\W_]+", "", (s or "").lower())
+    return norm(a) == norm(b)
+
+
 def _grounded(field: str, value: str, raw: str, original: str) -> bool:
     from rapidfuzz import fuzz
     if not raw:
@@ -524,8 +532,9 @@ def parse_references_with_llm(
             raw = references[i].get("raw") or ""
             for field in ("title", "authors", "year", "venue", "doi", "url"):
                 val = (getattr(p, field, None) or "").strip()
-                if val and val != (references[i].get(field) or "") \
-                        and _grounded(field, val, raw, references[i].get(field) or ""):
+                orig = references[i].get(field) or ""
+                if val and not _same_text(val, orig) \
+                        and _grounded(field, val, raw, orig):
                     enhanced[i][field] = val
                     enhanced[i].setdefault("_llm_fields", []).append(field)
 

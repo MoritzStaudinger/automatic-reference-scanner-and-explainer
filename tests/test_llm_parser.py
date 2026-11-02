@@ -181,3 +181,13 @@ def test_shortened_author_list_is_rejected():
     assert llm_parser._grounded("authors", "A. One, B. Two, C. Three, D. Four", raw, "")
     assert llm_parser._grounded("url", "https://arxiv.org/abs/2311.12474",
                                 "Kusa. Csmed. arXiv preprint arXiv:2311.12474, 2023.", "")
+
+
+def test_hyphen_only_change_is_not_a_repair(monkeypatch):
+    raw = "Tom Brown and others. 2020. Language models are fewshot learners. NeurIPS."
+    monkeypatch.setattr(llm_parser, "_make_client", lambda backend=None: object())
+    monkeypatch.setattr(llm_parser, "_call_llm", lambda c, batch, b=None, m=None: [
+        llm_parser._ParsedRef(title="Language models are fewshot learners")])
+    out = llm_parser.parse_references_with_llm(
+        [{"raw": raw, "title": "Language models are few-shot learners"}], backend="anthropic")[0]
+    assert out["title"] == "Language models are few-shot learners"
