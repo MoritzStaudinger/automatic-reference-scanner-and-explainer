@@ -213,3 +213,28 @@ def test_fulltext_method_still_selectable(monkeypatch):
                         lambda claims, ft, idx: seen.append(len(claims)) or [])
     claim_verifier.verify_batch([_claim("x [4].")], _ft())
     assert seen == [1]
+
+
+def test_retry_answers_are_renumbered_and_merged():
+    sp = lambda i, t: evidence.ScoredPassage(evidence.Passage(i, t, "s"), 1.0)
+    shown = [sp(0, "first"), sp(1, "second")]
+    more = [sp(5, "third"), sp(6, "fourth")]
+    parsed = {"claims": [{"verdict": "supported", "passage_ids": ["P1"]},
+                         {"verdict": "not_addressed", "passage_ids": []}]}
+    p2 = {"claims": [{"verdict": "contradicted", "passage_ids": ["P2"]}]}
+    merged, all_shown = claim_verifier._merge_retry(parsed, shown, p2, more, [1])
+    assert merged["claims"][0]["passage_ids"] == ["P1"]
+    assert merged["claims"][1] == {"verdict": "contradicted", "passage_ids": ["P4"]}
+    assert all_shown[3].passage.text == "fourth"
+
+
+def test_default_embedder_falls_back_to_bm25_without_fastembed(monkeypatch):
+    monkeypatch.delenv("ARSE_EMBEDDER", raising=False)
+    monkeypatch.setattr(evidence, "_loaded", {})
+    monkeypatch.setattr(evidence, "_failed", {})
+
+    def boom():
+        raise ImportError("No module named 'fastembed'")
+    monkeypatch.setitem(evidence._EMBEDDERS, "bge-small", boom)
+    assert evidence.get_embedder() is None
+    assert "bge-small" in evidence.embedder_status()

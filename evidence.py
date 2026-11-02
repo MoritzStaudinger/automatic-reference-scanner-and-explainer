@@ -10,7 +10,8 @@ cites is a real passage of the paper.
     passages = segment(fulltext)                 # section-tagged, refs dropped
     hits     = retrieve(claim, passages, key=…)  # BM25 ⊕ dense, fused by rank
 
-Dense embedders are optional and pluggable (``ARSE_EMBEDDER``):
+Dense embedders are optional and pluggable (``ARSE_EMBEDDER``, default
+bge-small):
 
     specter2   allenai/specter2 with the ad-hoc query / proximity adapters
     scincl     malteos/scincl
@@ -310,15 +311,36 @@ class BgeSmallEmbedder:
 
     def __init__(self):
         from fastembed import TextEmbedding
-        self.model = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=_model_dir())
+        # A few ONNX threads; encoding is serialised (see _encode_lock), so
+        # this bounds both CPU and memory per process.
+        self.model = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=_model_dir(),
+                                   threads=int(os.getenv("ARSE_EMBED_THREADS", "2")))
 
     def encode(self, texts, kind):
         import numpy as np
-        fn = self.model.query_embed if kind == "query" else self.model.passage_embed
-        vecs = np.array(list(fn(texts)), dtype="float32")
+        # Small batches: fastembed's default of 256 passages × 512 tokens
+        # needs ~3 GB for the attention matrices alone and got the 4 GB
+        # container OOM-killed.  16 keeps the peak in the low hundreds of MB.
+        if kind == "query":
+            vecs = np.array(list(self.model.query_embed(texts)), dtype="float32")
+        else:
+            vecs = np.array(list(self.model.passage_embed(
+                texts, batch_size=int(os.getenv("ARSE_EMBED_BATCH", "16")))), dtype="float32")
         if len(vecs):
             vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
         return vecs
+
+
+# One encode at a time per process: the claim check verifies references in
+# parallel threads, and concurrent model runs each allocate their own
+# activations — enough to exceed the 4 GB container limit on a paper with
+# many open-access citations.
+_encode_lock = threading.Lock()
+
+
+def _encode(embedder: "Embedder", texts: list[str], kind: str):
+    with _encode_lock:
+        return embedder.encode(texts, kind)
 
 
 _EMBEDDERS = {"specter2": Specter2Embedder, "scincl": SciNCLEmbedder, "bge-small": BgeSmallEmbedder}
@@ -330,7 +352,10 @@ _load_lock = threading.Lock()
 def get_embedder(name: Optional[str] = None) -> Optional[Embedder]:
     """The configured embedder, loaded once per process; None for BM25 only
     (``none``, unknown name, or packages / model files unavailable)."""
-    name = (name or os.getenv("ARSE_EMBEDDER") or "none").strip().lower()
+    # bge-small: on the citation-integrity corpus it matched SPECTER2 and
+    # beat SciNCL (recall@8 0.70 vs 0.69 / 0.67, BM25 alone 0.62) and needs
+    # no PyTorch.  Without fastembed installed this falls back to BM25.
+    name = (name or os.getenv("ARSE_EMBEDDER") or "bge-small").strip().lower()
     if name in ("", "none", "bm25") or name not in _EMBEDDERS:
         return None
     with _load_lock:
@@ -374,7 +399,7 @@ def passage_vectors(passages: Sequence[Passage], embedder: Embedder):
     if hit:
         arr = np.frombuffer(base64.b64decode(hit["v"]), dtype="float16").astype("float32")
         return arr.reshape(hit["n"], -1)
-    vecs = np.asarray(embedder.encode([p.text for p in passages], "passage"), dtype="float32")
+    vecs = np.asarray(_encode(embedder, [p.text for p in passages], "passage"), dtype="float32")
     try:
         from cache import get_cache
         get_cache().set("passage_emb", key, {
@@ -413,7 +438,7 @@ def retrieve(query: str, passages: Sequence[Passage], k: int = 8,
         try:
             import numpy as np
             pv = passage_vectors(passages, embedder)
-            qv = np.asarray(embedder.encode([query], "query"), dtype="float32")[0]
+            qv = np.asarray(_encode(embedder, [query], "query"), dtype="float32")[0]
             dense = _ranks(list(pv @ qv), positive_only=False)
         except Exception as exc:
             import sys

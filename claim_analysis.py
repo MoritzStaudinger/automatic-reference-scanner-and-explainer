@@ -120,6 +120,10 @@ Return a JSON array, one object per item, same order:
   as one standalone statement about that work ("The cited work shows
   that …").  Leave out what the sentence says about other citations or
   the citing authors' own work.  Keep numbers, datasets and names exactly.
+  If the sentence enumerates several works (models, datasets, tools,
+  methods) each with its own citation, the claim about this work is only
+  the item next to its marker: "We evaluate Mistral-7B [3], GPT-4 [5] and
+  Gemma [8]" → for [5]: "The cited work introduces GPT-4." (intent method).
 - subclaims: 1-3 atomic statements ABOUT THE CITED WORK that together make
   up cited_claim and can be checked against its text.  Never about what
   the citing authors do: for "We use the X dataset [4]" the subclaim is
@@ -132,7 +136,11 @@ Return a JSON array, one object per item, same order:
                  model, dataset, metric or tool from the cited work;
     "background" a general pointer to related work (examples, lists,
                  surveys) without a specific claim.
-Use only the sentence; do not add facts about the work from memory.
+Use only the sentence.  The cited title only tells you which work the
+marker refers to: never rewrite the claim to fit the title, and never add
+facts about the work from memory.  If the sentence attributes something to
+the work that its title doesn't suggest, keep what the sentence says —
+that mismatch is exactly what is being checked.
 Return ONLY the JSON array.
 """
 
@@ -206,7 +214,7 @@ def analyse(claims: list[Claim], refs: list[dict[str, Any]],
                                "cited_title": title_of(claims[i])} for i in chunk],
                              ensure_ascii=False)
         parsed: Optional[list] = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 text = _call_llm(client, backend, model, _SYSTEM_PROMPT, payload,
                                  n_claims=len(chunk))
@@ -215,7 +223,13 @@ def analyse(claims: list[Claim], refs: list[dict[str, Any]],
                     break
             except Exception as exc:
                 mark_down(backend, exc)
-                break
+                # Same opt-in backup as LLM repair and the verdict step.
+                fb = fallback_backend(backend)
+                fb_client = _make_client(fb) if fb else None
+                if fb_client is None:
+                    break
+                client, backend = fb_client, fb
+                model = os.getenv("LLM_FALLBACK_MODEL") or _DEFAULT_MODELS.get(fb, model)
         if not parsed:
             continue                       # keep the heuristic results
         for i, item in zip(chunk, parsed):

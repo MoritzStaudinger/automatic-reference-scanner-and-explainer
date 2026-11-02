@@ -46,7 +46,7 @@ services:
     build:
       context: .
       args:
-        ARSE_EMBED: ${ARSE_EMBED:-none}
+        ARSE_EMBED: ${ARSE_EMBED:-small}
     image: arse:latest
     container_name: arse-app
     restart: unless-stopped
@@ -77,7 +77,7 @@ services:
     build:
       context: .
       args:
-        ARSE_EMBED: ${ARSE_EMBED:-none}
+        ARSE_EMBED: ${ARSE_EMBED:-small}
     image: arse:latest
     container_name: arse-api
     restart: unless-stopped

@@ -527,13 +527,24 @@ one or more CLAIMS about it, plus the citation INTENT:
                supported if the passages show the paper introduces or
                describes that method / model / dataset / tool.
   background — a pointer to related work: supported if the paper is
-               clearly about the topic the claim names.
+               clearly about the topic the claim names, even when the
+               passages don't state the claim's details (the citation
+               points the reader to relevant work, it doesn't attribute a
+               finding); not_addressed only if the paper is about
+               something else.
 
 For each claim pick:
-  supported     — the passages say it (or plainly imply it);
+  supported     — the passages state it, or it is a faithful paraphrase or
+                  summary of what they state (citing authors condense and
+                  reword; that is fine as long as the meaning is kept);
   contradicted  — the passages say something incompatible with it;
-  ambiguous     — partial support, or only under conditions the claim omits;
+  ambiguous     — the passages support it only in a weaker form: a
+                  stronger effect, broader scope, missing condition or
+                  different population than the claim states;
   not_addressed — the passages don't contain the information.
+Don't demand the claim's exact wording; do check numbers, direction of
+effects, populations (e.g. humans vs mice) and causal vs correlational
+language.
 
 Passages marked [cites other work] attribute statements to OTHER papers
 (they contain citations).  For a result claim they are not the cited
@@ -644,6 +655,34 @@ def _ask(client, backend, model, cc, shown) -> Optional[dict]:
     return None
 
 
+def _sub_verdict(parsed: dict, i: int) -> str:
+    items = parsed.get("claims") or []
+    return (str(items[i].get("verdict", "")).strip().lower()
+            if i < len(items) and isinstance(items[i], dict) else "")
+
+
+def _merge_retry(parsed: dict, shown: list, p2: dict, more: list, missing: list[int]):
+    """Fold a second-round answer for the ``missing`` sub-claims into the
+    first one.  Passage ids of the second round are renumbered to follow
+    the first round's, so every id still maps to exactly one passage."""
+    offset = len(shown)
+    shown = shown + more
+    claims = [dict(c) if isinstance(c, dict) else {} for c in (parsed.get("claims") or [])]
+    while len(claims) < max(missing) + 1:
+        claims.append({})
+    for j, i in enumerate(missing):
+        item = (p2.get("claims") or [{}])[j] if j < len(p2.get("claims") or []) else {}
+        if not isinstance(item, dict) or str(item.get("verdict", "")).lower() in ("", "not_addressed"):
+            continue
+        ids = []
+        for x in item.get("passage_ids") or []:
+            m = re.match(r"P?(\d+)$", str(x).strip(), re.I)
+            if m:
+                ids.append(f"P{int(m.group(1)) + offset}")
+        claims[i] = {**item, "passage_ids": ids}
+    return {**parsed, "claims": claims}, shown
+
+
 def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
                          client, backend: str, model: str, claim_index: int) -> ClaimVerification:
     base = dict(claim_index=claim_index, cited_ref_index=claim.cited_ref_index,
@@ -651,6 +690,12 @@ def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
                 is_abstract_fallback=ft.is_abstract_fallback,
                 cited_claim=cc.cited_claim, intent=cc.intent)
     subclaims = cc.subclaims or [cc.cited_claim]
+    if cc.intent == "background":
+        # A pointer to related work only needs the cited paper to be on the
+        # topic; judging the sentence's details would demand more than the
+        # citation claims.
+        subclaims = [f"The cited work addresses this topic: {cc.cited_claim}"]
+        cc = type(cc)(cc.cited_claim, subclaims, cc.intent, cc.source)
     shown = _gather(subclaims, passages, embedder, skip=0)
 
     def ev(sps):
@@ -675,17 +720,18 @@ def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
                                              "explanation": ""} for t in subclaims])
     try:
         parsed = _ask(client, backend, model, cc, shown)
-        # Nothing found in the first passages of a full text: look further
-        # once before concluding "not addressed".
-        if (parsed and not ft.is_abstract_fallback
-                and all(str(c.get("verdict", "")).lower() == "not_addressed"
-                        for c in parsed["claims"][:len(subclaims)] if isinstance(c, dict))):
-            more = _gather(subclaims, passages, embedder, skip=_K_PER_SUBCLAIM)
-            if more:
-                p2 = _ask(client, backend, model, cc, more)
-                if p2 and any(str(c.get("verdict", "")).lower() != "not_addressed"
-                              for c in p2["claims"] if isinstance(c, dict)):
-                    parsed, shown = p2, more
+        # Sub-claims not found in the first passages of a full text: search
+        # further once for those, before concluding "not addressed".
+        if parsed and not ft.is_abstract_fallback:
+            missing = [i for i in range(len(subclaims))
+                       if _sub_verdict(parsed, i) in ("not_addressed", "")]
+            if missing:
+                sub_cc = type(cc)(cc.cited_claim, [subclaims[i] for i in missing],
+                                  cc.intent, cc.source)
+                more = _gather(sub_cc.subclaims, passages, embedder, skip=_K_PER_SUBCLAIM)
+                p2 = _ask(client, backend, model, sub_cc, more) if more else None
+                if p2:
+                    parsed, shown = _merge_retry(parsed, shown, p2, more, missing)
     except Exception as exc:
         return ClaimVerification(**base, verdict="error", evidence_passage="", confidence="low",
                                  explanation="", model=model, error=f"{type(exc).__name__}: {exc}"[:200],

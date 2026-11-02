@@ -17,9 +17,9 @@ COPY requirements.txt requirements-embed.txt requirements-embed-scientific.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Optional embedders for the citation-context evidence retrieval:
-#   ARSE_EMBED=none (default, BM25 only) | small (bge-small, ONNX) |
+#   ARSE_EMBED=small (default, bge-small via ONNX) | none (BM25 only) |
 #   scientific (SPECTER2 + SciNCL, PyTorch CPU, ~1-1.5 GB larger image)
-ARG ARSE_EMBED=none
+ARG ARSE_EMBED=small
 RUN if [ "$ARSE_EMBED" = "small" ] || [ "$ARSE_EMBED" = "scientific" ]; then \
         pip install --no-cache-dir -r requirements-embed.txt; fi \
  && if [ "$ARSE_EMBED" = "scientific" ]; then \
