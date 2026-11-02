@@ -52,10 +52,22 @@ def _landing() -> None:
             "and matching has limits.", icon=":material/person_search:")
 
 
+def _on_upload_change() -> None:
+    """Runs only when the user changes the uploader: a new file, or the ×.
+    Not when Streamlit resets the widget after a visit to another page —
+    so the current paper (and its results) survive API / About visits."""
+    f = st.session_state.get("pdf_upload")
+    if f is None:
+        st.session_state.pop("current_pdf", None)
+    else:
+        st.session_state.current_pdf = {"name": f.name, "bytes": f.getvalue()}
+
+
 up_col, opt_col = st.columns([5, 1], vertical_alignment="center")
 with up_col:
     uploaded = st.file_uploader("Paper (PDF, up to 25 MB)", type=["pdf"],
-                                label_visibility="collapsed")
+                                label_visibility="collapsed", key="pdf_upload",
+                                on_change=_on_upload_change)
 with opt_col:
     with st.popover("Options", icon=":material/tune:", width="stretch"):
         options = parser_options()
@@ -87,7 +99,17 @@ with opt_col:
 # landing page the moment the upload run starts.
 slot = st.empty()
 
-if uploaded is None:
+current = st.session_state.get("current_pdf")
+if uploaded is not None:
+    pdf_name, pdf_bytes = uploaded.name, uploaded.getvalue()
+    st.session_state.current_pdf = {"name": pdf_name, "bytes": pdf_bytes}
+elif current:
+    # Back from another page: the uploader was reset, the paper wasn't.
+    pdf_name, pdf_bytes = current["name"], current["bytes"]
+    with up_col:
+        st.caption(f":material/description: Showing **{pdf_name}** — upload another "
+                   f"PDF to replace it.")
+else:
     st.session_state.pop("doc_id", None)
     # A single child inside the slot: the first notice written after an
     # upload (the processing status) then replaces all of it at once.
@@ -95,7 +117,6 @@ if uploaded is None:
         _landing()
     st.stop()
 
-pdf_bytes = uploaded.getvalue()
 doc_id = state.file_hash(pdf_bytes)
 state.bind_document(doc_id)
 
@@ -306,9 +327,9 @@ with st.container(horizontal=True, gap="small"):
 
     if lookup_results is not None:
         from report import generate_report
-        report_md = generate_report(refs, lookup_results, pdf_name=uploaded.name,
+        report_md = generate_report(refs, lookup_results, pdf_name=pdf_name,
                                     parser=parser, claim_verifications=verdicts)
-        stem = uploaded.name.rsplit(".", 1)[0]
+        stem = pdf_name.rsplit(".", 1)[0]
         with st.popover("Export", icon=":material/download:"):
             st.download_button("Report (Markdown)", report_md, f"{stem}_references.md",
                                "text/markdown", icon=":material/description:", width="stretch")
@@ -337,7 +358,7 @@ with st.container(horizontal=True, gap="small"):
                                "text/csv", icon=":material/table:", width="stretch")
             st.download_button(
                 "Full results (JSON)",
-                json.dumps({"file": uploaded.name, "parser": parser, "references": rows,
+                json.dumps({"file": pdf_name, "parser": parser, "references": rows,
                             "lookups": lookup_results, "claims": verdicts}, default=str),
                 f"{stem}_references.json", "application/json",
                 icon=":material/data_object:", width="stretch")

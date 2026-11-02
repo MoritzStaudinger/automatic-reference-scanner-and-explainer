@@ -1155,6 +1155,42 @@ def _repair_from_raw(ref: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _line_break_hyphen_fixer(doc_text: str):
+    """Restore real hyphens that a line break made ambiguous.
+
+    "few-⏎shot" in a PDF is either a hyphenated word ("evalu-⏎ation") or a
+    compound broken at its hyphen ("few-shot").  Parsers (GROBID too) join
+    both, and "Language models are fewshot learners" then matches nothing
+    in the indexes.  The document decides: if the joined form never occurs
+    elsewhere in it but the second part does as a word, the hyphen was real."""
+    breaks = {(m.group(1), m.group(2))
+              for m in re.finditer(r"\b([A-Za-z]{2,})-[ \t]*\n\s*([a-z]{2,})\b", doc_text)}
+    if not breaks:
+        return lambda s: s
+    clean = re.sub(r"[A-Za-z]+-[ \t]*\n\s*[A-Za-z]+", " ", doc_text)
+    from collections import Counter
+    tokens = Counter(re.findall(r"[a-z]+", clean.lower()))
+    compounds: dict[str, int] = {}
+    for a, b in breaks:
+        joined = (a + b).lower()
+        # The second part is the telling one: hyphenation leaves fragments
+        # ("-ation", "-hoods", "-cessing") that never stand alone, while a
+        # compound's second word ("shot", "training", "based") does.
+        # Lowercase only (names such as "Bren-⏎nan" stay joined), and a
+        # second part of 4+ letters ("lever-⏎age" is hyphenation).
+        if a[0].islower() and not tokens[joined] and len(b) >= 4 and tokens[b.lower()]:
+            compounds[joined] = len(a)
+    if not compounds:
+        return lambda s: s
+    rx = re.compile(r"\b(" + "|".join(map(re.escape, sorted(compounds, key=len, reverse=True)))
+                    + r")\b", re.I)
+
+    def fix(s: str) -> str:
+        return rx.sub(lambda m: m.group(0)[:compounds[m.group(0).lower()]] + "-"
+                      + m.group(0)[compounds[m.group(0).lower()]:], s)
+    return fix
+
+
 def _better_title(primary: str, secondary: str) -> str:
     """The citation-list title when it fixes a typical full-document error:
     the venue glued on ("Title. Advances in Neural …") or a leading
@@ -1212,6 +1248,13 @@ def extract_references_hybrid(
             section_refs = []
     merged = _merge_ref_lists(grobid_refs, section_refs)
     merged = [_repair_from_raw(r) for r in merged if _is_plausible_reference(r)]
+    try:
+        fix = _line_break_hyphen_fixer(_plain_text(pdf_path))
+        # Titles only: they drive the lookups.  Raw text stays as printed
+        # (highlighting and the author repair compare against the PDF).
+        merged = [{**r, "title": fix(r["title"])} if r.get("title") else r for r in merged]
+    except Exception:
+        pass
     if errors and not merged:
         # Both halves need GROBID; silently returning [] used to show
         # "no references found" when the real problem was GROBID.
