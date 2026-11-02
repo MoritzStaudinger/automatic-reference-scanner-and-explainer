@@ -76,7 +76,14 @@ new_vol="${project}_arse-data"
 if docker volume inspect "$old_vol" >/dev/null 2>&1 \
         && ! docker volume inspect "$new_vol" >/dev/null 2>&1; then
     echo "== migrating data volume $old_vol -> $new_vol"
-    docker compose stop ares ares-api 2>/dev/null || true
+    # The old services no longer exist in the compose file, so stop their
+    # containers by label — otherwise the app keeps writing the SQLite
+    # cache while it is being copied.
+    old=$(docker ps -q --filter "label=com.docker.compose.project=$project" \
+              --filter "label=com.docker.compose.service=ares"; \
+          docker ps -q --filter "label=com.docker.compose.project=$project" \
+              --filter "label=com.docker.compose.service=ares-api")
+    [[ -n "$old" ]] && docker stop $old >/dev/null
     docker volume create "$new_vol" >/dev/null
     docker run --rm -v "$old_vol":/from:ro -v "$new_vol":/to alpine \
         sh -c 'cp -a /from/. /to/'
