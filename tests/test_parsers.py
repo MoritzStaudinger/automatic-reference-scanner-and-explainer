@@ -248,3 +248,16 @@ def test_org_author_and_appended_publisher():
            "raw": "[28] International Organization for Standardization (ISO). Information and "
                   "documentation - Guidelines for bibliographic references, June 2010."}
     assert _repair_from_raw(iso)["authors"] == "International Organization for Standardization (ISO)"
+
+
+def test_line_break_hyphens_use_document_evidence():
+    from parsers import _line_break_hyphen_fixer
+    doc = ("We compare zero-shot and few-shot prompting on many tasks.\n"
+           "Tom Brown and others. 2020. Language models are few-\nshot learners.\n"
+           "An evaluation of the method. Good evalu-\nation matters.\n"
+           "Crossroads, buildings and neighbor-\nhoods: a dataset.\n")
+    fix = _line_break_hyphen_fixer(doc)
+    assert fix("Language models are fewshot learners") == "Language models are few-shot learners"
+    assert fix("Good evaluation matters") == "Good evaluation matters"      # joined form occurs
+    assert fix("Crossroads, buildings and neighborhoods") == \
+        "Crossroads, buildings and neighborhoods"                          # "hoods" never alone
