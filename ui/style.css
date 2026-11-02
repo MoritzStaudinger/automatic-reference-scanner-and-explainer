@@ -62,6 +62,9 @@
                       font-style: italic; color: var(--muted-fg); }
 .refcard .claims li { margin-bottom: .6rem; }
 .refcard .claim { margin-top: .2rem; }
+.refcard .cited { margin: .3rem 0 .1rem; font-size: .85rem; }
+.refcard .subclaims { margin: .2rem 0 .2rem 1rem; padding: 0; font-size: .85rem; }
+.refcard .subclaims li { margin-bottom: .15rem; }
 
 .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%;
        margin-right: .4rem; background: var(--muted-fg); vertical-align: 1px; }

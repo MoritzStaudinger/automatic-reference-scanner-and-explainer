@@ -13,8 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps first so source edits don't bust the layer cache
-COPY requirements.txt .
+COPY requirements.txt requirements-embed.txt requirements-embed-scientific.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Optional embedders for the citation-context evidence retrieval:
+#   ARSE_EMBED=none (default, BM25 only) | small (bge-small, ONNX) |
+#   scientific (SPECTER2 + SciNCL, PyTorch CPU, ~1-1.5 GB larger image)
+ARG ARSE_EMBED=none
+RUN if [ "$ARSE_EMBED" = "small" ] || [ "$ARSE_EMBED" = "scientific" ]; then \
+        pip install --no-cache-dir -r requirements-embed.txt; fi \
+ && if [ "$ARSE_EMBED" = "scientific" ]; then \
+        pip install --no-cache-dir -r requirements-embed-scientific.txt; fi
 
 # Source — .dockerignore excludes data/, benchmark/, .env, .git, etc.
 COPY . .
@@ -26,6 +35,8 @@ USER arse
 
 ENV PYTHONUNBUFFERED=1 \
     ARES_CACHE=/app/data/cache.sqlite \
+    ARSE_MODEL_DIR=/app/data/models \
+    HF_HOME=/app/data/models \
     GROBID_URL=http://grobid:8070
 
 EXPOSE 8501

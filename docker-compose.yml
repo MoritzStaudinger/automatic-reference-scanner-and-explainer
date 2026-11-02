@@ -43,7 +43,10 @@ services:
       start_period: 240s
 
   arse:
-    build: .
+    build:
+      context: .
+      args:
+        ARSE_EMBED: ${ARSE_EMBED:-none}
     image: arse:latest
     container_name: arse-app
     restart: unless-stopped
@@ -71,7 +74,10 @@ services:
   # uvicorn entry point.  Shares the cache volume with the UI.  Without
   # ARES_API_KEY or a keys file it answers 503 to everything but /healthz.
   arse-api:
-    build: .
+    build:
+      context: .
+      args:
+        ARSE_EMBED: ${ARSE_EMBED:-none}
     image: arse:latest
     container_name: arse-api
     restart: unless-stopped

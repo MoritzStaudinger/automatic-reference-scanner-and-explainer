@@ -1,0 +1,5 @@
+# PyTorch CPU build + Hugging Face stack for SPECTER2 / SciNCL (evidence.py).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.3
+transformers>=4.44
+adapters>=1.0

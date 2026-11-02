@@ -125,6 +125,13 @@ class ClaimVerificationReport:
     citation_marker:      str          # the raw marker as it appears in text
     style:                str          # numeric | paren | narrative
     error:                str = ""     # why the check failed (verdict == "error")
+    # Passage-based method: what the sentence attributes to the reference,
+    # its sub-claims with their own verdicts, and the passages relied on.
+    cited_claim:          str = ""
+    intent:               str = ""     # result | method | background
+    subclaims:            list = field(default_factory=list)
+    evidence:             list = field(default_factory=list)
+    mode:                 str = ""     # fulltext | passages | evidence_only
 
 
 @dataclass
@@ -151,6 +158,8 @@ class PipelineReport:
     n_contradicted:     int = 0
     n_not_addressed:    int = 0
     n_ambiguous:        int = 0
+    n_partially_supported: int = 0
+    n_evidence_only:    int = 0        # no LLM: passages shown, no verdict
     n_verify_errors:    int = 0
     n_verify_no_source: int = 0        # claims we couldn't verify (no full text and no abstract)
     claim_verifications: list["ClaimVerificationReport"] = field(default_factory=list)
@@ -178,6 +187,8 @@ class PipelineReport:
                 "n_contradicted":     self.n_contradicted,
                 "n_not_addressed":    self.n_not_addressed,
                 "n_ambiguous":        self.n_ambiguous,
+                "n_partially_supported": self.n_partially_supported,
+                "n_evidence_only":    self.n_evidence_only,
                 "n_verify_errors":    self.n_verify_errors,
                 "n_verify_no_source": self.n_verify_no_source,
             }
@@ -381,6 +392,8 @@ def process_pdf(
         n_contradicted     = counts["n_contradicted"],
         n_not_addressed    = counts["n_not_addressed"],
         n_ambiguous        = counts["n_ambiguous"],
+        n_partially_supported = counts["n_partially_supported"],
+        n_evidence_only    = counts["n_evidence_only"],
         n_verify_errors    = counts["n_verify_errors"],
         n_verify_no_source = counts["n_verify_no_source"],
         claim_verifications = claim_verdicts,
@@ -398,12 +411,15 @@ def _count_verdicts(verdicts: list["ClaimVerificationReport"]) -> dict[str, int]
         "n_contradicted":     0,
         "n_not_addressed":    0,
         "n_ambiguous":        0,
+        "n_partially_supported": 0,
+        "n_evidence_only":    0,
         "n_verify_errors":    0,
         "n_verify_no_source": 0,
     }
     for v in verdicts:
-        k = "n_" + v.verdict if v.verdict in ("supported", "contradicted",
-                                              "not_addressed", "ambiguous") else None
+        k = "n_" + v.verdict if v.verdict in ("supported", "contradicted", "not_addressed",
+                                              "ambiguous", "partially_supported",
+                                              "evidence_only") else None
         if k:
             out[k] += 1
         elif v.verdict == "error":
@@ -491,6 +507,13 @@ def _verify_claims_stage(
         if not claims:
             return []
 
+    # What each sentence attributes to its reference, sub-claims, intent —
+    # one batched LLM call (heuristic without an LLM).  Only the
+    # passage-based method uses it.
+    from claim_verifier import claim_method
+    from claim_analysis import analyse
+    cited_all = (analyse(claims, refs) if claim_method() != "fulltext" else [None] * len(claims))
+
     # Group claims by cited_ref_index so each ref's fetch happens once
     # and each ref's LLM call gets ALL its citing sentences.
     from collections import defaultdict
@@ -524,6 +547,7 @@ def _verify_claims_stage(
         ft           = fulltexts.get(ref_idx)
         pipeline_ixs = [e[0] for e in entries]
         raw_claims   = [e[1] for e in entries]
+        cited        = [cited_all[i] for i in pipeline_ixs]
 
         if ft is None:
             out = []
@@ -544,7 +568,8 @@ def _verify_claims_stage(
                 )))
             return out
 
-        raw_verdicts = verify_batch(raw_claims, ft, pipeline_ixs)
+        raw_verdicts = verify_batch(raw_claims, ft, pipeline_ixs,
+                                    cited=cited if cited and cited[0] is not None else None)
         out = []
         for c, raw in zip(raw_claims, raw_verdicts):
             out.append((raw.claim_index, ClaimVerificationReport(
@@ -561,6 +586,11 @@ def _verify_claims_stage(
                 citation_marker      = c.citation_marker,
                 style                = c.style,
                 error                = raw.error or "",
+                cited_claim          = raw.cited_claim,
+                intent               = raw.intent,
+                subclaims            = raw.subclaims,
+                evidence             = raw.evidence,
+                mode                 = raw.mode,
             )))
         return out
 
