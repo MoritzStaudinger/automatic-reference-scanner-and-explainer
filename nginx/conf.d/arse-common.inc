@@ -59,6 +59,15 @@ location / {
     # Streamlit's live UI runs over a WebSocket (/_stcore/stream).
     proxy_set_header Upgrade    $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
+    # Any proxy_set_header here drops ALL inherited ones, so the headers
+    # above (server level) must be repeated.  Without Host, Streamlit saw
+    # "arse:8501", which doesn't match the browser's Origin, and rejected
+    # every WebSocket with 403 — the page never loaded.  (Locally the
+    # origin was localhost, which Streamlit always allows.)
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
     # Idle WebSocket timeout.  Long lookups keep sending progress, but a
     # quiet tab shouldn't be dropped after 60 s.
     proxy_read_timeout 600s;

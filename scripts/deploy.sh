@@ -126,6 +126,16 @@ for host in "${HOSTS[@]}"; do
     [[ "$code" == 200 ]] && green "✓ $host: UI responds (200)" || fail "$host: UI returned $code"
     code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "$host:443:127.0.0.1" "https://$host/api-health" || true)
     [[ "$code" == 200 ]] && green "✓ $host: API health (200)" || fail "$host: /api-health returned $code"
+    # The page itself loads even when Streamlit's WebSocket is refused
+    # (it then spins forever), so check the WebSocket handshake as a
+    # browser on this hostname would send it.  -k: TLS is checked above.
+    code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' --max-time 5 \
+             -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+             -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+             -H "Origin: https://$host" \
+             --resolve "$host:443:127.0.0.1" "https://$host/_stcore/stream" || true)
+    [[ "$code" == 101 ]] && green "✓ $host: app WebSocket (101)" \
+        || fail "$host: WebSocket /_stcore/stream returned $code (page would never finish loading)"
 done
 
 if (( FAILED )); then
