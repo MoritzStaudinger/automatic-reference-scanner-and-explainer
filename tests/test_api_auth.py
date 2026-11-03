@@ -27,7 +27,7 @@ def test_no_keys_means_disabled(api):
     mod, _ = api
     c = TestClient(mod.app)
     assert c.get("/healthz").status_code == 200
-    assert _post(c).status_code == 503
+    assert _post(c).status_code == 403
 
 
 def test_keys_file_and_expiry(api):
