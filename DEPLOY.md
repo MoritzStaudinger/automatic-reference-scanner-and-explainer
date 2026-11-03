@@ -93,7 +93,7 @@ done
 
 ## API keys
 
-The HTTP API refuses all requests (503) until at least one key exists.
+The HTTP API refuses all requests (403) until at least one key exists.
 `/healthz` is the only exception.
 
 ```bash

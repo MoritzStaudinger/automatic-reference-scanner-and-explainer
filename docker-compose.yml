@@ -72,7 +72,7 @@ services:
 
   # Headless HTTP API (api.py) for programmatic / batch use.  Same image,
   # uvicorn entry point.  Shares the cache volume with the UI.  Without
-  # ARSE_API_KEY or a keys file it answers 503 to everything but /healthz.
+  # ARSE_API_KEY or a keys file it answers 403 to everything but /healthz.
   arse-api:
     build:
       context: .

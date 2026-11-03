@@ -96,7 +96,7 @@ _KEYS_FILE      = Path(os.getenv(
     Path(__file__).resolve().parent / "data" / "api_keys.json",
 ))
 _BATCH_WORKERS  = max(1, int(os.getenv("ARSE_API_WORKERS", "2")))
-# Without any key configured the API refuses requests (503) — the public
+# Without any key configured the API refuses requests (403) — the public
 # deployment must never run it open by accident.  Local dev opts in.
 _ALLOW_OPEN     = os.getenv("ARSE_API_ALLOW_UNAUTHENTICATED", "") == "1"
 # Synchronous /process requests running at once; extra callers get 503.
@@ -217,15 +217,16 @@ def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
          optional expiry)
 
     When neither the env var nor the file has any keys, the API refuses
-    every request with 503 — unless ARSE_API_ALLOW_UNAUTHENTICATED=1
+    every request with 403 — unless ARSE_API_ALLOW_UNAUTHENTICATED=1
     (local development only).  Keys are compared in constant time.
     """
     keys = _load_api_keys()
     if not _API_KEY and not keys:
         if _ALLOW_OPEN:
             return
-        raise HTTPException(status_code=503,
-                            detail="API access is not configured on this server")
+        raise HTTPException(status_code=403,
+                            detail="API access is not enabled on this server; "
+                                   "request a key from the site operator")
     if not x_api_key:
         raise HTTPException(status_code=401,
                             detail="invalid or missing X-API-Key")
