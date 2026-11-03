@@ -19,6 +19,11 @@ Usage:
 
 from __future__ import annotations
 
+import os as _os
+for _k, _v in list(_os.environ.items()):   # old ARES_* settings
+    if _k.startswith("ARES_"):
+        _os.environ.setdefault("ARSE_" + _k[5:], _v)
+
 import argparse
 import importlib
 import json
@@ -226,13 +231,13 @@ def test_pipeline_local(pdf_path: Path) -> dict | None:
 
 def test_api(pdf_path: Path) -> None:
     section("HTTP API (FastAPI TestClient)")
-    os.environ["ARES_API_KEY"] = "smoke-test-key"
-    os.environ["ARES_JOBS_DB"] = str(
+    os.environ["ARSE_API_KEY"] = "smoke-test-key"
+    os.environ["ARSE_JOBS_DB"] = str(
         Path(tempfile.gettempdir()) / "ares_smoke_jobs.sqlite"
     )
     # Drop any stale DB so the recent-jobs assertion isn't muddied
     try:
-        Path(os.environ["ARES_JOBS_DB"]).unlink()
+        Path(os.environ["ARSE_JOBS_DB"]).unlink()
     except FileNotFoundError:
         pass
 

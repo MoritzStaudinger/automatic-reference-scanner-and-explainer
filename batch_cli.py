@@ -13,7 +13,7 @@ Remote — POST PDFs to a running ARSE API and collect results.  Best when
 the API runs on a separate machine (e.g. the institutional VM).
 
     python batch_cli.py <input_dir> <output_dir> --remote https://host/api/v1
-                       --api-key $ARES_API_KEY
+                       --api-key $ARSE_API_KEY
 
 Output: one ``<stem>.json`` per input PDF in the output directory, plus
 a ``summary.csv`` rolling everything up (n_match / n_mismatch / n_missing
@@ -21,6 +21,8 @@ per paper).
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 
 import argparse
 import csv
@@ -64,7 +66,7 @@ def _process_remote(
             headers=headers,
             files={"file": (pdf_path.name, f, "application/pdf")},
             # `1`/`0` mirrors the env-var convention used elsewhere in the
-            # project (ARES_PDF_SELECTOR=1, etc.).  FastAPI/Pydantic
+            # project (ARSE_PDF_SELECTOR=1, etc.).  FastAPI/Pydantic
             # accepts 1, 0, true, false, yes, no, on, off as boolean form
             # values — either spelling works, but staying consistent with
             # the shell-flag convention keeps the wire format predictable.
@@ -99,8 +101,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help=("Base URL of an ARSE API (e.g. "
                          "https://reference-cleaner.ds-ifs.tuwien.ac.at/api/v1). "
                          "When unset, runs the pipeline locally."))
-    p.add_argument("--api-key",  default=os.getenv("ARES_API_KEY"),
-                   help="X-API-Key for the remote ARSE API.  Defaults to $ARES_API_KEY.")
+    p.add_argument("--api-key",  default=os.getenv("ARSE_API_KEY"),
+                   help="X-API-Key for the remote ARSE API.  Defaults to $ARSE_API_KEY.")
     p.add_argument("--overwrite", action="store_true",
                    help="Overwrite existing per-PDF JSONs in output_dir.")
     args = p.parse_args(argv)

@@ -74,10 +74,10 @@ the Streamlit container; nginx routes `/api/*` to it. For local
 development you can also run it standalone:
 
 ```bash
-ARES_API_KEY=your-secret uvicorn api:app --host 0.0.0.0 --port 8500
+ARSE_API_KEY=your-secret uvicorn api:app --host 0.0.0.0 --port 8500
 ```
 
-Set `ARES_API_KEY` in the environment (and `.env` for Docker) — every
+Set `ARSE_API_KEY` in the environment (and `.env` for Docker) — every
 request must then carry `X-API-Key: your-secret`. When the variable is
 unset the API runs unauthenticated (dev mode only).
 
@@ -97,7 +97,7 @@ Single-PDF example:
 
 ```bash
 curl -X POST https://your-host/api/v1/process \
-     -H "X-API-Key: $ARES_API_KEY" \
+     -H "X-API-Key: $ARSE_API_KEY" \
      -F file=@paper.pdf \
      -F parser=grobid \
      -F use_llm=false
@@ -116,7 +116,7 @@ python batch_cli.py /path/to/pdfs/ /path/to/output/ \
 # Remote (against a deployed ARSE):
 python batch_cli.py /path/to/pdfs/ /path/to/output/ \
        --remote https://your-host/api/v1 \
-       --api-key $ARES_API_KEY \
+       --api-key $ARSE_API_KEY \
        --concurrency 8
 ```
 
@@ -141,7 +141,7 @@ short version:
 | `LLM_BACKEND` | `anthropic` or `aqueduct` |
 | `LLM_MODEL` | Model name for the chosen backend |
 | `GROBID_URL` | GROBID HTTP endpoint (set automatically in Docker) |
-| `ARES_CACHE` | SQLite cache path |
+| `ARSE_CACHE` | SQLite cache path |
 
 All keys are optional — the tool degrades gracefully when a source is
 unavailable. More keys → fewer rate-limit walls.

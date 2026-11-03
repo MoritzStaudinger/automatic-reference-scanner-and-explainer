@@ -13,6 +13,8 @@ dicts with (at least) these optional keys:
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 import os
 import time
 import threading
@@ -32,9 +34,9 @@ _TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
 # full-document parses got the container OOM-killed at mem_limit 4g, which
 # surfaced as random parsing failures.  Full-document parses are therefore
 # serialised per process; the light citation-list calls get two slots.
-_GROBID_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARES_GROBID_CONCURRENCY", "2")))
+_GROBID_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARSE_GROBID_CONCURRENCY", "2")))
 _GROBID_FULLTEXT_SLOTS = threading.BoundedSemaphore(
-    int(os.getenv("ARES_GROBID_FULLTEXT_CONCURRENCY", "1")))
+    int(os.getenv("ARSE_GROBID_FULLTEXT_CONCURRENCY", "1")))
 
 
 class ParserError(RuntimeError):

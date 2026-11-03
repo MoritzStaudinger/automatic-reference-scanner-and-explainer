@@ -2,7 +2,7 @@
 Mint, list, and revoke API keys for the ARSE HTTP API.
 
 The keys live in ``data/api_keys.json`` (override with the
-``ARES_API_KEYS_FILE`` env var).  The running API watches the file's
+``ARSE_API_KEYS_FILE`` env var).  The running API watches the file's
 mtime and reloads on every request, so changes apply without a restart.
 
 Usage
@@ -33,6 +33,11 @@ In Docker
 
 from __future__ import annotations
 
+import os as _os
+for _k, _v in list(_os.environ.items()):   # old ARES_* settings
+    if _k.startswith("ARES_"):
+        _os.environ.setdefault("ARSE_" + _k[5:], _v)
+
 import argparse
 import datetime
 import json
@@ -43,7 +48,7 @@ from pathlib import Path
 
 
 DEFAULT_PATH = Path(
-    os.getenv("ARES_API_KEYS_FILE",
+    os.getenv("ARSE_API_KEYS_FILE",
               Path(__file__).resolve().parent.parent / "data" / "api_keys.json")
 )
 

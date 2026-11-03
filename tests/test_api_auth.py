@@ -7,10 +7,10 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARES_JOBS_DB", str(tmp_path / "jobs.sqlite"))
-    monkeypatch.setenv("ARES_API_KEYS_FILE", str(tmp_path / "keys.json"))
-    monkeypatch.delenv("ARES_API_KEY", raising=False)
-    monkeypatch.delenv("ARES_API_ALLOW_UNAUTHENTICATED", raising=False)
+    monkeypatch.setenv("ARSE_JOBS_DB", str(tmp_path / "jobs.sqlite"))
+    monkeypatch.setenv("ARSE_API_KEYS_FILE", str(tmp_path / "keys.json"))
+    monkeypatch.delenv("ARSE_API_KEY", raising=False)
+    monkeypatch.delenv("ARSE_API_ALLOW_UNAUTHENTICATED", raising=False)
     import job_store
     monkeypatch.setattr(job_store, "_singleton", None)
     import api

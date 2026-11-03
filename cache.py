@@ -4,7 +4,7 @@ Persistent SQLite cache for external lookup responses.
 Keys: (source, query_hash). Values: JSON-serialised result dicts.
 
 We cache `found` results indefinitely — papers don't move.  Negative
-results (`not_found`, `not_in_anthology`) expire after ARES_NEG_TTL_DAYS
+results (`not_found`, `not_in_anthology`) expire after ARSE_NEG_TTL_DAYS
 (default 14) so papers that get indexed later are picked up again.  We do
 NOT cache transient errors (`error`, `rate_limited`, `no_index`) so a
 flaky run doesn't poison the cache for next time.
@@ -13,6 +13,8 @@ Clean up stale negatives with ``scripts/purge_negative_cache.py``.
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 
 import json
 import logging
@@ -27,11 +29,11 @@ from typing import Any, Callable
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 CACHE_PATH    = Path(os.getenv(
-    "ARES_CACHE", _PROJECT_ROOT / "data" / "cache.sqlite"))
+    "ARSE_CACHE", _PROJECT_ROOT / "data" / "cache.sqlite"))
 
 _CACHEABLE_STATUSES = {"found", "not_found", "not_in_anthology", "dead_link"}
 _NEGATIVE_STATUSES  = {"not_found", "not_in_anthology", "dead_link"}
-NEG_TTL_SECONDS     = int(float(os.getenv("ARES_NEG_TTL_DAYS", "14")) * 86400)
+NEG_TTL_SECONDS     = int(float(os.getenv("ARSE_NEG_TTL_DAYS", "14")) * 86400)
 
 log = logging.getLogger(__name__)
 

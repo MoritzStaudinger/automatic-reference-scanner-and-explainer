@@ -34,7 +34,7 @@ RUN useradd --create-home --uid 1000 arse && mkdir -p /app/data && chown arse:ar
 USER arse
 
 ENV PYTHONUNBUFFERED=1 \
-    ARES_CACHE=/app/data/cache.sqlite \
+    ARSE_CACHE=/app/data/cache.sqlite \
     ARSE_MODEL_DIR=/app/data/models \
     HF_HOME=/app/data/models \
     GROBID_URL=http://grobid:8070

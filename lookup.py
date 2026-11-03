@@ -32,6 +32,8 @@ Identifier source (link only):
 
 from __future__ import annotations
 
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
+
 import logging
 import os
 import re
@@ -55,9 +57,9 @@ log = logging.getLogger(__name__)
 
 # One contact address for every polite-pool API (Crossref, OpenAlex,
 # doi.org, Open Library) and for URL fetches.  Override with
-# ARES_CONTACT_EMAIL; the per-source OPENALEX_MAILTO / DOI_ORG_MAILTO
+# ARSE_CONTACT_EMAIL; the per-source OPENALEX_MAILTO / DOI_ORG_MAILTO
 # variables still win when set.
-CONTACT_EMAIL = os.getenv("ARES_CONTACT_EMAIL", "moritz.staudinger@tuwien.ac.at")
+CONTACT_EMAIL = os.getenv("ARSE_CONTACT_EMAIL", "moritz.staudinger@tuwien.ac.at")
 USER_AGENT    = f"ARSE/1.0 (+https://reference-cleaner.ds-ifs.tuwien.ac.at; mailto:{CONTACT_EMAIL})"
 
 # Connection-pooled HTTP session — every source uses this so TCP+TLS

@@ -58,7 +58,7 @@ services:
     environment:
       # In-container service discovery — overrides any GROBID_URL in .env
       - GROBID_URL=http://grobid:8070
-      - ARES_CACHE=/app/data/cache.sqlite
+      - ARSE_CACHE=/app/data/cache.sqlite
     volumes:
       # SQLite lookup cache, persists across restarts.
       - arse-data:/app/data
@@ -72,7 +72,7 @@ services:
 
   # Headless HTTP API (api.py) for programmatic / batch use.  Same image,
   # uvicorn entry point.  Shares the cache volume with the UI.  Without
-  # ARES_API_KEY or a keys file it answers 503 to everything but /healthz.
+  # ARSE_API_KEY or a keys file it answers 503 to everything but /healthz.
   arse-api:
     build:
       context: .
@@ -88,9 +88,9 @@ services:
       - .env
     environment:
       - GROBID_URL=http://grobid:8070
-      - ARES_CACHE=/app/data/cache.sqlite
-      - ARES_JOBS_DB=/app/data/jobs.sqlite
-      - ARES_API_KEYS_FILE=/app/data/api_keys.json
+      - ARSE_CACHE=/app/data/cache.sqlite
+      - ARSE_JOBS_DB=/app/data/jobs.sqlite
+      - ARSE_API_KEYS_FILE=/app/data/api_keys.json
     volumes:
       - arse-data:/app/data
     mem_limit: 4g
