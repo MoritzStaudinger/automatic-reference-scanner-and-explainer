@@ -522,8 +522,10 @@ def generate_report(
 
 
 _CLAIM_ICONS = {"supported": "🟢", "contradicted": "🔴", "not_addressed": "🟡",
-                "ambiguous": "🟡", "no_source": "⚪", "error": "⚪"}
-_CLAIM_ORDER = ("contradicted", "not_addressed", "ambiguous", "supported", "no_source", "error")
+                "ambiguous": "🟡", "partially_supported": "🟡", "evidence_only": "🔵",
+                "no_source": "⚪", "error": "⚪"}
+_CLAIM_ORDER = ("contradicted", "partially_supported", "not_addressed", "ambiguous",
+                "supported", "evidence_only", "no_source", "error")
 
 
 def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str]:
@@ -532,9 +534,10 @@ def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str
     rows = [v.to_dict() if hasattr(v, "to_dict") else dict(v) for v in verdicts]
     counts = {k: sum(1 for r in rows if r.get("verdict") == k) for k in _CLAIM_ORDER}
     out = ["---\n", "## Citation Context Check\n",
-           "For each sentence that cites a verified reference, an LLM compared the "
-           "sentence with the cited paper (abstract or full text). Treat these as "
-           "pointers for a human reader, not judgements.\n",
+           "For each sentence that cites a verified reference, ARSE extracted what the "
+           "sentence claims about that work and an LLM checked it against the passages "
+           "of the cited paper (abstract or open-access full text) that match it best. "
+           "Treat these as pointers for a human reader, not judgements.\n",
            " · ".join(f"{_CLAIM_ICONS[k]} {k.replace('_', ' ')}: {n}"
                       for k, n in counts.items() if n) + "\n"]
     for verdict in _CLAIM_ORDER[:3]:
@@ -545,6 +548,9 @@ def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str
             out.append(f"- {_CLAIM_ICONS[verdict]} **{verdict.replace('_', ' ')}** — "
                        f"cites [{i + 1}] *{title}*")
             out.append(f"  > {' '.join(str(r.get('claim_text', '')).split())}")
+            if r.get("cited_claim"):
+                out.append(f"  - Claim about this work ({r.get('intent') or 'result'}): "
+                           f"{r['cited_claim']}")
             if r.get("explanation"):
                 out.append(f"  - {r['explanation']}")
             if r.get("evidence_passage"):

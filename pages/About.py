@@ -53,9 +53,19 @@ st.markdown("""
    API, dead links through the Internet Archive.
 4. **Review.** Results appear as cards and as coloured highlights in the PDF. Click a
    highlight to open its card; use **Show on p. N** to jump the other way.
-5. **Citation context (optional).** For verified references, an LLM checks whether the
-   cited paper (its abstract, or its open-access full text) supports the sentences that
-   cite it.
+5. **Citation context (optional).** For verified references, ARSE checks whether the
+   cited paper supports what the citing sentence says about it:
+   - it first isolates the part of the sentence attributed to that reference, splits it
+     into checkable sub-claims and classifies the citation as reporting a *finding*,
+     *using a method or resource*, or *background*;
+   - it cuts the cited paper (abstract or open-access full text) into short passages,
+     leaving out its reference list, and retrieves the passages that best match each
+     sub-claim (keyword search combined with scientific text embeddings);
+   - an LLM judges each sub-claim on those passages only and must name the passages it
+     relies on, so the evidence shown is always real text of the cited paper. Passages
+     that describe *other* papers don't count as the cited paper's own findings.
+
+   Without an LLM, the card shows the best-matching passages without a verdict.
 """)
 
 st.header("How matching is scored")

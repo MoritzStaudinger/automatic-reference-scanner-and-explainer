@@ -1,0 +1,8 @@
+# Optional: dense embeddings for evidence retrieval in the citation-context
+# check (evidence.py).  Without these, retrieval uses BM25 only.
+# Docker: docker compose build --build-arg ARSE_EMBED=scientific   (or "small")
+#
+#   small       BAAI/bge-small-en-v1.5 via ONNX, no PyTorch (~150 MB)
+#   scientific  SPECTER2 (adapters) and SciNCL, PyTorch CPU (~1-1.5 GB)
+numpy>=1.26
+fastembed>=0.4

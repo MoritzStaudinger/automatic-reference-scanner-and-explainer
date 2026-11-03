@@ -42,3 +42,6 @@ venv/
 
 # Local-only docker-compose overrides (host ports, no nginx, etc)
 docker-compose.override.yml
+benchmark/claims/data/
+benchmark/claims/runs/
+benchmark/claims/*.log
