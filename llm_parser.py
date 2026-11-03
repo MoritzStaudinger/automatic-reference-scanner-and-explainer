@@ -14,10 +14,10 @@ Backends
   pricing.
 - ``aqueduct`` — free OpenAI-compatible endpoint hosted at
   https://aqueduct.ai.datalab.tuwien.ac.at/ (TU Wien DataLab).
-  Supports Qwen 3.6 35B and others.  No prompt caching.
+  Supports Qwen 3.8 27B and others.  No prompt caching.
 
 Switch via env:
-    LLM_BACKEND=aqueduct LLM_MODEL=qwen-3.6-35b python ...
+    LLM_BACKEND=aqueduct LLM_MODEL=qwen-3.8-27b python ...
     LLM_BACKEND=anthropic LLM_MODEL=claude-haiku-5-5 python ...
 
 When LLM_BACKEND is unset the backend follows whichever key is configured
@@ -35,14 +35,14 @@ from pydantic import BaseModel, field_validator
 
 _BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE") or "20")
 
-# Parallel LLM batches.  Aqueduct/Qwen 3.6 35B is rate-limited around 120
+# Parallel LLM batches.  Aqueduct (Qwen) is rate-limited around 120
 # RPM (~2 RPS).  With 8 workers and batch latency ~3-5 s, we sit at well
 # under that limit while collapsing N batches into ceil(N/8) wall-clock
 # rounds — most papers finish in one round.  Anthropic Haiku tolerates
 # higher concurrency too, so the same default works there.
 _MAX_PARALLEL_BATCHES = int(os.getenv("LLM_PARALLEL", "8"))
 
-_DEFAULT_MODELS = {"anthropic": "claude-haiku-5-5", "aqueduct": "qwen-3.6-35b"}
+_DEFAULT_MODELS = {"anthropic": "claude-haiku-5-5", "aqueduct": "qwen-3.8-27b"}
 
 
 def resolve_backend() -> str:
@@ -106,7 +106,7 @@ _AQUEDUCT_TIMEOUT = float(os.getenv("AQUEDUCT_TIMEOUT", "120"))
 def set_active_model(backend: str | None = None, model: str | None = None) -> tuple[str, str]:
     """
     Override the active LLM backend / model at runtime.  Lets the
-    benchmark harness compare models (e.g. qwen-3.6-35b vs gemma-4-e2b-it)
+    benchmark harness compare models (e.g. qwen-3.8-27b vs another model)
     within a single process without re-importing.
 
     Returns ``(active_backend, active_model)`` so callers can echo what
@@ -286,7 +286,9 @@ def _same_text(a: str, b: str) -> bool:
     """Equal up to case, spaces, hyphens and punctuation.  Such a change is
     no repair — and it used to undo the parser's restored hyphens
     ("few-shot" → "fewshot", copied from the line-broken raw text)."""
-    norm = lambda s: _re_lp.sub(r"[\W_]+", "", (s or "").lower())
+    import unicodedata
+    # NFKC folds ligatures ("ﬁne" → "fine") copied from the PDF text.
+    norm = lambda s: _re_lp.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", s or "").lower())
     return norm(a) == norm(b)
 
 

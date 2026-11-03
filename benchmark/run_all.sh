@@ -36,7 +36,7 @@ WITH_GEMMA=0
 SMOKE=0
 NO_INTER=0
 TAG=""
-QWEN_MODEL="qwen-3.6-35b"
+QWEN_MODEL="qwen-3.8-27b"
 GEMMA_MODEL="gemma-4-e2b-it"
 for arg in "$@"; do
   case "$arg" in

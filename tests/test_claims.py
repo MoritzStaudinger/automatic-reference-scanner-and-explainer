@@ -238,3 +238,16 @@ def test_default_embedder_falls_back_to_bm25_without_fastembed(monkeypatch):
     monkeypatch.setitem(evidence._EMBEDDERS, "bge-small", boom)
     assert evidence.get_embedder() is None
     assert "bge-small" in evidence.embedder_status()
+
+
+def test_bm25_matches_hyphenated_model_names():
+    ps = [evidence.Passage(0, "We present Gemma 2, a family of open models.", ""),
+          evidence.Passage(1, "Unrelated text about geoparsing of tweets here.", "")]
+    hits = evidence.retrieve("The cited work introduces Gemma-2-10B.", ps, k=1)
+    assert hits and "Gemma 2" in hits[0].passage.text
+
+
+def test_short_text_without_matches_is_shown_whole():
+    ps = [evidence.Passage(0, "Completely different words appear in this abstract.", "")]
+    hits = evidence.retrieve("zebra quantum", ps, k=8)
+    assert [h.passage.idx for h in hits] == [0]

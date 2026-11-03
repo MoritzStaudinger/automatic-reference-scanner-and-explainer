@@ -283,7 +283,7 @@ def main() -> None:
                          "(anthropic | aqueduct).  Defaults to the env-var value.")
     ap.add_argument("--llm-model", default="",
                     help="Override the LLM model for this run "
-                         "(e.g. qwen-3.6-35b, gemma-4-e2b-it, claude-haiku-4-5).  "
+                         "(e.g. qwen-3.8-27b, claude-haiku-5-5).  "
                          "Use this to compare models in side-by-side benchmark runs.")
     ap.add_argument("--cold", action="store_true",
                     help="Use a fresh empty SQLite cache for this run (ARSE_CACHE "

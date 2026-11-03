@@ -198,8 +198,15 @@ shown""".split())
 
 
 def _tokens(text: str) -> list[str]:
-    return [t for t in re.findall(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", text.lower())
-            if t not in _STOP and len(t) > 1]
+    """Words and numbers; hyphenated / dotted compounds also count by their
+    parts, so "Gemma-2-10B" meets "Gemma 2" and "BERT-base" meets "BERT"."""
+    out = []
+    for comp in re.findall(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*", text.lower()):
+        parts = re.split(r"[.\-]", comp)
+        for t in ([comp] if len(parts) > 1 else []) + parts:
+            if t not in _STOP and (len(t) > 1 or t.isdigit()):
+                out.append(t)
+    return out
 
 
 def bm25_scores(query: str, passages: Sequence[Passage],
@@ -449,4 +456,8 @@ def retrieve(query: str, passages: Sequence[Passage], k: int = 8,
             if r <= candidates:
                 fused[i] = fused.get(i, 0.0) + 1.0 / (_RRF_K + r)
     order = sorted(fused, key=lambda i: -fused[i])[skip:skip + k]
+    if not order and not skip and len(passages) <= k:
+        # Nothing matched, but the whole text fits (an abstract): let the
+        # verdict step read all of it instead of concluding "no evidence".
+        return [ScoredPassage(p, 0.0) for p in passages]
     return [ScoredPassage(passages[i], fused[i], bm.get(i), dense.get(i)) for i in order]
