@@ -21,11 +21,16 @@ _SOURCE_ORDER = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openal
 
 CLAIM_LABEL = {
     "supported": "supported", "contradicted": "contradicted",
+    "partially_supported": "partly supported",
     "not_addressed": "not addressed", "ambiguous": "ambiguous",
-    "no_source": "no text available", "error": "check failed",
+    "evidence_only": "evidence only", "no_source": "no text available",
+    "error": "check failed",
 }
-_CLAIM_TONE = {"supported": "ok", "contradicted": "bad", "not_addressed": "muted",
-               "ambiguous": "warn", "no_source": "muted", "error": "muted"}
+_CLAIM_TONE = {"supported": "ok", "contradicted": "bad", "partially_supported": "warn",
+               "not_addressed": "muted", "ambiguous": "warn", "evidence_only": "info",
+               "no_source": "muted", "error": "muted"}
+INTENT_LABEL = {"result": "reports a finding", "method": "uses a method / resource",
+                "background": "background"}
 
 esc = html.escape
 
@@ -111,6 +116,33 @@ def fields_html(ref: dict) -> str:
     return f'<div class="fields">{cells}</div>'
 
 
+def _passages_detail(v: dict) -> str:
+    """Cited claim, intent, sub-claim verdicts and the passages of the cited
+    paper they rest on (passage-based method)."""
+    out = []
+    intent = v.get("intent")
+    if v.get("cited_claim"):
+        chip = (f' <span class="chip">{esc(INTENT_LABEL.get(intent, intent))}</span>'
+                if intent else "")
+        out.append(f'<div class="cited"><b>Claim about this work:</b> '
+                   f'{esc(v["cited_claim"][:400])}{chip}</div>')
+    subs = v.get("subclaims") or []
+    if len(subs) > 1 or (subs and subs[0].get("evidence_ids")):
+        items = []
+        for sc in subs:
+            sv = sc.get("verdict") or ""
+            tag = (f'<span class="chip {_CLAIM_TONE.get(sv, "muted")}">{CLAIM_LABEL.get(sv, sv)}</span> '
+                   if sv else "")
+            ids = " ".join(sc.get("evidence_ids") or [])
+            items.append(f'<li>{tag}{esc(sc.get("text", "")[:300])}'
+                         f'{f" <span class=muted>({esc(ids)})</span>" if ids else ""}</li>')
+        out.append(f'<ul class="subclaims">{"".join(items)}</ul>')
+    for e in (v.get("evidence") or [])[:4]:
+        sect = f'<span class="muted">{esc(e.get("id", ""))} · {esc((e.get("section") or "")[:60])}</span>'
+        out.append(f'<blockquote>{sect}<br>“{esc((e.get("text") or "")[:450])}”</blockquote>')
+    return "".join(out)
+
+
 def claims_html(verdicts: list[dict]) -> str:
     if not verdicts:
         return ""
@@ -123,12 +155,15 @@ def claims_html(verdicts: list[dict]) -> str:
         conf = v.get("confidence")
         conf_s = (f' <span class="muted">{esc(conf)} confidence</span>'
                   if conf and verdict not in ("no_source", "error") else "")
-        evidence = (f'<blockquote>“{esc((v.get("evidence_passage") or "")[:300])}”</blockquote>'
-                    if v.get("evidence_passage") else "")
         note = v.get("explanation") or (v.get("error") if verdict == "error" else "")
         expl = f'<div class="muted">{esc(str(note)[:300])}</div>' if note else ""
-        rows.append(f'<li>{badge}{conf_s}{src}<div class="claim">“{esc((v.get("claim_text") or "")[:400])}”'
-                    f'</div>{evidence}{expl}</li>')
+        sentence = f'<div class="claim">“{esc((v.get("claim_text") or "")[:400])}”</div>'
+        if v.get("mode") in ("passages", "evidence_only"):
+            rows.append(f'<li>{badge}{conf_s}{src}{sentence}{_passages_detail(v)}{expl}</li>')
+            continue
+        evidence = (f'<blockquote>“{esc((v.get("evidence_passage") or "")[:300])}”</blockquote>'
+                    if v.get("evidence_passage") else "")
+        rows.append(f'<li>{badge}{conf_s}{src}{sentence}{evidence}{expl}</li>')
     return (f'<div class="sect"><div class="sect-h">Citation context ({len(verdicts)})</div>'
             f'<ul class="claims">{"".join(rows)}</ul></div>')
 
