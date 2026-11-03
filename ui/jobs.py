@@ -8,11 +8,13 @@ worker thread that never touches ``st.*``; a fragment polls its progress
 once a second and, when it finishes, hands the result to an ``on_done``
 callback on the script thread and reruns the page.
 
-A process-wide semaphore (ARES_MAX_CONCURRENT_JOBS, default 3) bounds how
+A process-wide semaphore (ARSE_MAX_CONCURRENT_JOBS, default 3) bounds how
 many jobs run at once on the public instance; later jobs show "queued".
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 
 import os
 import threading
@@ -23,7 +25,7 @@ from typing import Any, Callable
 
 import streamlit as st
 
-_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARES_MAX_CONCURRENT_JOBS", "3")))
+_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARSE_MAX_CONCURRENT_JOBS", "3")))
 
 
 @dataclass

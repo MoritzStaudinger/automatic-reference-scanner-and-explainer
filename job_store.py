@@ -10,11 +10,13 @@ not millions), the API lives in one container, and SQLite + WAL handles
 concurrent writes from the API thread and the background worker thread
 without a separate service.  Same rationale as the lookup cache.
 
-Path is configurable via env ``ARES_JOBS_DB`` (defaults next to the
+Path is configurable via env ``ARSE_JOBS_DB`` (defaults next to the
 lookup cache: ``./data/jobs.sqlite``).
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 
 import json
 import os
@@ -26,7 +28,7 @@ from typing import Any, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_PATH = _PROJECT_ROOT / "data" / "jobs.sqlite"
-JOBS_DB_PATH = Path(os.getenv("ARES_JOBS_DB", _DEFAULT_PATH))
+JOBS_DB_PATH = Path(os.getenv("ARSE_JOBS_DB", _DEFAULT_PATH))
 
 
 class JobStore:

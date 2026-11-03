@@ -43,6 +43,11 @@ The services, containers and data volume were renamed from `ares*` to
 `<project>_arse-data` and keeps the old one as a backup. Once everything
 works, remove it with `docker volume rm <project>_ares-data`.
 
+The environment variables were renamed as well (`ARES_API_KEY` →
+`ARSE_API_KEY`, `ARES_CONTACT_EMAIL` → `ARSE_CONTACT_EMAIL`, …; see
+`.env.example`). An existing `.env` with the old `ARES_*` names keeps
+working (`arse_env.py` maps them); rename the lines when convenient.
+
 The first deploy after the cache-poisoning fix needs one extra command:
 
 ```bash
@@ -107,8 +112,8 @@ take effect without a restart.
 | Upload size | `.streamlit/config.toml` / nginx | 25 MB / 30 MB (batch API 200 MB) |
 | Request rate per IP | `nginx/conf.d/default.conf` | UI 20 r/s (burst 100), API 2 r/s (burst 20) |
 | Connections per IP | nginx | 30 |
-| Concurrent synchronous API runs | `ARES_API_SYNC_CONCURRENCY` | 2 |
-| Concurrent GROBID full-document parses | `ARES_GROBID_FULLTEXT_CONCURRENCY` | 1 per process |
+| Concurrent synchronous API runs | `ARSE_API_SYNC_CONCURRENCY` | 2 |
+| Concurrent GROBID full-document parses | `ARSE_GROBID_FULLTEXT_CONCURRENCY` | 1 per process |
 
 ## Local stack (same proxy path as production)
 
@@ -132,6 +137,6 @@ TLS_CERT=$PWD/dev.pem TLS_KEY=$PWD/dev.key \
 - `docker compose logs --tail 100 <service>` shows recent logs.
 - `docker inspect arse-grobid --format '{{.State.OOMKilled}}'` returns
   `true` when GROBID ran out of memory. Raise its `mem_limit`, or lower
-  `ARES_GROBID_FULLTEXT_CONCURRENCY`.
+  `ARSE_GROBID_FULLTEXT_CONCURRENCY`.
 - When GROBID is down, the UI falls back to the pymupdf4llm parser and
   shows a warning. The API reports `summary.parser_fallback`.

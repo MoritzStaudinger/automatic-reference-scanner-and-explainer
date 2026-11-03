@@ -9,14 +9,14 @@ GET  /healthz
 POST /api/v1/process
     Sync single-PDF processing.  Multipart upload, returns JSON report.
     Fields: file (PDF), parser (str), use_llm (bool).
-    Auth: X-API-Key header (when ARES_API_KEY is set).
+    Auth: X-API-Key header (when ARSE_API_KEY is set).
     Use this when you have one PDF and want the answer in the response.
 
 POST /api/v1/batch
     Async batch processing.  Multipart with multiple files.  Returns
     a job_id immediately; the actual processing runs on a background
-    thread pool sized by ARES_API_WORKERS.
-    Auth: X-API-Key header (when ARES_API_KEY is set).
+    thread pool sized by ARSE_API_WORKERS.
+    Auth: X-API-Key header (when ARSE_API_KEY is set).
     Use this for 10s–1000s of PDFs.
 
 GET  /api/v1/batch/{job_id}
@@ -36,7 +36,7 @@ GET  /api/v1/batches
 
 Auth
 ----
-Set ``ARES_API_KEY=<secret>`` in the environment and pass it via the
+Set ``ARSE_API_KEY=<secret>`` in the environment and pass it via the
 ``X-API-Key`` header on every request.  When the env var is unset the
 API runs in dev mode (no auth required) — convenient for local use,
 do not deploy that way.
@@ -52,6 +52,8 @@ on port 8500 and nginx routes ``/api/*`` to it.
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 
 import datetime
 import hmac
@@ -88,21 +90,21 @@ _log = logging.getLogger("arse.api")
 # Config
 # ---------------------------------------------------------------------------
 
-_API_KEY        = os.getenv("ARES_API_KEY", "").strip()
+_API_KEY        = os.getenv("ARSE_API_KEY", "").strip()
 _KEYS_FILE      = Path(os.getenv(
-    "ARES_API_KEYS_FILE",
+    "ARSE_API_KEYS_FILE",
     Path(__file__).resolve().parent / "data" / "api_keys.json",
 ))
-_BATCH_WORKERS  = max(1, int(os.getenv("ARES_API_WORKERS", "2")))
+_BATCH_WORKERS  = max(1, int(os.getenv("ARSE_API_WORKERS", "2")))
 # Without any key configured the API refuses requests (503) — the public
 # deployment must never run it open by accident.  Local dev opts in.
-_ALLOW_OPEN     = os.getenv("ARES_API_ALLOW_UNAUTHENTICATED", "") == "1"
+_ALLOW_OPEN     = os.getenv("ARSE_API_ALLOW_UNAUTHENTICATED", "") == "1"
 # Synchronous /process requests running at once; extra callers get 503.
-_SYNC_SLOTS     = threading.BoundedSemaphore(int(os.getenv("ARES_API_SYNC_CONCURRENCY", "2")))
-_SYNC_WAIT_S    = float(os.getenv("ARES_API_SYNC_WAIT_S", "30"))
-_SPOOL_DIR      = Path(os.getenv("ARES_API_SPOOL", Path(os.getenv(
-    "ARES_JOBS_DB", "data/jobs.sqlite")).parent / "batch_uploads"))
-_MAX_BATCH      = int(os.getenv("ARES_API_MAX_BATCH", "500"))
+_SYNC_SLOTS     = threading.BoundedSemaphore(int(os.getenv("ARSE_API_SYNC_CONCURRENCY", "2")))
+_SYNC_WAIT_S    = float(os.getenv("ARSE_API_SYNC_WAIT_S", "30"))
+_SPOOL_DIR      = Path(os.getenv("ARSE_API_SPOOL", Path(os.getenv(
+    "ARSE_JOBS_DB", "data/jobs.sqlite")).parent / "batch_uploads"))
+_MAX_BATCH      = int(os.getenv("ARSE_API_MAX_BATCH", "500"))
 _VALID_PARSERS  = {"grobid", "hybrid", "pymupdf4llm"}
 
 
@@ -130,7 +132,7 @@ def _load_api_keys() -> dict[str, dict]:
           ...
         }
 
-    Missing file → empty dict (dev mode falls back to ARES_API_KEY env).
+    Missing file → empty dict (dev mode falls back to ARSE_API_KEY env).
     """
     global _KEYS_CACHE, _KEYS_MTIME
     try:
@@ -210,12 +212,12 @@ def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
     Auth dependency.
 
     Accepts a key if EITHER of these matches:
-      1. ``ARES_API_KEY`` env var (single shared key — legacy path)
+      1. ``ARSE_API_KEY`` env var (single shared key — legacy path)
       2. A key entry in ``data/api_keys.json`` (multi-user with labels +
          optional expiry)
 
     When neither the env var nor the file has any keys, the API refuses
-    every request with 503 — unless ARES_API_ALLOW_UNAUTHENTICATED=1
+    every request with 503 — unless ARSE_API_ALLOW_UNAUTHENTICATED=1
     (local development only).  Keys are compared in constant time.
     """
     keys = _load_api_keys()

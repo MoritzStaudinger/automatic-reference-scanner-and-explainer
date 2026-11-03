@@ -16,7 +16,7 @@
 #         -keyout dev.key -out dev.pem
 #     and open https://reference-cleaner.ds-ifs.tuwien.ac.at:8443 with a
 #     hosts-file entry (or curl --resolve).
-#   * the API runs without keys (ARES_API_ALLOW_UNAUTHENTICATED=1)
+#   * the API runs without keys (ARSE_API_ALLOW_UNAUTHENTICATED=1)
 
 services:
 
@@ -32,7 +32,7 @@ services:
     ports:
       - "127.0.0.1:8500:8500"
     environment:
-      - ARES_API_ALLOW_UNAUTHENTICATED=1
+      - ARSE_API_ALLOW_UNAUTHENTICATED=1
 
   nginx:
     ports: !override

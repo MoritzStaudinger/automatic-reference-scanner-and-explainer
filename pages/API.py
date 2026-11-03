@@ -6,12 +6,14 @@ truth for endpoints and schemas.  This page points there and gives
 copy-pasteable examples for whichever hostname the visitor used.
 """
 
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 import os
 
 import streamlit as st
 
 _KNOWN_HOSTS = {"reference-cleaner.ds-ifs.tuwien.ac.at", "arse.ds-ifs.tuwien.ac.at"}
-_DEFAULT_BASE = os.getenv("ARES_API_PUBLIC_BASE", "https://reference-cleaner.ds-ifs.tuwien.ac.at")
+_DEFAULT_BASE = os.getenv("ARSE_API_PUBLIC_BASE", "https://reference-cleaner.ds-ifs.tuwien.ac.at")
 
 # Examples use the host the visitor reached us at — only if it is one of
 # ours, so a forged Host header can't put another URL on the page.
@@ -36,7 +38,7 @@ with st.container(border=True):
 st.subheader("Check one paper")
 st.code(
     f'curl -fsS -X POST {BASE}/api/v1/process \\\n'
-    f'     -H "X-API-Key: $ARES_API_KEY" \\\n'
+    f'     -H "X-API-Key: $ARSE_API_KEY" \\\n'
     f'     -F file=@paper.pdf \\\n'
     f'     -F parser=hybrid \\\n'
     f'     -F use_llm=1 \\\n'
@@ -51,10 +53,10 @@ st.markdown(
 
 st.subheader("Batches")
 st.code(
-    f'job=$(curl -fsS -X POST {BASE}/api/v1/batch -H "X-API-Key: $ARES_API_KEY" \\\n'
+    f'job=$(curl -fsS -X POST {BASE}/api/v1/batch -H "X-API-Key: $ARSE_API_KEY" \\\n'
     f'      -F files=@a.pdf -F files=@b.pdf -F parser=hybrid | jq -r .job_id)\n'
-    f'curl -fsS {BASE}/api/v1/batch/$job -H "X-API-Key: $ARES_API_KEY"          # progress\n'
-    f'curl -fsS {BASE}/api/v1/batch/$job/results.jsonl -H "X-API-Key: $ARES_API_KEY"',
+    f'curl -fsS {BASE}/api/v1/batch/$job -H "X-API-Key: $ARSE_API_KEY"          # progress\n'
+    f'curl -fsS {BASE}/api/v1/batch/$job/results.jsonl -H "X-API-Key: $ARSE_API_KEY"',
     language="bash",
 )
 
