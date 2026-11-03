@@ -38,3 +38,7 @@ venv/
 
 # Claude Code session state
 .claude/
+
+
+# Local-only docker-compose overrides (host ports, no nginx, etc)
+docker-compose.override.yml

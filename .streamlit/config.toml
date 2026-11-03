@@ -1,0 +1,57 @@
+# Streamlit settings shared by local runs and the Docker image.
+# (Previously spread across Dockerfile CLI flags and compose env vars.)
+
+[server]
+headless = true
+# Public instance: keep uploads small.  nginx allows a little more so
+# Streamlit, not nginx, produces the user-facing error.
+maxUploadSize = 25
+# Streamlit sits behind nginx on the same origin; XSRF protection stays
+# on (it was disabled in compose, which isn't needed behind a proxy that
+# forwards Host and cookies).
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+# ── Theme ───────────────────────────────────────────────────────────────
+# One accent colour, neutral surfaces, Inter for text and JetBrains Mono for
+# citations.  Status colours (green / red / amber) live in ui/style.css and
+# verdict.py so the cards, the PDF highlights and the report agree.
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 15
+baseRadius = "0.6rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+linkUnderline = false
+
+[theme.light]
+primaryColor = "#2754c5"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6fa"
+textColor = "#1b2330"
+borderColor = "#dfe3ea"
+linkColor = "#2754c5"
+greenColor = "#1f9d55"
+redColor = "#d64545"
+orangeColor = "#c98a04"
+
+[theme.dark]
+primaryColor = "#7aa2ff"
+backgroundColor = "#0f1420"
+secondaryBackgroundColor = "#181f2e"
+textColor = "#e6e9ef"
+borderColor = "#2a3346"
+linkColor = "#8fb0ff"
+greenColor = "#3ecf7a"
+redColor = "#ff6b6b"
+orangeColor = "#f2b84b"

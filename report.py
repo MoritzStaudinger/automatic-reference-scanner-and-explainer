@@ -16,33 +16,16 @@ Verified      – confirmed correct (title match, venue plausible).
 
 from __future__ import annotations
 
-import html as _html
 from datetime import date
 from typing import Any
 
-_VALIDATION_SOURCES = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex", "crossref", "openlibrary", "scholarly", "arxiv")
+from verdict import SOURCE_NAMES, VALIDATION_SOURCES as _VALIDATION_SOURCES
+from verdict import overall_status as _overall_status   # noqa: F401  (re-exported)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (mirror app.py logic without importing Streamlit)
+# Internal helpers
 # ---------------------------------------------------------------------------
-
-def _overall_status(lr: dict | None) -> str:
-    if lr is None:
-        return "pending"
-    found = [
-        lr.get(src, {})
-        for src in _VALIDATION_SOURCES
-        if lr.get(src, {}).get("status") == "found"
-    ]
-    labels = [r.get("label") for r in found]
-    if not found:
-        return "missing"
-    if "match" in labels:
-        return "match"
-    if "mismatch" in labels:
-        return "mismatch"
-    return "missing"
 
 
 def _best_found(lr: dict) -> dict | None:
@@ -58,14 +41,44 @@ def _best_found(lr: dict) -> dict | None:
 
 
 def _has_wrong_doi(lr: dict | None) -> str | None:
-    """Return the wrong DOI string if flagged, else None.
+    """Return the wrong DOI string if flagged by ANY source, else None.
 
     None-safe: when `lr` is None (pending manual-ref slot — added after
     lookups, not yet queried), there's no wrong-DOI information to surface.
     """
     if not lr:
         return None
-    return lr.get("semantic_scholar", {}).get("wrong_doi") or None
+    for src in _VALIDATION_SOURCES:
+        wd = lr.get(src, {}).get("wrong_doi")
+        if wd:
+            return wd
+    return None
+
+
+def _has_wrong_arxiv_id(lr: dict | None) -> str | None:
+    if not lr:
+        return None
+    for src in _VALIDATION_SOURCES:
+        w = lr.get(src, {}).get("wrong_arxiv_id")
+        if w:
+            return w
+    return None
+
+
+def _has_wrong_authors(lr: dict | None) -> bool:
+    if not lr:
+        return False
+    return any(
+        lr.get(src, {}).get("wrong_authors") for src in _VALIDATION_SOURCES
+    )
+
+
+def _has_wrong_venue(lr: dict | None) -> bool:
+    if not lr:
+        return False
+    return any(
+        lr.get(src, {}).get("wrong_venue") for src in _VALIDATION_SOURCES
+    )
 
 
 # Order matters — the first matching category wins.  Strongest-signal
@@ -74,8 +87,17 @@ def _has_wrong_doi(lr: dict | None) -> str | None:
 SUSPICIOUS_CATEGORIES = (
     "wrong_arxiv_id",      # cited arxiv ID resolves to a different paper
     "wrong_doi",           # cited DOI resolves to a different paper
-    "title_authors_mismatch",  # high title sim (≥0.90) but authors clearly disagree
-    "venue_mismatch",      # title+authors match but venue is wrong
+    "wrong_authors",       # title matches but authors clearly disagree
+                           # (set by any source via _finalize_match when
+                           # tsim ≥ 0.50 AND asim < 0.35)
+    "wrong_venue",         # title matches but venue clearly disagrees,
+                           # excluding preprint markers (set by any source
+                           # via _finalize_match when tsim ≥ 0.50 AND
+                           # vsim < 0.30)
+    "title_authors_mismatch",  # legacy: high title sim (≥0.90) + authors
+                           # disagree — now subsumed by wrong_authors,
+                           # kept for back-compat in benchmark reports.
+    "venue_mismatch",      # title+authors match but venue is wrong (soft)
     "uncertain_match",     # tier-2 fuzzy: best source returned a paper at
                            # 0.70-0.90 title sim but couldn't confirm via
                            # authors.  Often legitimate-but-obscure refs
@@ -121,15 +143,28 @@ def _categorise_suspicious(lr: dict | None) -> str | None:
         if r.get("wrong_doi"):
             return "wrong_doi"
 
-    # 2. Title+authors mismatch — at least one source returned a paper
-    #    with high title similarity but authors clearly disagree.
-    #    Matches our `_composite_label` tier-1 mismatch rule.
+    # 2. Any source flagged wrong_authors — title matches (tsim ≥ 0.50)
+    #    but authors clearly disagree (asim < 0.35).  Captures both the
+    #    tier-1 "exact title, wrong authors" case (legacy
+    #    title_authors_mismatch) and the tier-2 "medium title, wrong
+    #    authors" case that previously fell through to "fuzzy" silently.
+    for _, r in found_sources:
+        if r.get("wrong_authors"):
+            return "wrong_authors"
+
+    # 2b. Same as legacy title_authors_mismatch.  Kept so older cached
+    #     results that don't carry the new flag still classify.
     for _, r in found_sources:
         sim  = r.get("similarity")
         asim = r.get("authors_sim")
         if (sim is not None and sim >= 0.90
                 and asim is not None and asim < 0.35):
             return "title_authors_mismatch"
+
+    # 2c. Any source flagged wrong_venue (excluding preprints).
+    for _, r in found_sources:
+        if r.get("wrong_venue"):
+            return "wrong_venue"
 
     # 3. Title+authors match but venue is wrong — a softer concern,
     #    often a preprint-vs-published confusion.  Only surface when
@@ -175,7 +210,7 @@ def _categorise_suspicious(lr: dict | None) -> str | None:
     return "unclassified"
 
 
-def _venue_concern(lr: dict | None) -> tuple[str, str] | None:
+def _venue_concern(lr: dict | None, extracted_venue: str = "") -> tuple[str, str] | None:
     """
     Return (extracted_venue, found_venue) if the title matched but the venue
     is clearly wrong in at least one source, else None.
@@ -186,7 +221,7 @@ def _venue_concern(lr: dict | None) -> tuple[str, str] | None:
         r = lr.get(src, {})
         if r.get("status") == "found" and r.get("label") == "match":
             if r.get("venue_label") == "mismatch":
-                return r.get("found_venue", ""), r.get("found_venue", "")
+                return extracted_venue, r.get("found_venue", "")
     return None
 
 
@@ -275,6 +310,7 @@ def generate_report(
     lookup_results: list[dict[str, Any]],
     pdf_name: str = "",
     parser: str = "",
+    claim_verifications: list[Any] | None = None,
 ) -> str:
     """
     Return a Markdown string summarising reference quality.
@@ -469,6 +505,9 @@ def generate_report(
             lines.append(f"- **[{n}]** {entry}" + (f" ({meta})" if meta else ""))
         lines.append("")
 
+    if claim_verifications:
+        lines.extend(_claims_section(refs, claim_verifications))
+
     # --- Detailed per-reference audit ---
     lines.append("---\n")
     lines.append("## Detailed Per-Reference Audit\n")
@@ -482,19 +521,49 @@ def generate_report(
     return "\n".join(lines)
 
 
+_CLAIM_ICONS = {"supported": "🟢", "contradicted": "🔴", "not_addressed": "🟡",
+                "ambiguous": "🟡", "no_source": "⚪", "error": "⚪"}
+_CLAIM_ORDER = ("contradicted", "not_addressed", "ambiguous", "supported", "no_source", "error")
+
+
+def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str]:
+    """Citation-context check: does the cited paper support the sentence
+    that cites it?  Accepts ClaimVerification objects or their dicts."""
+    rows = [v.to_dict() if hasattr(v, "to_dict") else dict(v) for v in verdicts]
+    counts = {k: sum(1 for r in rows if r.get("verdict") == k) for k in _CLAIM_ORDER}
+    out = ["---\n", "## Citation Context Check\n",
+           "For each sentence that cites a verified reference, an LLM compared the "
+           "sentence with the cited paper (abstract or full text). Treat these as "
+           "pointers for a human reader, not judgements.\n",
+           " · ".join(f"{_CLAIM_ICONS[k]} {k.replace('_', ' ')}: {n}"
+                      for k, n in counts.items() if n) + "\n"]
+    for verdict in _CLAIM_ORDER[:3]:
+        for r in (r for r in rows if r.get("verdict") == verdict):
+            i = r.get("cited_ref_index", -1)
+            ref = refs[i] if 0 <= i < len(refs) else {}
+            title = ref.get("title") or (ref.get("raw") or "")[:80]
+            out.append(f"- {_CLAIM_ICONS[verdict]} **{verdict.replace('_', ' ')}** — "
+                       f"cites [{i + 1}] *{title}*")
+            out.append(f"  > {' '.join(str(r.get('claim_text', '')).split())}")
+            if r.get("explanation"):
+                out.append(f"  - {r['explanation']}")
+            if r.get("evidence_passage"):
+                out.append(f"  - Evidence: “{r['evidence_passage']}”")
+            if r.get("is_abstract_fallback"):
+                out.append("  - _Checked against the abstract only._")
+    out.append("")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-reference audit card
 # ---------------------------------------------------------------------------
 
 _SOURCE_LABELS: list[tuple[str, str]] = [
-    ("semantic_scholar", "Semantic Scholar"),
-    ("crossref",         "Crossref"),
-    ("openalex",         "OpenAlex"),
-    ("acl_anthology",    "ACL Anthology"),
-    ("dblp",             "DBLP"),
-    ("arxiv",            "arXiv"),
-    ("openlibrary",      "Open Library"),
-    ("scholarly",        "Google Scholar"),
+    (src, SOURCE_NAMES[src]) for src in (
+        "doi_org", "semantic_scholar", "crossref", "openalex", "acl_anthology",
+        "dblp", "arxiv", "openlibrary", "scholarly", "url_verify",
+    )
 ]
 
 _STATUS_ICONS = {
@@ -504,6 +573,8 @@ _STATUS_ICONS = {
     "skipped":          "—",
     "not_in_anthology": "—",
     "no_index":         "—",
+    "dead_link":        "⚠️",
+    "archived":         "🗄️",
 }
 
 _LABEL_ICONS = {
@@ -511,6 +582,11 @@ _LABEL_ICONS = {
     "fuzzy":    "🟡",
     "mismatch": "🔴",
 }
+
+
+def _cell(text: Any) -> str:
+    """Make free text safe inside a Markdown table cell."""
+    return " ".join(str(text).split()).replace("|", "\\|")
 
 
 def _pct(x: float | None) -> str:
@@ -651,7 +727,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
     ]:
         val = (ref.get(field) or "").strip()
         if val:
-            display = f"`{val}`" if field in ("doi", "url") else val
+            display = f"`{_cell(val)}`" if field in ("doi", "url") else _cell(val)
             field_rows.append(f"| {label} | {display} |")
     if field_rows:
         out.append("**Extracted fields**\n")
@@ -667,7 +743,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
     # Per-source table — skip rows that just say "skipped" so the verdict
     # block stays focused on sources that actually returned a signal.
     lr = lr or {}
-    interesting = ("found", "not_found", "error")
+    interesting = ("found", "not_found", "error", "dead_link", "archived")
     rows: list[str] = []
     for src, label in _SOURCE_LABELS:
         r = lr.get(src) or {}
@@ -680,7 +756,7 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
         vsim   = r.get("venue_sim")
         vlbl   = r.get("venue_label", "")
         if r.get("found_venue"):
-            vcell = r["found_venue"]
+            vcell = _cell(r["found_venue"])
             if vlbl in ("fuzzy", "mismatch") and vsim is not None:
                 vcell += f" ({vsim:.0%}, {vlbl})"
         else:
@@ -689,11 +765,13 @@ def _per_ref_audit(n: int, ref: dict, lr: dict | None) -> str:
         if status == "found":
             mlbl = r.get("label")
             mark = _LABEL_ICONS.get(mlbl, "")
-            ft   = r.get("found_title") or ""
-            url  = r.get("url") or ""
+            ft   = _cell(r.get("found_title") or "").replace("[", "\\[").replace("]", "\\]")
+            url  = (r.get("url") or "").replace(" ", "%20").replace(")", "%29")
             result_cell = f"{mark} [{ft}]({url})" if url and ft else (ft or "(found)")
         elif status == "not_found":
             result_cell = "not found"
+        elif status in ("dead_link", "archived"):
+            result_cell = _cell(r.get("note") or status.replace("_", " "))
         else:   # error
             err = (r.get("error") or "")[:80].replace("|", "\\|")
             result_cell = f"error: `{err}`"

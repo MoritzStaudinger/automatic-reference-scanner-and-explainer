@@ -54,8 +54,7 @@ sys.path.insert(0, str(ROOT))
 
 from cache import cache_key as _cache_key
 from lookup import (
-    _lookup_core, _lookup_scholarly, _scholarly_reset_budget,
-    _SCHOLARLY_BLOCKED,
+    _lookup_core, _lookup_scholarly, ScholarBudget,
 )
 import lookup as _lookup_mod
 from report import _overall_status
@@ -204,7 +203,7 @@ def main() -> None:
 
     # Step 3: lift the Scholar budget so it doesn't refuse calls after the
     # default cap of 30 (designed for per-paper runs, not a rescue study).
-    _scholarly_reset_budget(len(pending) * 2)   # 2× headroom
+    budget = ScholarBudget(len(pending) * 2)   # 2× headroom
 
     # Step 4: process refs serially.  Each ref fires CORE + Scholar
     # concurrently in a 2-thread pool.  Scholar's internal lock
@@ -230,14 +229,14 @@ def main() -> None:
                 f_gs = None
                 gs_r = {"status": "skipped", "reason": "captcha_disabled"}
             else:
-                f_gs = pool.submit(_lookup_scholarly, ref)
+                f_gs = pool.submit(_lookup_scholarly, ref, budget)
             core_r = f_core.result()
             if f_gs is not None:
                 gs_r = f_gs.result()
 
         # Track Scholar block state — flip set inside _lookup_scholarly
         # when CAPTCHA hits.
-        if not scholar_disabled and getattr(_lookup_mod, "_SCHOLARLY_BLOCKED", False):
+        if not scholar_disabled and time.monotonic() < _lookup_mod._SCHOLARLY_BLOCKED_UNTIL:
             scholar_block_streak += 1
             print(f"  ⚠️  Scholar CAPTCHA hit (streak {scholar_block_streak}/{args.max_blocks})")
             if scholar_block_streak >= args.max_blocks:
@@ -245,7 +244,7 @@ def main() -> None:
                 print(f"  ✗  Scholar disabled for the remainder; CORE-only from here.")
             else:
                 # Reset flag and sleep for 20 min before retrying
-                _lookup_mod._SCHOLARLY_BLOCKED = False
+                _lookup_mod._SCHOLARLY_BLOCKED_UNTIL = 0.0
                 print(f"  💤 sleeping 20 min before trying Scholar again …")
                 time.sleep(20 * 60)
 

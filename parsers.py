@@ -13,15 +13,64 @@ dicts with (at least) these optional keys:
 """
 
 from __future__ import annotations
+
+import arse_env  # noqa: F401  (accepts the old ARES_* settings)
 import os
+import time
+import threading
 import re
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from typing import Any
 
 import requests as _requests
 
 GROBID_URL: str = os.getenv("GROBID_URL", "http://localhost:8070")
+GROBID_TIMEOUT: float = float(os.getenv("GROBID_TIMEOUT", "90"))
 _TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
+
+# GROBID runs with a 2 GB heap, but its native PDF layer (pdfalto) uses
+# memory outside the heap: one 3 MB paper peaked at ~3.8 GB.  Two parallel
+# full-document parses got the container OOM-killed at mem_limit 4g, which
+# surfaced as random parsing failures.  Full-document parses are therefore
+# serialised per process; the light citation-list calls get two slots.
+_GROBID_SLOTS = threading.BoundedSemaphore(int(os.getenv("ARSE_GROBID_CONCURRENCY", "2")))
+_GROBID_FULLTEXT_SLOTS = threading.BoundedSemaphore(
+    int(os.getenv("ARSE_GROBID_FULLTEXT_CONCURRENCY", "1")))
+
+
+class ParserError(RuntimeError):
+    """A parser backend failed (e.g. GROBID down) — callers should tell
+    the user and fall back instead of showing "no references found"."""
+
+
+def _grobid_post(endpoint: str, **kwargs) -> _requests.Response:
+    """POST to GROBID with bounded concurrency and one retry on 503 /
+    connection failure.  Raises ParserError when GROBID can't answer."""
+    url = f"{GROBID_URL}/api/{endpoint}"
+    last: Exception | None = None
+    for attempt in range(2):
+        files = kwargs.get("files")
+        if files and attempt:
+            for fh in files.values():
+                fh.seek(0)
+        heavy = _GROBID_FULLTEXT_SLOTS if endpoint == "processFulltextDocument" else nullcontext()
+        with heavy, _GROBID_SLOTS:
+            try:
+                r = _requests.post(url, timeout=GROBID_TIMEOUT, **kwargs)
+            except (_requests.ConnectionError, _requests.Timeout) as e:
+                last = e
+            else:
+                if r.status_code == 503 and attempt == 0:
+                    last = RuntimeError("GROBID busy (503)")
+                elif r.ok:
+                    return r
+                else:
+                    raise ParserError(f"GROBID returned HTTP {r.status_code} for {endpoint}")
+        if attempt == 0:
+            time.sleep(2)
+    _grobid_alive_cache.update(ts=0.0)
+    raise ParserError(f"GROBID unavailable ({type(last).__name__}: {last})"[:300])
 
 
 # ---------------------------------------------------------------------------
@@ -53,11 +102,67 @@ _REF_SECTION_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def _locate_reference_section(full_text: str) -> str | None:
-    """Return the portion of *full_text* that starts after the reference heading."""
-    match = _REF_SECTION_RE.search(full_text)
-    if match:
-        return full_text[match.end():]
-    return None
+    """Return the portion of *full_text* that starts after the reference heading.
+
+    Takes the last heading that is followed by a reasonable amount of text:
+    a "References" line can also appear earlier (table of contents, a
+    figure, a related-work paragraph)."""
+    matches = list(_REF_SECTION_RE.finditer(full_text))
+    if not matches:
+        return None
+
+    def looks_like_bibliography(m: re.Match) -> bool:
+        # A figure label "Literature" or a TOC line isn't followed by a
+        # run of publication years; a bibliography is.
+        window = full_text[m.end(): m.end() + 1500]
+        return len(re.findall(r"\b(?:19|20)\d{2}\b", window)) >= 4
+
+    for match in reversed(matches):
+        if looks_like_bibliography(match):
+            return full_text[match.end():]
+    return full_text[matches[0].end():]
+
+
+_NUM_MARKER_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\[(\d{1,3})\]|\((\d{1,3})\)|(\d{1,3})[.)])\s+")
+
+
+def _split_numbered(text: str) -> list[str]:
+    """Split a numbered bibliography ([1] …, 1. …, (1) …) at its markers.
+
+    A marker only counts when its number continues the sequence (n+1), so
+    wrapped lines that happen to start with "2011. ACM." or "16:1–16:20"
+    don't open a new entry.  Returns [] unless at least three markers form
+    a sequence covering most of the candidates — the caller then falls back
+    to another strategy."""
+    lines = text.splitlines()
+    groups: list[list[str]] = []
+    expected = None
+    hits = 0
+    for line in lines:
+        m = _NUM_MARKER_RE.match(line)
+        n = int(next(g for g in m.groups() if g)) if m else None
+        if n is not None and (expected is None and n <= 2 or n == expected):
+            groups.append([line.strip()])
+            expected = n + 1
+            hits += 1
+        elif groups:
+            stripped = line.strip()
+            if stripped:
+                groups[-1].append(stripped)
+    if hits < 3:
+        return []
+    out = []
+    for g in groups:
+        # Re-join hyphenated line breaks ("Longeval-\nretrieval" stays,
+        # "evalu-\nation" → "evaluation") and collapse the rest.
+        joined = g[0]
+        for nxt in g[1:]:
+            if re.search(r"[a-z]-$", joined) and nxt[:1].islower():
+                joined = joined[:-1] + nxt
+            else:
+                joined += " " + nxt
+        out.append(joined.strip())
+    return out
 
 
 def _split_into_references(text: str) -> list[str]:
@@ -68,23 +173,10 @@ def _split_into_references(text: str) -> list[str]:
     1. Try numbered markers ([1], 1., etc.) — join continuation lines first.
     2. Fall back to blank-line separation.
     """
-    lines = text.splitlines()
-
     # --- Strategy 1: numbered markers ---
-    # Check whether most lines that look like ref starts are numbered.
-    marker_lines = [i for i, l in enumerate(lines) if _REF_MARKER_RE.match(l)]
-    if len(marker_lines) >= 2:
-        # Group lines: a new reference starts at each marker line.
-        groups: list[list[str]] = []
-        for i, line in enumerate(lines):
-            if _REF_MARKER_RE.match(line):
-                groups.append([line])
-            elif groups:
-                # Continuation line: strip leading whitespace and append.
-                stripped = line.strip()
-                if stripped:
-                    groups[-1].append(stripped)
-        return [" ".join(g).strip() for g in groups if g]
+    numbered = _split_numbered(text)
+    if numbered:
+        return numbered
 
     # --- Strategy 2: blank-line separated ---
     paragraphs = re.split(r"\n\s*\n", text)
@@ -246,6 +338,10 @@ def _is_plausible_reference(ref: dict[str, Any]) -> bool:
         return False
     if _looks_like_body_text(raw):
         return False
+    # The last entry sometimes swallows the appendix that follows the
+    # bibliography (figure captions, tables, prompts).
+    if len(raw) > 1500 and re.search(r"(?:^|\s)(?:Figure|Table|Algorithm)\s+\d+\s*:", raw):
+        return False
     if _looks_like_name_fragment_title(ref.get("title", "")):
         # Real ref but with a corrupted title field; mark so lookup skips
         # AND it's excluded from the match-rate denominator.
@@ -323,13 +419,82 @@ def extract_references_pymupdf4llm(
 # GROBID backend
 # ---------------------------------------------------------------------------
 
-def grobid_is_available() -> bool:
-    """Return True if the GROBID service is reachable."""
+_grobid_alive_cache: dict[str, Any] = {"ts": 0.0, "ok": False}
+
+
+def grobid_is_available(max_age: float = 30.0) -> bool:
+    """Return True if the GROBID service is reachable (cached ``max_age`` s,
+    so UI reruns don't each pay a network round trip)."""
+    now = time.monotonic()
+    if now - _grobid_alive_cache["ts"] < max_age:
+        return _grobid_alive_cache["ok"]
     try:
-        r = _requests.get(f"{GROBID_URL}/api/isalive", timeout=3)
-        return r.status_code == 200
+        ok = _requests.get(f"{GROBID_URL}/api/isalive", timeout=3).status_code == 200
     except Exception:
-        return False
+        ok = False
+    _grobid_alive_cache.update(ts=now, ok=ok)
+    return ok
+
+
+def _clean_doi(value: str) -> str:
+    """Bare DOI from GROBID's idno, which can hold a whole URL
+    ("…/article?id=10.1371/journal.pone.0163309") or LaTeX escapes
+    ("10.1007/978-3-319-06028-6\\_97")."""
+    value = value.replace("\\", "")
+    m = re.search(r"10\.\d{4,9}/\S+", value)
+    return m.group(0).rstrip(".,;)]") if m else ""
+
+
+_ORG_WORD_RE = re.compile(
+    r"\b(?:Committee|Group|Organi[sz]ation|Institute|Consortium|Association|"
+    r"Alliance|Observatory|Foundation|Council|Agency|Society|Working|Standardi[sz]ation|"
+    r"Team|Contributors|Project|Initiative|Lab|Laboratory|Inc|Ltd|Corporation|Office)\b")
+_NAME_LIST_WORDS = {"and", "of", "for", "the", "on", "&", "others", "et", "al", "al."}
+_VENUE_TITLE_RE = re.compile(
+    r"^(?:In\s+)?(?:Proceedings\b|Proc\.|Advances in\b|arXiv\b|Transactions\b|Journal of\b|"
+    r"International Conference\b|Conference on\b|Findings of\b|Workshop\b)", re.I)
+
+
+def _looks_like_venue(text: str) -> bool:
+    return bool(_VENUE_TITLE_RE.match(text.strip()))
+
+
+def _is_name_list(text: str) -> bool:
+    """"Alan Schelten, Alex Vaughan, and others", "Tonja, and 1 others" — a
+    title field that GROBID filled with author names."""
+    words = re.findall(r"[^\s,()]+", text)
+    listy = "," in text or re.search(r"\b(?:and (?:\d+ )?others|et al)\b", text)
+    return (bool(listy) and len(words) >= 3
+            and all(w.lower() in _NAME_LIST_WORDS or w[:1].isupper() or w.isdigit()
+                    for w in words))
+
+
+def _strip_name_prefix(title: str) -> str:
+    """Drop an author / organisation list that GROBID glued to the front of
+    the title, e.g. "Mateusz Lango, and Ondřej Dušek. Leak, cheat, repeat: …"
+    or "ESIP Data … Committee. Data Citation Guideline …".
+
+    Only when the part before the first ". " consists solely of capitalised
+    words (plus and/of/for/the), contains a comma-separated name list or an
+    organisation word, and what follows is still a title of 3+ words."""
+    # Leftovers of a mis-split author list: "others. 2021. Learning …",
+    # "and 1 others. Title", "2019a. Sentencebert: …".
+    title = re.sub(r"^(?:and\s+)?(?:\d+\s+)?others\.\s+", "", title)
+    title = re.sub(r"^\(?(?:19|20)\d{2}[a-z]?\)?\.\s+(?=\S)", "", title)
+    head, sep, rest = title.partition(". ")
+    if not sep or len(rest.split()) < 3:
+        return title
+    words = re.findall(r"[^\s,()]+", head)
+    if not words or any(w.lower() not in _NAME_LIST_WORDS and not w[:1].isupper()
+                        and not w.isdigit() for w in words):
+        return title
+    has_list = (", and " in head or (", " in head and len(words) >= 4)
+                or re.search(r"\b(?:and others|et al)\b", head))
+    if not (has_list or _ORG_WORD_RE.search(head)):
+        return title
+    # ACL / author-year style also leaves the year behind: "2024. The llama 3 …"
+    rest = re.sub(r"^\(?(?:19|20)\d{2}[a-z]?\)?\.\s+", "", rest.strip())
+    return rest.strip()
 
 
 def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
@@ -359,6 +524,9 @@ def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
             if el is not None and el.text:
                 ref["title"] = el.text.strip()
                 break
+
+        if ref.get("title"):
+            ref["title"] = _strip_name_prefix(ref["title"])
 
         # Authors
         authors = []
@@ -397,18 +565,23 @@ def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
                     break
 
         # DOI
-        doi_el = bib.find("tei:idno[@type='DOI']", _TEI_NS)
+        # Identifiers sit under <analytic> or <monogr>, not on biblStruct.
+        doi_el = bib.find(".//tei:idno[@type='DOI']", _TEI_NS)
         if doi_el is not None and doi_el.text:
-            ref["doi"] = doi_el.text.strip()
+            doi = _clean_doi(doi_el.text)
+            if doi:
+                ref["doi"] = doi
 
         # arXiv → URL
-        arxiv_el = bib.find("tei:idno[@type='arXiv']", _TEI_NS)
+        arxiv_el = bib.find(".//tei:idno[@type='arXiv']", _TEI_NS)
         if arxiv_el is not None and arxiv_el.text:
             ref["url"] = f"https://arxiv.org/abs/{arxiv_el.text.strip()}"
 
         # Web pointer fallback
         if not ref.get("url"):
-            ptr = bib.find("tei:ptr[@type='web']", _TEI_NS)
+            ptr = bib.find(".//tei:ptr[@type='web']", _TEI_NS)
+            if ptr is None:
+                ptr = bib.find(".//tei:ptr", _TEI_NS)
             if ptr is not None:
                 ref["url"] = ptr.get("target", "")
 
@@ -432,14 +605,16 @@ def extract_references_grobid(
     ``return_markdown`` returns the raw TEI XML for debugging (not actual markdown).
     """
     with open(pdf_path, "rb") as fh:
-        response = _requests.post(
-            f"{GROBID_URL}/api/processFulltextDocument",
+        response = _grobid_post(
+            "processFulltextDocument",
             files={"input": fh},
-            data={"consolidateReferences": "0",
-                  "includeRawReferences": "1"},
-            timeout=120,
+            # GROBID's parameter names: the old "includeRawReferences" /
+            # "consolidateReferences" were silently ignored, so every raw
+            # string was reconstructed from parsed fields — dropping DOIs,
+            # arXiv IDs and URLs and breaking highlight matching.
+            data={"consolidateCitations": "0",
+                  "includeRawCitations": "1"},
         )
-    response.raise_for_status()
     tei_xml = response.text
 
     references = _parse_tei_references(tei_xml)
@@ -462,8 +637,16 @@ _REF_SECTION_END_RE = re.compile(
     r"(?:A(?:ppendix)?\b|Supplementary|Limitations?|Ethics?|"
     r"Broader\s+Impact|Acknowledg|Author\s+Contributions)|"
     r"[A-Z]\.?\s+(?:Appendix|Supplementary|Limitations?|Ethics?)|"
-    r"\*{0,2}A(?:ppendix)?\s+(?:[A-Z]|\d)|"           # "*A. Implementation*"
-    r"\d+\s+Appendix"
+    # "*A. Implementation*", "Appendix B".  The letter after "A" must be a
+    # real capital: under IGNORECASE "[A-Z]" also matched "A replicability
+    # study" — a wrapped title line — and cut the bibliography in half.
+    r"\*{0,2}(?:A\.?|Appendix)[ \t]+(?:(?-i:[A-Z])(?-i:[a-z]*)\b(?![ \t]+(?-i:[a-z]))|\d)|"
+    r"\d+\s+Appendix|"
+    # ACL style: the appendix letter alone on its line, title on the next
+    # ("A\nSystem Screen Shot", "A.1\nPrompts").
+    r"(?-i:A)(?:\.\d+)?\.?[ \t]*\n[ \t]*(?-i:[A-Z][a-z]+)|"
+    # A figure / table caption can't be part of a bibliography.
+    r"(?-i:Figure|Table)\s+\d+\s*[:.]\s"
     r")",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -475,14 +658,14 @@ def _trim_to_section_end(section_text: str) -> str:
     return section_text[: m.start()] if m else section_text
 
 
-def _looks_like_ref_candidate(raw: str) -> bool:
+def _looks_like_ref_candidate(raw: str, require_year: bool = True) -> bool:
     """Quick filter: must look like a citation, not body text from an appendix."""
     if len(raw) < 30:
         return False
     if _looks_like_body_text(raw):
         return False
     # Needs a 4-digit year — every modern citation has one
-    if not re.search(r"\b(?:19|20)\d{2}\b", raw):
+    if require_year and not re.search(r"\b(?:19|20)\d{2}\b", raw):
         return False
     return True
 
@@ -493,13 +676,11 @@ def _grobid_process_citation_list(citations: list[str]) -> list[dict[str, Any]]:
         return []
     # form-encoded with repeated `citations` parameter; ask for TEI XML
     payload = [("citations", c) for c in citations]
-    response = _requests.post(
-        f"{GROBID_URL}/api/processCitationList",
+    response = _grobid_post(
+        "processCitationList",
         data=payload,
         headers={"Accept": "application/xml"},
-        timeout=120,
     )
-    response.raise_for_status()
     tei = response.text
     refs = _parse_tei_references(tei)
     # processCitationList preserves input order.  Force raw to the input
@@ -524,8 +705,10 @@ def _split_plaintext_bibliography(section: str) -> list[str]:
     earlier `". [A-Z]"` candidates in that span are typically inside the
     title or venue (subtitles, "vol. N", "arXiv:NNNN.").
     """
-    # Un-hyphenate: word- continued on next line
-    text = re.sub(r"-\s*\n\s*", "", section)
+    # Un-hyphenate: word- continued on next line ("evalu-\nation"), but
+    # keep real hyphens before a capital ("Callison-\nBurch").
+    text = re.sub(r"-\s*\n\s*(?=[a-zà-ÿ])", "", section)
+    text = re.sub(r"-\s*\n\s*", "-", text)
     # Drop page footers (a line that is just digits, often a page number)
     text = re.sub(r"\n\s*\d{1,5}\s*\n", "\n", text)
     # Collapse all whitespace
@@ -533,7 +716,9 @@ def _split_plaintext_bibliography(section: str) -> list[str]:
     if not text:
         return []
 
-    year_positions = [m.end() for m in re.finditer(r"\b(?:19|20)\d{2}\.", text)]
+    # A year, not the end of a page range ("33:1877–1901.") or an ID.
+    year_positions = [m.end() for m in re.finditer(
+        r"(?<![–\-:/.\d])\b(?:19|20)\d{2}[a-z]?\.", text)]
     if len(year_positions) < 2:
         return [text] if len(text) >= 30 else []
 
@@ -588,33 +773,91 @@ def _extract_via_section_pipeline(pdf_path: str) -> list[dict[str, Any]]:
     figures/equations, adding 10-30 s per page — a 1-3 minute freeze on
     papers with extensive appendices.
     """
-    import fitz
-    doc = fitz.open(pdf_path)
-    full_text = "\n".join(page.get_text() for page in doc)
-    doc.close()
+    full_text = _plain_text(pdf_path)
     section = _locate_reference_section(full_text)
     if not section:
         return []
     section = _trim_to_section_end(section)
-    # Try the smart plain-text splitter first; fall back to the bullet/blank-line
-    # splitter for sections that have explicit markers.
-    candidates_raw = _split_plaintext_bibliography(section)
+    # Numbered bibliographies split exactly at their markers; only
+    # author-year lists need the year-anchor heuristic.
+    candidates_raw = _split_numbered(section)
+    numbered = bool(candidates_raw)
+    if not numbered:
+        candidates_raw = _split_plaintext_bibliography(section)
     if len(candidates_raw) < 3:
         candidates_raw = _split_into_references(section)
-    candidates = [c for c in candidates_raw if _looks_like_ref_candidate(c)]
+    # A numbered entry is delimited by its markers, so it needn't carry a
+    # year to count (standards, software, "n.d." web pages).
+    candidates = [c for c in candidates_raw
+                  if _looks_like_ref_candidate(c, require_year=not numbered)]
     if not candidates:
         return []
-    try:
-        refs = _grobid_process_citation_list(candidates)
-    except Exception:
-        return []
+    refs = _grobid_process_citation_list(candidates)   # ParserError propagates
     return [r for r in refs if _is_plausible_reference(r)]
+
+
+def _plain_text(pdf_path: str) -> str:
+    """PyMuPDF text of every page (no OCR, no markdown conversion), with
+    page furniture removed: line numbers of review manuscripts, page
+    numbers, and running headers / footers that repeat on most pages.
+    Left in, they land in the middle of references that cross a page."""
+    import fitz
+    with fitz.open(pdf_path) as doc:
+        pages = [page.get_text().splitlines() for page in doc]
+    return "\n".join("\n".join(lines) for lines in _strip_page_furniture(pages))
+
+
+def _furniture_key(line: str) -> str:
+    """Line with digits removed — "Manuscript … 31" and "… 32" compare equal."""
+    return re.sub(r"\d+", "#", line.strip().lower())
+
+
+def _strip_page_furniture(pages: list[list[str]]) -> list[list[str]]:
+    from collections import Counter
+    n_pages = len(pages)
+    # Line / page numbers first, so the header is "first line" again.
+    pages = [[l for l in lines if not re.fullmatch(r"\d{1,5}", l.strip())] for lines in pages]
+    counts: Counter[str] = Counter()
+    for lines in pages:
+        # Headers / footers sit in the first or last few lines of a page.
+        edge = lines[:4] + lines[-4:]
+        counts.update({_furniture_key(l) for l in edge if l.strip()})
+    min_pages = max(3, n_pages // 3)
+    repeated = {k for k, c in counts.items() if c >= min_pages and len(k) <= 120}
+    out = []
+    for lines in pages:
+        kept = []
+        for i, line in enumerate(lines):
+            at_edge = i < 4 or i >= len(lines) - 4
+            if at_edge and _furniture_key(line) in repeated:
+                continue
+            kept.append(line)
+        out.append(kept)
+    return out
 
 
 def _norm_for_dedup(text: str) -> str:
     """Lowercase + strip + collapse whitespace + drop punctuation, for fuzzy dedup."""
     text = re.sub(r"[^\w\s]", " ", text.lower())
     return " ".join(text.split())
+
+
+def _distinct_refs(a: dict[str, Any], b: dict[str, Any], check_year: bool = True) -> bool:
+    """True when two similar-titled refs are evidently different works:
+    the titles carry different numbers ("CLEF 2017 …" vs "CLEF 2018 …",
+    "Part 1" vs "Part 2"), or both have a year / DOI and they differ."""
+    ta, tb = (r.get("title") or "" for r in (a, b))
+    garbage = any(_looks_like_venue(t) or _is_name_list(t) for t in (ta, tb))
+    na, nb = (set(re.findall(r"\d+", t)) for t in (ta, tb))
+    # "2017" vs "2018" separates works; {1, 32} vs {1} is a lost "-32b"
+    # from hyphenation, not a different work.
+    if na and nb and not (na <= nb or nb <= na) and not garbage:
+        return True
+    ya, yb = (a.get("year") or "").strip(), (b.get("year") or "").strip()
+    if check_year and ya and yb and ya != yb:
+        return True
+    da, db = (a.get("doi") or "").lower().strip(), (b.get("doi") or "").lower().strip()
+    return bool(da and db and da != db)
 
 
 def dedupe_references(
@@ -634,10 +877,17 @@ def dedupe_references(
     venues sometimes get truncated in one source but full in another).
     Each kept ref gains a `_merged_from` list of duplicate raws so the
     user can see what was folded together.
+
+    Each ref also gets ``_orig_index`` (its position in the parser output)
+    and merged refs collect ``_merged_orig_indices``, so numeric citation
+    markers ("[12]") still resolve to the right entry after merging.
     """
     from rapidfuzz import fuzz as _fuzz
     if not refs:
         return [], 0
+    for i, r in enumerate(refs):
+        if not r.get("_user_added") and not r.get("_auto_added"):
+            r.setdefault("_orig_index", i)
 
     kept: list[dict[str, Any]] = []
     kept_titles_norm: list[str] = []
@@ -654,6 +904,8 @@ def dedupe_references(
         canonical.setdefault("_merged_from", []).append(
             (dup.get("raw") or "")[:200]
         )
+        if "_orig_index" in dup:
+            canonical.setdefault("_merged_orig_indices", []).append(dup["_orig_index"])
 
     for ref in refs:
         # User-added refs are NEVER auto-merged — they're explicit user input.
@@ -672,7 +924,9 @@ def dedupe_references(
         # Find a fuzzy title match among already-kept refs
         match_idx = -1
         for i, kt in enumerate(kept_titles_norm):
-            if kt and _fuzz.token_sort_ratio(t, kt) >= title_threshold:
+            if (kt and _fuzz.token_sort_ratio(t, kt) >= title_threshold
+                    and not kept[i].get("_user_added")
+                    and not _distinct_refs(ref, kept[i])):
                 match_idx = i
                 break
 
@@ -704,24 +958,47 @@ def _merge_ref_lists(
     primary_raws   = [_norm_for_dedup(r.get("raw")   or "") for r in primary]
 
     merged = list(primary)
+    claimed: set[int] = set()
     for s in secondary:
         st = _norm_for_dedup(s.get("title") or "")
         sr = _norm_for_dedup(s.get("raw") or "")
         if not st and not sr:
             continue
 
-        dup_idx = None
+        # Best match, not the first one over the threshold: "Kernel
+        # principal component analysis" must not land on an earlier
+        # "Principal component analysis".  Each primary entry absorbs at
+        # most one secondary entry.
+        dup_idx, best = None, 0.0
         for i, (pt, pr) in enumerate(zip(primary_titles, primary_raws)):
+            if i in claimed:
+                continue
+            # Two parses of the same citation can disagree on the year,
+            # so only numbers in the title and DOIs separate them here.
+            if _distinct_refs(s, primary[i], check_year=False):
+                continue
+            score = 0.0
             # Title match is the strong signal
-            if st and pt and _fuzz.token_sort_ratio(st, pt) >= title_threshold:
-                dup_idx = i
-                break
-            # Fallback: high partial overlap on raw text (catches cases
-            # where one source extracted a fragmentary title but the raw
-            # is the same citation)
-            if sr and pr and _fuzz.partial_ratio(sr, pr) >= 90 and min(len(sr), len(pr)) >= 50:
-                dup_idx = i
-                break
+            if st and pt:
+                t = _fuzz.token_sort_ratio(st, pt)
+                if t >= title_threshold:
+                    score = t
+            # Fallback: high partial overlap on raw text (one side got a
+            # fragmentary or garbage title, but it is the same citation).
+            # Not when the primary raw is much longer and its title is
+            # nowhere in this entry: then the primary holds two citations
+            # glued together and this is the one it swallowed.
+            if sr and pr and min(len(sr), len(pr)) >= 50:
+                r = _fuzz.partial_ratio(sr, pr)
+                glued = (len(pr) >= 1.4 * len(sr) and st and pt
+                         and not _is_name_list(primary[i].get("title") or "")
+                         and _fuzz.partial_ratio(pt, sr) < 80)
+                if r >= 90 and not glued:
+                    score = max(score, r - 0.5)   # a title match wins ties
+            if score > best:
+                dup_idx, best = i, score
+        if dup_idx is not None:
+            claimed.add(dup_idx)
 
         if dup_idx is None:
             merged.append(s)
@@ -735,7 +1012,203 @@ def _merge_ref_lists(
         s_raw = s.get("raw") or ""
         if s_raw and merged[dup_idx].get("raw") != s_raw:
             merged[dup_idx] = {**merged[dup_idx], "raw": s_raw}
+        better = _better_title(merged[dup_idx].get("title") or "", s.get("title") or "")
+        if better:
+            merged[dup_idx] = {**merged[dup_idx], "title": better}
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Deterministic repair against the printed citation text
+# ---------------------------------------------------------------------------
+# GROBID's CRF splits "Peter G. Anick and Rex A. Flynn" into forename /
+# surname pairs that drift across names ("G Peter, Rex Anick, Flynn") and
+# sometimes stops a title at a comma.  With the real citation text in
+# ``raw`` both can be checked and fixed without an LLM.
+
+_NAME_TOKEN_RE = re.compile(r"^(?:[A-ZÀ-ÖØ-Þ][\w'’\-]*\.?|[A-Z]\.(?:-?[A-Z]\.)*|"
+                            r"de|van|von|der|den|da|di|du|la|le|dos|del|bin|al|el|ter|ten)$")
+
+
+def _dehyphenate(text: str) -> str:
+    """Undo line-break hyphenation: "Sori- cut" → "Soricut"; keep real
+    hyphens before a capital ("Klaus- Robert" → "Klaus-Robert")."""
+    text = re.sub(r"(\w)- (?=[a-zà-ÿ])", r"\1", text)
+    return re.sub(r"(\w)- (?=[A-ZÀ-Þ])", r"\1-", text)
+
+
+def _norm_loose(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return " ".join(re.sub(r"[^\w\s]", " ", s).split())
+
+
+def _title_start(body: str, title: str) -> int:
+    """Index of ``title`` in ``body`` (loose match on its first words), or -1."""
+    words = re.findall(r"\w+", title)[:6]
+    if len(words) < 2:
+        return -1
+    pat = r"[\W_]+".join(re.escape(w) for w in words)
+    m = re.search(pat, body, re.I)
+    return m.start() if m else -1
+
+
+def _names_from_raw(raw: str, title: str) -> list[str] | None:
+    """Author names as printed before the title, when they are written
+    "First Middle Last" (ACM, ACL, IEEE).  None when the segment can't be
+    read that way — "Last, F." styles, editors, no title found."""
+    body = _dehyphenate(re.sub(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*", "", raw))
+    i = _title_start(body, title)
+    if i <= 0:
+        return None
+    seg = body[:i].strip()
+    seg = re.sub(r"[“\"'‘(]+$", "", seg).strip()
+    # Trailing year ("2024b.", "(2020).") of author-year styles
+    seg = re.sub(r"[.,]?\s*\(?(?:19|20)\d{2}[a-z]?\)?[.,:]?$", "", seg).strip()
+    seg = seg.rstrip(".,:; ")
+    if not seg or len(seg) > 2000:
+        return None
+    parts = [p.strip() for p in re.split(r",\s*(?:and\s+|&\s+)?|\s+and\s+|\s+&\s+", seg) if p.strip()]
+    names = [p for p in parts if not re.fullmatch(r"(?:\d+\s+)?others|et\s+al\.?", p, re.I)]
+    if not names:
+        return None
+    for n in names:
+        toks = n.split()
+        if not 2 <= len(toks) <= 6:
+            return None             # "Smith", "J." → a "Last, F." style
+        if not all(_NAME_TOKEN_RE.match(t) for t in toks):
+            return None
+        last = toks[-1]
+        if len(last.rstrip(".")) < 2 or last.endswith("."):
+            return None             # ends in an initial → "Last, F. M." style
+    return names
+
+
+def _surname_set(names: list[str]) -> set[str]:
+    return {(_norm_loose(n).split() or [""])[-1] for n in names if _norm_loose(n)}
+
+
+def _extend_title(raw: str, title: str) -> str:
+    """Complete a title GROBID ended at a comma: "… High-Impact Pediatrics"
+    → "… High-Impact Pediatrics, Cardiology and Surgery Journals: A
+    Cross-Sectional Study".  Only within the same sentence, and only when
+    the continuation doesn't look like a venue, pages or a year."""
+    body = _dehyphenate(" ".join(raw.split()))
+    words = re.findall(r"\w+", title)
+    if len(words) < 2:
+        return title
+    whole = re.search(r"[\W_]+".join(re.escape(w) for w in words), body, re.I)
+    if not whole:
+        return title
+    rest = body[whole.end():]
+    if not rest.startswith(", "):
+        return title
+    stop = re.search(r"[.?!](?:\s|$)", rest)
+    extra = rest[: stop.start()] if stop else ""
+    if (not extra or len(extra.split()) > 15 or re.search(r"\d", extra)
+            or re.search(r"\b(?:In|Proceedings|Proc|Journal|Conference|vol|pp|pages|"
+                         r"Springer|ACM|IEEE|arXiv|Press|University)\b", extra)):
+        return title
+    return (title.rstrip(".") + extra).strip()
+
+
+def _org_author_from_raw(raw: str, title: str) -> str:
+    """"International Organization for Standardization (ISO)" — a corporate
+    author GROBID left empty.  Only short segments naming an organisation."""
+    body = re.sub(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*", "", " ".join(raw.split()))
+    i = _title_start(body, title)
+    if i <= 0:
+        return ""
+    seg = re.sub(r"[.,]?\s*\(?(?:19|20)\d{2}[a-z]?\)?[.,:]?$", "", body[:i].strip()).rstrip(".,:; ")
+    if 3 <= len(seg) <= 160 and (_ORG_WORD_RE.search(seg) or re.search(r"\([A-Z]{2,}\)", seg)):
+        return seg
+    return ""
+
+
+def _repair_from_raw(ref: dict[str, Any]) -> dict[str, Any]:
+    raw, title = ref.get("raw") or "", (ref.get("title") or "").strip()
+    if not raw or not title:
+        return ref
+    out = ref
+    # Publisher / organisation appended to the title:
+    # "Data Citation of Evolving Data. Research Data Alliance"
+    head, sep, tail = title.rpartition(". ")
+    if sep and len(head.split()) >= 3 and len(tail.split()) <= 5 and (
+            _ORG_WORD_RE.search(tail) or _looks_like_venue(tail)):
+        title = head
+        out = {**out, "title": title}
+    names = _names_from_raw(raw, title)
+    if names:
+        grobid = [a for a in (ref.get("authors") or "").split(", ") if a]
+        # A scramble re-assigns the same name tokens; a different token set
+        # means raw holds a neighbouring citation — leave GROBID's names.
+        g_tokens = set(_norm_loose(" ".join(grobid)).split())
+        r_tokens = set(_norm_loose(" ".join(names)).split())
+        same_people = not g_tokens or len(g_tokens & r_tokens) >= 0.6 * len(g_tokens)
+        if same_people and _surname_set(names) != _surname_set(grobid):
+            out = {**out, "authors": ", ".join(names), "_authors_from_raw": True}
+    elif not (ref.get("authors") or "").strip():
+        org = _org_author_from_raw(raw, title)
+        if org:
+            out = {**out, "authors": org}
+    longer = _extend_title(raw, title)
+    if longer != title:
+        out = {**out, "title": longer}
+    return out
+
+
+def _line_break_hyphen_fixer(doc_text: str):
+    """Restore real hyphens that a line break made ambiguous.
+
+    "few-⏎shot" in a PDF is either a hyphenated word ("evalu-⏎ation") or a
+    compound broken at its hyphen ("few-shot").  Parsers (GROBID too) join
+    both, and "Language models are fewshot learners" then matches nothing
+    in the indexes.  The document decides: if the joined form never occurs
+    elsewhere in it but the second part does as a word, the hyphen was real."""
+    breaks = {(m.group(1), m.group(2))
+              for m in re.finditer(r"\b([A-Za-z]{2,})-[ \t]*\n\s*([a-z]{2,})\b", doc_text)}
+    if not breaks:
+        return lambda s: s
+    clean = re.sub(r"[A-Za-z]+-[ \t]*\n\s*[A-Za-z]+", " ", doc_text)
+    from collections import Counter
+    tokens = Counter(re.findall(r"[a-z]+", clean.lower()))
+    compounds: dict[str, int] = {}
+    for a, b in breaks:
+        joined = (a + b).lower()
+        # The second part is the telling one: hyphenation leaves fragments
+        # ("-ation", "-hoods", "-cessing") that never stand alone, while a
+        # compound's second word ("shot", "training", "based") does.
+        # Lowercase only (names such as "Bren-⏎nan" stay joined), and a
+        # second part of 4+ letters ("lever-⏎age" is hyphenation).
+        if a[0].islower() and not tokens[joined] and len(b) >= 4 and tokens[b.lower()]:
+            compounds[joined] = len(a)
+    if not compounds:
+        return lambda s: s
+    rx = re.compile(r"\b(" + "|".join(map(re.escape, sorted(compounds, key=len, reverse=True)))
+                    + r")\b", re.I)
+
+    def fix(s: str) -> str:
+        return rx.sub(lambda m: m.group(0)[:compounds[m.group(0).lower()]] + "-"
+                      + m.group(0)[compounds[m.group(0).lower()]:], s)
+    return fix
+
+
+def _better_title(primary: str, secondary: str) -> str:
+    """The citation-list title when it fixes a typical full-document error:
+    the venue glued on ("Title. Advances in Neural …") or a leading
+    "name:" lost ("A Toolkit …" for "pybool_ir: A Toolkit …").  "" = keep."""
+    p, q = primary.strip().rstrip("."), secondary.strip().rstrip(".")
+    if not q or p == q:
+        return ""
+    if not p or (_looks_like_venue(p) and not _looks_like_venue(q)):
+        return q
+    if p.startswith(q + ". ") and len(q.split()) >= 3:
+        return q
+    if _is_name_list(p) and not _is_name_list(q) and len(q.split()) >= 2:
+        return q
+    if q.endswith(": " + p) or (q.endswith(p) and re.match(r"^[^\s]+:\s", q)):
+        return q
+    return ""
 
 
 def extract_references_hybrid(
@@ -761,26 +1234,40 @@ def extract_references_hybrid(
     # Run GROBID full-doc parse and the pymupdf-section pipeline in
     # parallel — they share no state and hit different HTTP endpoints.
     from concurrent.futures import ThreadPoolExecutor
+    errors: list[str] = []
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_grobid  = pool.submit(extract_references_grobid, pdf_path)
         f_section = pool.submit(_extract_via_section_pipeline, pdf_path)
         try:
             grobid_refs = f_grobid.result()
-        except Exception:
+        except Exception as e:
+            errors.append(str(e))
             grobid_refs = []
         try:
             section_refs = f_section.result()
-        except Exception:
+        except Exception as e:
+            errors.append(str(e))
             section_refs = []
-
     merged = _merge_ref_lists(grobid_refs, section_refs)
-    merged = [r for r in merged if _is_plausible_reference(r)]
+    merged = [_repair_from_raw(r) for r in merged if _is_plausible_reference(r)]
+    try:
+        fix = _line_break_hyphen_fixer(_plain_text(pdf_path))
+        # Titles only: they drive the lookups.  Raw text stays as printed
+        # (highlighting and the author repair compare against the PDF).
+        merged = [{**r, "title": fix(r["title"])} if r.get("title") else r for r in merged]
+    except Exception:
+        pass
+    if errors and not merged:
+        # Both halves need GROBID; silently returning [] used to show
+        # "no references found" when the real problem was GROBID.
+        raise ParserError(errors[0])
 
     if return_markdown:
-        # Best-effort: return the markdown for debugging the section split
+        # Debug view of what the section splitter saw.  Plain page text,
+        # not pymupdf4llm: to_markdown can trigger minutes of OCR on
+        # appendix pages and this ran on every hybrid parse.
         try:
-            import pymupdf4llm
-            md = pymupdf4llm.to_markdown(pdf_path)
+            md = _locate_reference_section(_plain_text(pdf_path)) or ""
         except Exception:
             md = ""
         return merged, md

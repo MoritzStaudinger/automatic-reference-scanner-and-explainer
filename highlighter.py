@@ -9,6 +9,8 @@ from typing import Any
 
 import fitz  # PyMuPDF
 
+from verdict import STATUS_RGB
+
 
 Color = tuple[float, float, float]
 
@@ -18,15 +20,7 @@ Color = tuple[float, float, float]
 #   missing  = yellow  → couldn't find in any database (NOT proof of wrong;
 #                        common for blogs/tech-reports/uncommon venues)
 #   pending  = pale yellow → lookup not yet completed
-COLORS: dict[str, Color] = {
-    "match":    (0.18, 0.78, 0.35),   # green
-    "mismatch": (0.93, 0.27, 0.27),   # red
-    "missing":  (1.00, 0.85, 0.20),   # clearer yellow
-    "pending":  (1.00, 0.85, 0.20),   # same yellow as missing — pending and
-                                      # missing are visually indistinguishable
-                                      # in the UI, so the baked PDF colour
-                                      # matches.  Status changes after lookup.
-}
+COLORS: dict[str, Color] = dict(STATUS_RGB)
 
 
 def _clean_for_search(text: str) -> str:
@@ -91,11 +85,147 @@ def _search_snippets(raw: str, title: str = "") -> list[str]:
     return snippets
 
 
+_ORPHAN_AUTHOR_START_RE = re.compile(
+    r"^[A-Z][a-zA-Z\-']{1,}"          # capital surname
+    r"(?:,?\s+[A-Z]\.?"               # comma+initial OR
+    r"|\s+[A-Z][a-zA-Z\-']+)",        # space+capital first name
+)
+_ORPHAN_DOI_RE   = re.compile(r"10\.\d{4,}/\S+")
+_ORPHAN_ARXIV_RE = re.compile(r"arXiv:\s*\d{4}\.\d+|arxiv\.org/", re.IGNORECASE)
+_ORPHAN_URL_RE   = re.compile(r"https?://", re.IGNORECASE)
+_ORPHAN_ETAL_RE  = re.compile(r"\bet\s*al\.?\b", re.IGNORECASE)
+
+# Phrases that mark text as prose / not a citation.  Conservative: each
+# of these is something we'd basically never see at the START of a
+# bibliography entry but commonly see in body text inside the bib
+# region (e.g. an editor's note, an embedded paragraph).
+_ORPHAN_BODY_MARKERS = (
+    "we propose", "we present", "we describe", "in this paper",
+    "in this section", "in this work", "in conclusion",
+    "table ", "figure ", "section ", "appendix ",
+    "as shown in", "for example", "however,",
+)
+
+
+def _orphan_confidence(text: str) -> str:
+    """
+    Classify an orphan text block as 'high' or 'low' confidence reference.
+
+    'high' means the block looks unambiguously like a bibliography
+    entry (author surname start + ref-shaped punctuation + at least one
+    strong signal: DOI / arXiv ID / URL / "et al" / ≥3 commas).  Callers
+    can auto-add these as references without user review.
+
+    'low' means we surface it as a "possible missed reference" but
+    don't act on it automatically.  Stays in the manual-triage panel.
+    """
+    text = text.strip()
+    if len(text) < 60:
+        return "low"
+
+    if not _ORPHAN_AUTHOR_START_RE.match(text):
+        return "low"
+
+    low = text.lower()
+    if any(marker in low for marker in _ORPHAN_BODY_MARKERS):
+        return "low"
+
+    has_doi          = bool(_ORPHAN_DOI_RE.search(text))
+    has_arxiv        = bool(_ORPHAN_ARXIV_RE.search(text))
+    has_url          = bool(_ORPHAN_URL_RE.search(text))
+    has_etal         = bool(_ORPHAN_ETAL_RE.search(text))
+    has_many_commas  = text.count(",") >= 3
+
+    if has_doi or has_arxiv or has_url or has_etal or has_many_commas:
+        return "high"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Line-level locating
+# ---------------------------------------------------------------------------
+# PyMuPDF often splits one reference over several text blocks (at a
+# hyperlinked DOI / URL, a font change, a column or page break), so
+# highlighting the single best-matching block left references partially
+# boxed or not boxed at all.  Instead: find the line where the reference
+# starts, follow it line by line in reading order (across columns and
+# pages), and draw one rectangle per contiguous piece.
+
+def _collect_lines(doc) -> list[tuple[int, "fitz.Rect", str]]:
+    lines = []
+    for page in doc:
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for line in b.get("lines") or []:
+                t = "".join(sp.get("text", "") for sp in line.get("spans") or [])
+                n = _clean_for_search(t).lower()
+                if n:
+                    lines.append((page.number, fitz.Rect(line["bbox"]), n))
+    return lines
+
+
+def _locate_by_lines(ref_norm: str, lines, used: list[bool]) -> list[int] | None:
+    """Indices of the lines that make up ``ref_norm`` (best start wins)."""
+    from rapidfuzz import fuzz
+    if len(ref_norm) < 25:
+        return None
+    head = ref_norm[:60]
+    budget = len(ref_norm) * 1.15
+    best: tuple[float, list[int]] | None = None
+    for i, (_pn, _r, n) in enumerate(lines):
+        if used[i] or len(n) < 8:
+            continue
+        # The reference must *start* on this line.
+        if fuzz.partial_ratio(n[:30], head) < 88:
+            continue
+        if fuzz.ratio(n[:40], ref_norm[:min(len(n), 40)]) < 75:
+            continue
+        run, acc, j, skipped = [i], len(n), i + 1, False
+        while j < len(lines) and acc < budget and not used[j]:
+            nj = lines[j][2]
+            if fuzz.partial_ratio(nj, ref_norm) >= 88:
+                run.append(j)
+                acc += len(nj) + 1
+                skipped = False
+            elif len(nj) < 15 and not skipped:
+                skipped = True       # page number / running header between pieces
+            else:
+                break
+            j += 1
+        text = " ".join(lines[k][2] for k in run)
+        score = fuzz.ratio(text, ref_norm)
+        if best is None or score > best[0]:
+            best = (score, run)
+    return best[1] if best and best[0] >= 75 else None
+
+
+def _group_rects(run: list[int], lines) -> list[tuple[int, "fitz.Rect"]]:
+    """Merge consecutive lines into one rectangle per column / page piece."""
+    groups: list[tuple[int, fitz.Rect]] = []
+    for k in run:
+        pn, r, _ = lines[k]
+        if groups:
+            gpn, g = groups[-1]
+            if (gpn == pn and abs(r.x0 - g.x0) < 40
+                    and -3 <= r.y0 - g.y1 < 8):
+                groups[-1] = (gpn, fitz.Rect(g) | r)   # `g |= r` doesn't update the list
+                continue
+        groups.append((pn, fitz.Rect(r)))
+    return groups
+
+
+def _pdf_native(rect: "fitz.Rect", page_h: float) -> list[float]:
+    """PyMuPDF top-down y → PDF-native bottom-up y (what PDF.js expects)."""
+    return [rect.x0, page_h - rect.y1, rect.x1, page_h - rect.y0]
+
+
 def highlight_references(
     pdf_bytes: bytes,
     references: list[dict[str, Any]],
     statuses: list[str] | None = None,
-) -> tuple[bytes, list[dict[str, Any]]]:
+    bake_color: bool = True,
+) -> tuple[bytes, list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Add highlights for each reference found in the PDF.
 
@@ -108,17 +238,20 @@ def highlight_references(
     statuses : list[str] | None
         Per-reference status strings (``"match"``, ``"mismatch"``,
         ``"missing"``, ``"pending"``).  Defaults to ``"pending"`` for all.
+    bake_color : bool
+        Whether to draw colored rectangles into the PDF page content.
 
-    Returns
-    -------
-    annotated_pdf : bytes
-    enriched_refs : list[dict]
-        Each entry gains ``page`` (1-based int or None) and ``found`` (bool).
-    orphan_blocks : list[dict]
-        Text blocks on pages where parsed refs live but that no ref claimed
-        AND that look citation-shaped (year + ≥40 chars).  Surfaced in the
-        UI as "possible missed references" the user can add manually.
-        Each: {"page": 1-based int, "rect": [x0,y0,x1,y1], "text": str}.
+        ``True`` (default) — used by the legacy ``streamlit_pdf_viewer``
+        viewer which has no overlay capability; the colour has to live in
+        the PDF bytes themselves.
+
+        ``False`` — used by our custom ``pdf_selector`` component, which
+        paints its own DOM overlay rectangles on top of PDF.js.  Baking
+        the rect AS WELL doubles the visual opacity for parsed refs
+        (baked 30% + overlay ~14%), while manually-added refs would only
+        get the overlay — producing the "different shade of yellow"
+        symptom the user sees.  We still record ``rect`` / ``page`` on
+        each entry so the overlay knows where to draw.
     """
     if statuses is None:
         statuses = ["pending"] * len(references)
@@ -211,6 +344,8 @@ def highlight_references(
             blocks.append((page.number, rect, text, norm))
 
     used_block_idx: set[int] = set()  # blocks already claimed by an earlier ref
+    lines = _collect_lines(doc)
+    line_used = [False] * len(lines)
 
     for ref, status in zip(references, statuses):
         entry = dict(ref)
@@ -224,7 +359,25 @@ def highlight_references(
             enriched.append(entry)
             continue
 
-        # Score every block by best fuzzy match on raw OR title.
+        run = _locate_by_lines(ref_raw, lines, line_used) if ref_raw else None
+        if run:
+            for k in run:
+                line_used[k] = True
+            pieces = _group_rects(run, lines)
+            rects = []
+            for pn, rect in pieces:
+                page = doc[pn]
+                if bake_color:
+                    page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
+                                   width=0, overlay=True)
+                rects.append({"page": pn + 1, "rect": _pdf_native(rect, page.rect.height)})
+            entry.update(found=True, page=rects[0]["page"], rect=rects[0]["rect"],
+                         rects=rects, status=status)
+            enriched.append(entry)
+            continue
+
+        # Fallback: best-matching block.  Score every block by best fuzzy
+        # match on raw OR title.
         # Use partial_ratio so a short ref title still scores high against
         # a longer block (block can contain title + venue etc.).
         best_score = 0
@@ -244,16 +397,19 @@ def highlight_references(
         if best_idx >= 0 and best_score >= 80:
             pn, rect, _, _ = blocks[best_idx]
             page = doc[pn]
-            # Draw the highlight as page CONTENT, not as a PDF annotation.
-            # add_rect_annot would create an interactive widget that PDF.js
-            # renders in its AnnotationLayer with pointer-events:auto —
-            # which intercepts clicks on any PDF link annotation underneath
-            # (DOIs, URLs, etc.) and makes them unclickable.  draw_rect
-            # bakes the rectangle into the page's content stream, so it's
-            # visually identical but completely non-interactive — links
-            # underneath stay clickable.
-            page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
-                           width=0, overlay=True)
+            if bake_color:
+                # Draw the highlight as page CONTENT, not as a PDF annotation.
+                # add_rect_annot would create an interactive widget that PDF.js
+                # renders in its AnnotationLayer with pointer-events:auto —
+                # which intercepts clicks on any PDF link annotation underneath
+                # (DOIs, URLs, etc.) and makes them unclickable.  draw_rect
+                # bakes the rectangle into the page's content stream, so it's
+                # visually identical but completely non-interactive — links
+                # underneath stay clickable.
+                page.draw_rect(rect, color=None, fill=color, fill_opacity=0.30,
+                               width=0, overlay=True)
+            # When `bake_color` is False we still record rect + page so the
+            # JS overlay knows where to draw — it just owns the colour.
             used_block_idx.add(best_idx)
             entry["found"] = True
             entry["page"] = pn + 1
@@ -272,15 +428,31 @@ def highlight_references(
                 rect.x1,
                 page_h - rect.y0,   # top of pymupdf box → y1 in PDF native
             ]
+            entry["rects"] = [{"page": entry["page"], "rect": entry["rect"]}]
             entry["status"] = status
 
         enriched.append(entry)
 
     # Identify orphan blocks — text paragraphs in the bibliography region
     # that no reference claimed.  These are the most likely "missed refs"
-    # the user might want to add manually.  We restrict to blocks on pages
-    # where at least one parsed ref was located (so we don't surface body
-    # text from the rest of the doc).
+    # the user might want to add (or the system might want to auto-add).
+    # Restricted to pages where at least one parsed ref was located
+    # (so we don't surface body text from the rest of the doc).
+    #
+    # Each orphan carries a `confidence` field — "high" means we're
+    # confident enough to auto-add it as a ref (callers can do this
+    # without user review); "low" means it goes to the "possible missed
+    # references" panel for manual triage.
+    lines_by_page: dict[int, list[int]] = {}
+    for k, (lpn, _lr, _) in enumerate(lines):
+        lines_by_page.setdefault(lpn, []).append(k)
+    for bi, (pn, rect, _t, _n) in enumerate(blocks):
+        inside = [k for k in lines_by_page.get(pn, [])
+                  if rect.contains(fitz.Point((lines[k][1].x0 + lines[k][1].x1) / 2,
+                                              (lines[k][1].y0 + lines[k][1].y1) / 2))]
+        if inside and sum(line_used[k] for k in inside) >= 0.5 * len(inside):
+            used_block_idx.add(bi)
+
     pages_with_refs = {e["page"] for e in enriched if e.get("page")}
     orphans: list[dict[str, Any]] = []
     import re as _re_h
@@ -289,15 +461,27 @@ def highlight_references(
             continue
         if (pn + 1) not in pages_with_refs:
             continue
-        # Heuristic: must look like a citation (has year + reasonable length).
+        # Baseline orphan filter: must look like a citation
+        # (has year + reasonable length).
         if len(text) < 40:
             continue
         if not _re_h.search(r"\b(?:19|20)\d{2}\b", text):
             continue
+        # PDF-native rect coords (bottom-up y) — same convention as
+        # parsed-ref rects above so the JS overlay can render
+        # auto-added orphans consistently.
+        page_h_orph = doc[pn].rect.height
+        pdf_rect = [
+            rect.x0,
+            page_h_orph - rect.y1,
+            rect.x1,
+            page_h_orph - rect.y0,
+        ]
         orphans.append({
-            "page": pn + 1,
-            "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
-            "text": text,
+            "page":       pn + 1,
+            "rect":       pdf_rect,
+            "text":       text,
+            "confidence": _orphan_confidence(text),
         })
         # NOTE: we deliberately do NOT draw the orphan rectangle as a PyMuPDF
         # annotation here.  The PDF selector component receives `orphans` via

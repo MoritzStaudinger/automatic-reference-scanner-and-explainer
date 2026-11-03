@@ -15,15 +15,13 @@
 //   4. Text-layer painting is manual (PDF.js v4 TextLayer class was
 //      flaky); spans are transparent but selectable.
 
-const PDFJS_VERSION = "4.0.379";
 
+// Vendored copy (see vendor/README.md) — no third-party CDN at runtime.
 async function loadPdfJs() {
   if (window._pdfjs) return window._pdfjs;
-  const mod = await import(
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.mjs`
-  );
-  mod.GlobalWorkerOptions.workerSrc =
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+  const base = new URL("./vendor/", import.meta.url);
+  const mod = await import(new URL("pdf.min.js", base).href);
+  mod.GlobalWorkerOptions.workerSrc = new URL("pdf.worker.min.js", base).href;
   window._pdfjs = mod;
   return mod;
 }
@@ -337,11 +335,15 @@ async function renderAllPages() {
         if (a.page !== n || typeof a.ref_index !== "number") continue;
         const r = annotViewportRect(a, viewport);
         if (x >= r.left && x <= r.left + r.w && y >= r.top && y <= r.top + r.h) {
-          Streamlit.setComponentValue({
-            kind: "ref_click",
-            ref_index: a.ref_index,
-            id: `ref-${Date.now()}-${a.ref_index}`,
-          });
+          if (list.items) {
+            focusCard(a.ref_index);
+          } else {
+            Streamlit.setComponentValue({
+              kind: "ref_click",
+              ref_index: a.ref_index,
+              id: `ref-${Date.now()}-${a.ref_index}`,
+            });
+          }
           e.stopPropagation();
           return;
         }
@@ -362,9 +364,7 @@ async function renderAllPages() {
     const idx = state.pendingScrollToPage - 1;
     if (state.pageElements[idx]) {
       // small delay to let layout settle
-      requestAnimationFrame(() =>
-        state.pageElements[idx].el.scrollIntoView({ block: "start", behavior: "auto" })
-      );
+      requestAnimationFrame(() => scrollWrapTo(state.pageElements[idx].el, "auto"));
     }
     state.pendingScrollToPage = null;
   }
@@ -402,6 +402,7 @@ function setupPageObserver() {
     if (best.pageNum !== state.pageNum) {
       state.pageNum = best.pageNum;
       updatePageBar();
+      if (list.items && list.pageOnly) renderList();
       emitPageChange();
     }
   }
@@ -429,10 +430,42 @@ function updatePageBar() {
   if (label) label.textContent = `${state.pageNum} / ${state.totalPages}`;
 }
 
+// Scroll only the viewer's own container.  scrollIntoView() also scrolls
+// every ancestor — including the Streamlit page around this iframe — so
+// "Show on p. N" used to yank the whole app down.
+function scrollWrapTo(el, behavior) {
+  const wrap = document.getElementById("pages-wrap");
+  if (!wrap || !el) return;
+  const top = el.getBoundingClientRect().top - wrap.getBoundingClientRect().top + wrap.scrollTop;
+  wrap.scrollTo({ top: Math.max(0, top - 8), behavior });
+}
+
+// Scroll a reference into view and flash an outline around it — the
+// card → PDF backlink.  Works when the reference is on the current page
+// too (the page-only jump did nothing then).
+let _lastFocusNonce = null;
+function focusOn(focus) {
+  if (!focus || focus.nonce === _lastFocusNonce) return;
+  const pi = state.pageElements[(focus.page || 1) - 1];
+  if (!pi) return;
+  _lastFocusNonce = focus.nonce;
+  const wrap = document.getElementById("pages-wrap");
+  if (!focus.rect) { scrollWrapTo(pi.el, "smooth"); return; }
+  const r = annotViewportRect({ rect: focus.rect }, pi.viewport);
+  const pageTop = pi.el.getBoundingClientRect().top - wrap.getBoundingClientRect().top + wrap.scrollTop;
+  wrap.scrollTo({ top: Math.max(0, pageTop + r.top - wrap.clientHeight * 0.12), behavior: "smooth" });
+  const flash = document.createElement("div");
+  flash.className = "focus-flash";
+  Object.assign(flash.style, { left: `${r.left - 4}px`, top: `${r.top - 4}px`,
+                               width: `${r.w + 8}px`, height: `${r.h + 8}px` });
+  pi.annotLayer.appendChild(flash);
+  setTimeout(() => flash.remove(), 2400);
+}
+
 function scrollToPage(n) {
   if (n < 1 || n > state.totalPages) return;
   const pi = state.pageElements[n - 1];
-  if (pi) pi.el.scrollIntoView({ block: "start", behavior: "smooth" });
+  if (pi) scrollWrapTo(pi.el, "smooth");
 }
 
 async function loadPdf(pdfBytes, annotations, scrollToTarget) {
@@ -604,8 +637,192 @@ function _clearSelecting() {
   });
 })();
 
+// ─────────  Reference list (client-side)  ─────────
+// Items come from Python with pre-rendered, escaped card HTML.  Filtering,
+// search, the page filter, opening cards and "Show in PDF" all happen here
+// without a Streamlit rerun; only server actions are sent back.
+const list = {
+  items: null, labels: {}, order: [], filter: "all", query: "", pageOnly: false,
+  open: new Set(), keyHtml: "", tiles: [],
+};
+
+// A filter is a status key, "all", or an item flag behind a tile
+// ("dead" → cited link is dead, "bad_claims" → a claim was contradicted).
+function matchesFilter(it, f) {
+  if (f === "all") return true;
+  if (f === "dead" || f === "bad_claims") return Boolean(it[f]);
+  return it.status === f;
+}
+
+function itemVisible(it) {
+  if (!matchesFilter(it, list.filter)) return false;
+  if (list.query && !it.text.includes(list.query)) return false;
+  if (list.pageOnly && it.page !== state.pageNum) return false;
+  return true;
+}
+
+function renderFilterButtons() {
+  const counts = { all: list.items.length };
+  for (const it of list.items) counts[it.status] = (counts[it.status] || 0) + 1;
+  const box = document.getElementById("status-filter");
+  box.innerHTML = "";
+  for (const key of ["all", ...list.order]) {
+    if (key !== "all" && !counts[key]) continue;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = `${key === "all" ? "All" : list.labels[key]} ${counts[key] || 0}`;
+    b.setAttribute("aria-pressed", String(list.filter === key));
+    b.onclick = () => { setFilter(key); };
+    box.appendChild(b);
+  }
+}
+
+function setFilter(key) {
+  list.filter = key;
+  renderFilterButtons();
+  renderTiles();
+  renderList();
+  document.getElementById("list").scrollTop = 0;
+}
+
+function renderTiles() {
+  const box = document.getElementById("tiles");
+  if (!list.tiles.length) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = "";
+  for (const t of list.tiles) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "tile";
+    b.title = t.help || "";
+    const label = document.createElement("span");
+    label.className = "t-label";
+    label.textContent = t.label;
+    const value = document.createElement("span");
+    value.className = "t-value";
+    value.textContent = String(t.value);
+    b.append(label, value);
+    const active = t.filter !== "all" && list.filter === t.filter;
+    b.setAttribute("aria-pressed", String(active));
+    // Nothing to show behind an empty tile; "References" always resets.
+    b.disabled = t.filter !== "all" && !t.value;
+    // A second click on the active tile goes back to all references.
+    b.onclick = () => setFilter(active || t.filter === "all" ? "all" : t.filter);
+    box.appendChild(b);
+  }
+}
+
+function renderList() {
+  const el = document.getElementById("list");
+  const scroll = el.scrollTop;
+  const vis = list.items.filter(itemVisible);
+  document.getElementById("list-count").textContent =
+    `${vis.length} of ${list.items.length} references`;
+  if (!vis.length) {
+    el.innerHTML = '<div class="empty">No references match these filters.</div>';
+    return;
+  }
+  el.innerHTML = vis.map((it) => {
+    const acts = [];
+    if (it.page) acts.push(`<button data-act="show" data-i="${it.i}">◎ Show in PDF (p. ${it.page})</button>`);
+    for (const a of it.actions) {
+      acts.push(`<button data-act="${a.act}" data-i="${it.i}"${a.disabled ? " disabled" : ""}>${a.label}</button>`);
+    }
+    return `<div class="item" id="item-${it.i}">${it.html}<div class="actions">${acts.join("")}</div></div>`;
+  }).join("");
+  for (const d of el.querySelectorAll("details.refcard")) {
+    const i = Number(d.closest(".item").id.slice(5));
+    if (list.open.has(i)) d.open = true;
+    d.addEventListener("toggle", () => { d.open ? list.open.add(i) : list.open.delete(i); });
+  }
+  el.scrollTop = scroll;
+}
+
+function focusCard(i) {
+  // PDF highlight → card: make sure it is visible, open it, scroll to it.
+  const it = (list.items || []).find((x) => x.i === i);
+  if (!it) return;
+  if (!itemVisible(it)) {
+    list.filter = "all"; list.query = ""; list.pageOnly = false;
+    document.getElementById("search").value = "";
+    document.getElementById("page-only").checked = false;
+    renderFilterButtons();
+    renderTiles();
+  }
+  list.open.add(i);
+  renderList();
+  const node = document.getElementById(`item-${i}`);
+  if (!node) return;
+  // Scroll #list itself — scrollIntoView would also scroll the app page.
+  const box = document.getElementById("list");
+  box.scrollTo({ top: node.offsetTop - 8, behavior: "smooth" });
+  node.classList.add("flash");
+  setTimeout(() => node.classList.remove("flash"), 1600);
+}
+
+function setupList() {
+  const search = document.getElementById("search");
+  let t = null;
+  search.addEventListener("input", () => {
+    clearTimeout(t);
+    t = setTimeout(() => { list.query = search.value.trim().toLowerCase(); renderList(); }, 120);
+  });
+  document.getElementById("page-only").addEventListener("change", (e) => {
+    list.pageOnly = e.target.checked; renderList();
+  });
+  document.getElementById("list").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (!b || b.disabled) return;
+    const i = Number(b.dataset.i);
+    const it = list.items.find((x) => x.i === i);
+    if (b.dataset.act === "show") {
+      focusOn({ page: it.page, rect: it.rect, nonce: `show-${Date.now()}` });
+      return;
+    }
+    b.disabled = true;     // server action: one click, then wait for the rerun
+    Streamlit.setComponentValue({ kind: "action", action: b.dataset.act, ref_index: i,
+                                  id: `act-${Date.now()}-${i}` });
+  });
+}
+
+function updateList(args) {
+  const pane = document.getElementById("list-pane");
+  if (!args.items) { pane.hidden = true; return; }
+  pane.hidden = false;
+  if (args.cards_css && document.getElementById("cards-css").textContent !== args.cards_css) {
+    document.getElementById("cards-css").textContent = args.cards_css;
+  }
+  const key = JSON.stringify([args.items, args.tiles || []]);
+  if (key === list.keyHtml) return;          // nothing changed → keep DOM, scroll, focus
+  list.keyHtml = key;
+  list.items = args.items;
+  list.tiles = args.tiles || [];
+  list.labels = args.status_labels || {};
+  list.order = args.status_order || [];
+  if (!list.items.some((x) => matchesFilter(x, list.filter))) list.filter = "all";
+  renderFilterButtons();
+  renderTiles();
+  renderList();
+}
+
+function applyTheme(theme) {
+  if (!theme) return;
+  const root = document.documentElement;
+  root.classList.toggle("dark", theme.base === "dark");
+  if (theme.backgroundColor) root.style.setProperty("--bg", theme.backgroundColor);
+  if (theme.textColor) root.style.setProperty("--fg", theme.textColor);
+  if (theme.font) root.style.setProperty("font-family", theme.font);
+  if (theme.primaryColor) {
+    root.style.setProperty("--accent", theme.primaryColor);
+    root.style.setProperty("--accent-hover", theme.primaryColor);
+  }
+}
+
 function onRender(event) {
   const args = event.detail.args || {};
+  applyTheme(event.detail.theme);
+  updateList(args);
+  if (args.height) Streamlit.setFrameHeight(args.height);
   // Always update the emit flag — it controls JS-side behaviour for
   // page-change emissions and doesn't itself require a re-render.
   state.emitPageChanges = !!args.emit_page_changes;
@@ -631,12 +848,19 @@ function onRender(event) {
   // that got lost), the skip prevented recovery.  Splitting lets the
   // annotation-only path always run when there's a change, while the
   // expensive PDF reload still gets the skip optimisation.
-  const pdfKey   = (args.pdf_b64 || "").length;
+  // Length plus content samples: length alone treated two different
+  // PDFs of the same encoded size as unchanged.
+  const b64      = args.pdf_b64 || "";
+  const mid      = b64.length >> 1;
+  const pdfKey   = `${b64.length}:${b64.slice(-96)}:${b64.slice(mid, mid + 96)}`;
   const annotKey = JSON.stringify(args.annotations || []);
   const pdfUnchanged   = pdfKey   === _lastPdfKey;
   const annotUnchanged = annotKey === _lastAnnotKey;
+  const focus = args.focus || null;
+  const focusIsNew = !!focus && focus.nonce !== _lastFocusNonce;
   if (pdfUnchanged && annotUnchanged && !args.scroll_to_page) {
-    // Truly nothing to do.
+    // Nothing to re-render; maybe a backlink jump.
+    if (focusIsNew) focusOn(focus);
     return;
   }
   _lastPdfKey   = pdfKey;
@@ -645,7 +869,9 @@ function onRender(event) {
   const pdfBytes = b64ToBytes(args.pdf_b64 || "");
   const annotations = args.annotations || [];
   const scrollTarget = args.scroll_to_page || null;
-  loadPdf(pdfBytes, annotations, scrollTarget).catch((err) => {
+  loadPdf(pdfBytes, annotations, scrollTarget).then(() => {
+    if (focusIsNew) requestAnimationFrame(() => focusOn(focus));
+  }).catch((err) => {
     document.getElementById("pages").innerHTML =
       `<pre style="color:red; padding:1em;">PDF render error: ${err.message}\n${err.stack}</pre>`;
     Streamlit.setFrameHeight();
@@ -656,4 +882,5 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
 Streamlit.setComponentReady();
 setupNavButtons();
 setupSelectionWatcher();
+setupList();
 Streamlit.setFrameHeight(900);

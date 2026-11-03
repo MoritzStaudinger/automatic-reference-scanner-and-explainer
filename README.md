@@ -1,4 +1,4 @@
-# Automatic Reference Explainer and Scanner
+# Automatic Reference Scanner and Explainer
 
 A pipeline + Streamlit UI for extracting references from academic PDFs and
 auditing them against multiple authoritative databases. The tool surfaces
@@ -33,23 +33,22 @@ A SQLite cache makes any second pass on the same paper near-instant.
 
 ## Quick start (Docker)
 
-You need Docker, Docker Compose, and ~10 GB of free RAM (GROBID alone
-asks for 6–8 GB).
+You need Docker, Docker Compose v2.24+, and ~12 GB of free RAM (GROBID
+alone can peak near 4 GB per paper and is capped at 6 GB).
 
 ```bash
-git clone https://github.com/<your-org>/reference-explainer.git
-cd reference-explainer
+git clone https://github.com/MoritzStaudinger/automatic-reference-scanner-and-explainer.git
+cd automatic-reference-scanner-and-explainer
 cp .env.example .env        # fill in any API keys you have
-docker compose up -d --build
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -subj /CN=localhost -keyout dev.key -out dev.pem
+TLS_CERT=$PWD/dev.pem TLS_KEY=$PWD/dev.key \
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
-The Streamlit UI lives behind nginx at port 443 in the shipped compose.
-For local development without TLS, comment out the `nginx` service and
-add `ports: ["8501:8501"]` to the `ares` service, then visit
-`http://localhost:8501`.
-
-Production deployment with an institutional certificate is documented in
-the comments at the top of `docker-compose.yml`.
+Then open `http://localhost:8501` (or `https://localhost:8443` through
+nginx). Production deployment — TLS for both hostnames, API keys, limits —
+is in [DEPLOY.md](DEPLOY.md); `scripts/deploy.sh` performs and verifies it.
 
 ## Quick start (local Python)
 
@@ -64,6 +63,67 @@ cp .env.example .env        # fill in API keys
 docker run -d --rm --name grobid -p 8070:8070 lfoppiano/grobid:0.8.1
 streamlit run app.py
 ```
+
+## HTTP API and batch mode
+
+ARSE exposes a headless HTTP API for programmatic use and batch
+processing of large PDF collections.
+
+The Docker Compose deployment ships with an `arse-api` service alongside
+the Streamlit container; nginx routes `/api/*` to it. For local
+development you can also run it standalone:
+
+```bash
+ARSE_API_KEY=your-secret uvicorn api:app --host 0.0.0.0 --port 8500
+```
+
+Set `ARSE_API_KEY` in the environment (and `.env` for Docker) — every
+request must then carry `X-API-Key: your-secret`. When the variable is
+unset the API runs unauthenticated (dev mode only).
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Liveness check. No auth. |
+| `POST` | `/api/v1/process` | Sync single-PDF processing. Multipart upload, returns JSON report. |
+| `POST` | `/api/v1/batch` | Async batch: multiple PDFs in one request, returns `job_id`. |
+| `GET` | `/api/v1/batch/{job_id}` | Job status / progress counters. |
+| `GET` | `/api/v1/batch/{job_id}/results` | Full per-PDF results. |
+| `GET` | `/api/v1/batch/{job_id}/results.jsonl` | Streamed JSONL. |
+| `GET` | `/api/v1/batches` | Recent jobs. |
+
+Single-PDF example:
+
+```bash
+curl -X POST https://your-host/api/v1/process \
+     -H "X-API-Key: $ARSE_API_KEY" \
+     -F file=@paper.pdf \
+     -F parser=grobid \
+     -F use_llm=false
+```
+
+### Batch CLI
+
+For driving the pipeline against a directory of PDFs, `batch_cli.py`
+wraps both the local pipeline and the remote API:
+
+```bash
+# Local (in the repo, with GROBID running):
+python batch_cli.py /path/to/pdfs/ /path/to/output/ \
+       --parser grobid --concurrency 4
+
+# Remote (against a deployed ARSE):
+python batch_cli.py /path/to/pdfs/ /path/to/output/ \
+       --remote https://your-host/api/v1 \
+       --api-key $ARSE_API_KEY \
+       --concurrency 8
+```
+
+Per-PDF JSON reports land in the output directory along with
+`summary.csv` rolling up `n_match` / `n_mismatch` / `n_missing` per paper.
+Re-running skips PDFs that already have an output JSON (pass
+`--overwrite` to redo).
 
 ## Configuration
 
@@ -81,7 +141,7 @@ short version:
 | `LLM_BACKEND` | `anthropic` or `aqueduct` |
 | `LLM_MODEL` | Model name for the chosen backend |
 | `GROBID_URL` | GROBID HTTP endpoint (set automatically in Docker) |
-| `ARES_CACHE` | SQLite cache path |
+| `ARSE_CACHE` | SQLite cache path |
 
 All keys are optional — the tool degrades gracefully when a source is
 unavailable. More keys → fewer rate-limit walls.

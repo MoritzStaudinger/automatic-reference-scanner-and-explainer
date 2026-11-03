@@ -16,6 +16,11 @@ Usage:
 
 from __future__ import annotations
 
+import os as _os
+for _k, _v in list(_os.environ.items()):   # old ARES_* settings
+    if _k.startswith("ARES_"):
+        _os.environ.setdefault("ARSE_" + _k[5:], _v)
+
 import argparse
 import json
 import os
@@ -281,7 +286,7 @@ def main() -> None:
                          "(e.g. qwen-3.6-35b, gemma-4-e2b-it, claude-haiku-4-5).  "
                          "Use this to compare models in side-by-side benchmark runs.")
     ap.add_argument("--cold", action="store_true",
-                    help="Use a fresh empty SQLite cache for this run (ARES_CACHE "
+                    help="Use a fresh empty SQLite cache for this run (ARSE_CACHE "
                          "redirected to a temp file).  Measures the realistic first-time "
                          "experience; warm-cache runs piggyback on previous lookups and "
                          "report misleadingly fast numbers.")
@@ -302,7 +307,7 @@ def main() -> None:
         import tempfile
         cold_dir  = tempfile.mkdtemp(prefix="refcleaner_cold_")
         cold_path = Path(cold_dir) / "cache.sqlite"
-        os.environ["ARES_CACHE"] = str(cold_path)
+        os.environ["ARSE_CACHE"] = str(cold_path)
         # Force a fresh cache singleton with the new path
         import cache as _cache_mod
         _cache_mod._cache_singleton = None
