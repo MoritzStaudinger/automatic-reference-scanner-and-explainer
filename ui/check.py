@@ -17,7 +17,7 @@ from lookup import forget_reference, lookup_all
 from ui import cards, explain, jobs, state, viewer
 from ui.processing import (
     LLM_BACKEND, LLM_MODEL, LLM_READY, PARSER_HELP, Document, annotated_pdf,
-    parser_options, process, with_manual,
+    clean_pdf, parser_options, process, with_manual,
 )
 from verdict import SOURCE_NAMES, overall_status, status_reason
 
@@ -117,8 +117,16 @@ else:
         _landing()
     st.stop()
 
-doc_id = state.file_hash(pdf_bytes)
+doc_id = state.file_hash(pdf_bytes)      # of the file as uploaded
 state.bind_document(doc_id)
+# Draft layouts number every line in the margin; those numbers would end
+# up inside the references and citing sentences.  Everything below —
+# parsing, highlighting, citations, export — works on the cleaned PDF.
+pdf_bytes, n_line_numbers = clean_pdf(pdf_bytes)
+if n_line_numbers:
+    with up_col:
+        st.caption(f":material/format_list_numbered: Draft layout detected — removed "
+                   f"{n_line_numbers} margin line numbers before reading the paper.")
 
 
 

@@ -135,6 +135,8 @@ def _pdf_bytes_to_text(pdf_bytes: bytes) -> Optional[str]:
     """
     if not pdf_bytes.startswith(b"%PDF"):
         return None
+    from pdfclean import strip_line_numbers
+    pdf_bytes, _ = strip_line_numbers(pdf_bytes)     # a cited draft / preprint
     import pymupdf4llm
     # pymupdf4llm needs a file path, not bytes.  Write to a tmpfile,
     # unlink in finally so a parse crash doesn't leak.

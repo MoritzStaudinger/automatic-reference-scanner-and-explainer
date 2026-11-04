@@ -151,6 +151,8 @@ class PipelineReport:
     llm_stats: dict[str, Any] = field(default_factory=dict)
     # Set when the requested parser failed and pymupdf4llm was used instead.
     parser_fallback: str = ""
+    # Margin line numbers removed from a draft / review-mode PDF.
+    line_numbers_removed: int = 0
     # Claim verification block — empty when opts.verify_claims is False.
     verify_claims_seconds: float = 0.0
     n_claims:           int = 0
@@ -174,6 +176,8 @@ class PipelineReport:
             "used_llm":   self.used_llm,
             **({"llm_repair": self.llm_stats} if self.llm_stats else {}),
             **({"parser_fallback": self.parser_fallback} if self.parser_fallback else {}),
+            **({"line_numbers_removed": self.line_numbers_removed}
+               if self.line_numbers_removed else {}),
             "timings_seconds": {
                 "parse":  round(self.parse_seconds, 2),
                 "repair": round(self.repair_seconds, 2),
@@ -312,6 +316,10 @@ def process_pdf(
     """
     opts = options or PipelineOptions()
 
+    # Draft / review-mode PDFs: margin line numbers out before parsing.
+    from pdfclean import strip_line_numbers
+    pdf_bytes, n_line_numbers = strip_line_numbers(pdf_bytes)
+
     # 1. Parse — needs an on-disk path (parsers use fitz/pymupdf which
     #    open files, not bytes).  We write to a tmpfile and unlink in a
     #    `finally` so a parser crash doesn't leak the file.
@@ -386,6 +394,7 @@ def process_pdf(
             llm_stats.get("n_failed_refs") == llm_stats.get("n_sent")),
         llm_stats       = llm_stats,
         parser_fallback = parser_fallback,
+        line_numbers_removed = n_line_numbers,
         verify_claims_seconds = verify_s,
         n_claims           = counts["n_claims"],
         n_supported        = counts["n_supported"],

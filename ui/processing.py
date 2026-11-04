@@ -224,6 +224,14 @@ class Document:
     timings: dict[str, float] = field(default_factory=dict)
 
 
+@st.cache_data(**_CACHE)
+def clean_pdf(pdf_bytes: bytes) -> tuple[bytes, int]:
+    """Draft / review-mode PDFs: remove margin line numbers before anything
+    reads the text (see pdfclean.py).  Returns (pdf, n_removed)."""
+    from pdfclean import strip_line_numbers
+    return strip_line_numbers(pdf_bytes)
+
+
 def process(pdf_bytes: bytes, parser: str, use_llm: bool,
             log: Callable[[str], None] | None = None) -> Document:
     """Run (or replay from cache) the processing pipeline for the parsed
