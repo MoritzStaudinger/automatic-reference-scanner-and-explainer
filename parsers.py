@@ -717,8 +717,12 @@ def _split_plaintext_bibliography(section: str) -> list[str]:
         return []
 
     # A year, not the end of a page range ("33:1877–1901.") or an ID.
+    # "n.d." (no date: model cards, web pages, datasets), "in press" and
+    # "forthcoming" stand where the year would — without them such an entry
+    # was glued to the reference before it.
     year_positions = [m.end() for m in re.finditer(
-        r"(?<![–\-:/.\d])\b(?:19|20)\d{2}[a-z]?\.", text)]
+        r"(?<![–\-:/.\d])\b(?:19|20)\d{2}[a-z]?\."
+        r"|(?<![\w.])n\.\s?d\.|\b(?:[Ii]n press|[Ff]orthcoming)\.", text)]
     if len(year_positions) < 2:
         return [text] if len(text) >= 30 else []
 

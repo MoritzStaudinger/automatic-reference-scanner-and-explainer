@@ -261,3 +261,41 @@ def test_line_break_hyphens_use_document_evidence():
     assert fix("Good evaluation matters") == "Good evaluation matters"      # joined form occurs
     assert fix("Crossroads, buildings and neighborhoods") == \
         "Crossroads, buildings and neighborhoods"                          # "hoods" never alone
+
+
+def test_no_date_entries_start_a_new_reference():
+    sec = ("Edward J Hu and Weizhu Chen. 2022. LoRA: Low-rank adaptation of large\nlanguage models. In ICLR.\n"
+           "EuroBench. 2026. Wikipedia native topic\nclassification: sk. Hugging Face dataset\n"
+           "EuroBench/eurobench-wiki-sk-topics, revision\n72d2dd53165c44acadab521946e36115ffdcb6e8.\n"
+           "Slovak Wikipedia article introductions with category\nlabels; CC BY-SA 4.0.\n"
+           "Google. n.d. Gemma-4-E2B-it: Pinned\nmodel card. Hugging Face model\n"
+           "card google/gemma-4-E2B-it, revision\n3e22461f65e89153144f8adb70e3b8c2cc9845a7.\n"
+           "Albert Q. Jiang and Others. 2023. Mistral 7B. arXiv preprint arXiv:2310.06825.\n")
+    refs = _split_plaintext_bibliography(sec)
+    assert [r.split(".")[0] for r in refs] == ["Edward J Hu and Weizhu Chen", "EuroBench", "Google", "Albert Q"]
+    assert refs[1].endswith("CC BY-SA 4.0.")
+    assert refs[2].startswith("Google. n.d. Gemma-4-E2B-it")
+
+
+def test_orphan_block_with_two_author_year_entries_is_split():
+    import fitz
+    import highlighter
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    known = ["Edward J Hu and Weizhu Chen. 2022. LoRA: Low-rank adaptation of large language models. In ICLR.",
+             "Albert Q. Jiang and Others. 2023. Mistral 7B. arXiv preprint arXiv:2310.06825."]
+    y = 80
+    for t in known:
+        page.insert_textbox(fitz.Rect(60, y, 300, y + 40), t, fontsize=8)
+        y += 50
+    page.insert_textbox(fitz.Rect(60, y, 300, y + 160), (
+        "EuroBench. 2026. Wikipedia native topic classification: sk. Hugging Face dataset "
+        "EuroBench/eurobench-wiki-sk-topics, revision 72d2dd53165c44acadab521946e36115ffdcb6e8. "
+        "Slovak Wikipedia article introductions with category labels; CC BY-SA 4.0. "
+        "Google. n.d. Gemma-4-E2B-it: Pinned model card. Hugging Face model card "
+        "google/gemma-4-E2B-it, revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7."), fontsize=8)
+    refs = [{"raw": t, "title": t.split(". ")[2]} for t in known]
+    _, _, orphans = highlighter.highlight_references(doc.tobytes(), refs, ["match", "match"])
+    texts = [o["text"] for o in orphans]
+    assert len(texts) == 2
+    assert texts[0].startswith("EuroBench. 2026.") and texts[1].startswith("Google. n.d.")

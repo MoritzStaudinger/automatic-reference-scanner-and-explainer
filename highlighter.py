@@ -465,7 +465,7 @@ def highlight_references(
         # (has year + reasonable length).
         if len(text) < 40:
             continue
-        if not _re_h.search(r"\b(?:19|20)\d{2}\b", text):
+        if not _re_h.search(r"\b(?:19|20)\d{2}\b|(?<![\w.])n\.\s?d\.", text):
             continue
         # PDF-native rect coords (bottom-up y) — same convention as
         # parsed-ref rects above so the JS overlay can render
@@ -477,12 +477,22 @@ def highlight_references(
             rect.x1,
             page_h_orph - rect.y0,
         ]
-        orphans.append({
-            "page":       pn + 1,
-            "rect":       pdf_rect,
-            "text":       text,
-            "confidence": _orphan_confidence(text),
-        })
+        # An author-year block can hold several entries (no "[n]" to split
+        # on above): "EuroBench. 2026. … Google. n.d. Gemma-4 …" used to
+        # become ONE auto-detected reference.  Split it like the parser does.
+        pieces = [text]
+        if not _REF_MARKER_RE.match(text):
+            from parsers import _split_plaintext_bibliography
+            split = _split_plaintext_bibliography(text)
+            if len(split) >= 2:
+                pieces = split
+        for piece in pieces:
+            orphans.append({
+                "page":       pn + 1,
+                "rect":       pdf_rect,
+                "text":       piece,
+                "confidence": _orphan_confidence(piece),
+            })
         # NOTE: we deliberately do NOT draw the orphan rectangle as a PyMuPDF
         # annotation here.  The PDF selector component receives `orphans` via
         # its `annotations` arg and paints the dashed outline as a DOM overlay
