@@ -275,9 +275,10 @@ TILES = [
 ]
 if verdicts:
     n_con = sum(1 for v in verdicts if v.get("verdict") == "contradicted")
-    TILES.append({"label": "Claims contradicted", "value": n_con, "filter": "bad_claims",
-                  "help": f"References with a contradicted claim, of {len(verdicts)} "
-                          f"citing sentences checked."})
+    TILES.append({"label": "Possible conflicts", "value": n_con, "filter": "bad_claims",
+                  "help": f"References where the cited text may say something different "
+                          f"from the citing sentence — worth a manual look "
+                          f"({len(verdicts)} citing sentences checked)."})
 
 
 @st.dialog("Add a reference", width="large")

@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from verdict import SOURCE_NAMES, VALIDATION_SOURCES as _VALIDATION_SOURCES
+from verdict import SOURCE_NAMES, VALIDATION_SOURCES as _VALIDATION_SOURCES, claim_label
 from verdict import overall_status as _overall_status   # noqa: F401  (re-exported)
 
 
@@ -521,7 +521,7 @@ def generate_report(
     return "\n".join(lines)
 
 
-_CLAIM_ICONS = {"supported": "🟢", "contradicted": "🔴", "not_addressed": "🟡",
+_CLAIM_ICONS = {"supported": "🟢", "contradicted": "🟠", "not_addressed": "🟡",
                 "ambiguous": "🟡", "partially_supported": "🟡", "evidence_only": "🔵",
                 "no_source": "⚪", "error": "⚪"}
 _CLAIM_ORDER = ("contradicted", "partially_supported", "not_addressed", "ambiguous",
@@ -538,14 +538,14 @@ def _claims_section(refs: list[dict[str, Any]], verdicts: list[Any]) -> list[str
            "sentence claims about that work and an LLM checked it against the passages "
            "of the cited paper (abstract or open-access full text) that match it best. "
            "Treat these as pointers for a human reader, not judgements.\n",
-           " · ".join(f"{_CLAIM_ICONS[k]} {k.replace('_', ' ')}: {n}"
+           " · ".join(f"{_CLAIM_ICONS[k]} {claim_label(k)}: {n}"
                       for k, n in counts.items() if n) + "\n"]
     for verdict in _CLAIM_ORDER[:3]:
         for r in (r for r in rows if r.get("verdict") == verdict):
             i = r.get("cited_ref_index", -1)
             ref = refs[i] if 0 <= i < len(refs) else {}
             title = ref.get("title") or (ref.get("raw") or "")[:80]
-            out.append(f"- {_CLAIM_ICONS[verdict]} **{verdict.replace('_', ' ')}** — "
+            out.append(f"- {_CLAIM_ICONS[verdict]} **{claim_label(verdict)}** — "
                        f"cites [{i + 1}] *{title}*")
             out.append(f"  > {' '.join(str(r.get('claim_text', '')).split())}")
             if r.get("cited_claim"):

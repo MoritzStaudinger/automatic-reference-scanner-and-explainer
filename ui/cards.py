@@ -12,21 +12,14 @@ import urllib.parse
 from typing import Any
 
 from lookup import _is_preprint_venue
-from verdict import SOURCE_NAMES, STATUS_LABEL, overall_status, status_reason
+from verdict import CLAIM_LABEL, SOURCE_NAMES, STATUS_LABEL, overall_status, status_reason
 
 _ICON = {"match": "✓", "mismatch": "✕", "missing": "!", "pending": "…"}
 _LABEL_DOT = {"match": "ok", "fuzzy": "warn", "mismatch": "bad"}
 _SOURCE_ORDER = ("doi_org", "semantic_scholar", "acl_anthology", "dblp", "openalex",
                  "crossref", "arxiv", "openlibrary", "scholarly", "url_verify")
 
-CLAIM_LABEL = {
-    "supported": "supported", "contradicted": "contradicted",
-    "partially_supported": "partly supported",
-    "not_addressed": "not addressed", "ambiguous": "ambiguous",
-    "evidence_only": "evidence only", "no_source": "no text available",
-    "error": "check failed",
-}
-_CLAIM_TONE = {"supported": "ok", "contradicted": "bad", "partially_supported": "warn",
+_CLAIM_TONE = {"supported": "ok", "contradicted": "warn", "partially_supported": "warn",
                "not_addressed": "muted", "ambiguous": "warn", "evidence_only": "info",
                "no_source": "muted", "error": "muted"}
 INTENT_LABEL = {"result": "reports a finding", "method": "uses a method / resource",
@@ -185,7 +178,8 @@ def card_html(i: int, ref: dict, lr: dict | None, verdicts: list[dict],
         badges += '<span class="chip bad">dead link</span>'
     n_bad_claims = sum(1 for v in verdicts if v.get("verdict") == "contradicted")
     if n_bad_claims:
-        badges += f'<span class="chip bad">{n_bad_claims} claim{"s" if n_bad_claims > 1 else ""} contradicted</span>'
+        badges += (f'<span class="chip warn">{n_bad_claims} possible '
+                   f'conflict{"s" if n_bad_claims > 1 else ""}</span>')
     body = (f'<div class="raw">{esc(ref.get("raw") or "").replace(chr(10), "<br>")}</div>'
             + fields_html(ref)
             + (source_rows(lr, ref) if lr else "")

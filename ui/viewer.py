@@ -78,7 +78,7 @@ def render(doc: Document, lookup_results: list | None, doc_id: str,
             "html": cards.card_html(i, r, lr, mine),
             "text": " ".join(str(r.get(k) or "") for k in ("title", "authors", "venue", "raw")).lower(),
             "actions": actions,
-            # Extra filters behind the "Dead links" / "Claims contradicted" tiles.
+            # Extra filters behind the "Dead links" / "Possible conflicts" tiles.
             "dead": ((lr or {}).get("url_verify") or {}).get("status") == "dead_link",
             "bad_claims": any(v.get("verdict") == "contradicted" for v in mine),
         })

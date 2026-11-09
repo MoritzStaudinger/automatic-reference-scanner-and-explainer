@@ -117,3 +117,26 @@ def status_reason(lr: dict | None) -> str:
         return "found a paper at this title but details disagree"
 
     return "no confident match found"
+
+
+# ---------------------------------------------------------------------------
+# Citation-context (claim check) wording
+# ---------------------------------------------------------------------------
+# The verdicts are pointers for a human reader, so the labels describe what
+# the comparison with the source found rather than passing judgement on the
+# citing authors ("possible conflict", not "contradicted").  The internal
+# values (keys) are unchanged — the API returns them as before.
+CLAIM_LABEL = {
+    "supported":           "matches source",
+    "partially_supported": "partly matches",
+    "contradicted":        "possible conflict",
+    "ambiguous":           "unclear",
+    "not_addressed":       "not found in source",
+    "evidence_only":       "passages only",
+    "no_source":           "no text available",
+    "error":               "check failed",
+}
+
+
+def claim_label(verdict: str) -> str:
+    return CLAIM_LABEL.get(verdict, verdict.replace("_", " "))

@@ -101,7 +101,7 @@ st.markdown("""
 - **Mismatch needs a look, too.** If the extracted authors are wrong (parser or LLM error),
   a real citation can look mis-attributed — compare against the PDF.
 - **Scanned PDFs** without a text layer extract poorly.
-- **Citation context** verdicts from abstracts are partial by nature; *not addressed*
+- **Citation context** verdicts from abstracts are partial by nature; *not found in source*
   often just means the abstract is silent.
 
 ARSE surfaces candidates for review. It is not a citation auditor of record, and a clean
