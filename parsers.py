@@ -115,7 +115,7 @@ def _locate_reference_section(full_text: str) -> str | None:
         # A figure label "Literature" or a TOC line isn't followed by a
         # run of publication years; a bibliography is.
         window = full_text[m.end(): m.end() + 1500]
-        return len(re.findall(r"\b(?:19|20)\d{2}\b", window)) >= 4
+        return len(re.findall(r"\b(?:19|20)\d{2}[a-z]?\b", window)) >= 4
 
     for match in reversed(matches):
         if looks_like_bibliography(match):
@@ -301,7 +301,7 @@ def _looks_like_body_text(raw: str) -> bool:
     head = _OPENER_NOISE_RE.sub("", raw)
     if not _BODY_TEXT_OPENER.match(head):
         return False
-    has_year = bool(re.search(r"\b(?:19|20)\d{2}\b", raw))
+    has_year = bool(re.search(r"\b(?:19|20)\d{2}[a-z]?\b", raw))
     has_doi  = "10." in raw and "/" in raw
     has_url  = "http" in raw
     if has_year or has_doi or has_url:
@@ -350,9 +350,10 @@ def _is_plausible_reference(ref: dict[str, Any]) -> bool:
         return True   # keep for visibility in the report
 
     # Backfill year from raw if GROBID didn't structure it.
-    year_in_raw = re.search(r"\b(?:19|20)\d{2}\b", raw)
+    # "2024a" (author-year disambiguation) is a year too; keep the digits.
+    year_in_raw = re.search(r"\b((?:19|20)\d{2})[a-z]?\b", raw)
     if year_in_raw and not ref.get("year"):
-        ref["year"] = year_in_raw.group(0)
+        ref["year"] = year_in_raw.group(1)
 
     # A reference needs at least one anchor: an explicit year/doi/url field,
     # OR a year in the raw text, OR a comma+period combo (typical citation
@@ -497,8 +498,13 @@ def _strip_name_prefix(title: str) -> str:
     return rest.strip()
 
 
-def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
-    """Parse GROBID TEI XML and return a list of reference dicts."""
+def _parse_tei_references(tei_xml: str, keep_empty: bool = False) -> list[dict[str, Any]]:
+    """Parse GROBID TEI XML and return a list of reference dicts.
+
+    ``keep_empty``: one dict per biblStruct, even when GROBID couldn't
+    structure the entry (empty dict).  processCitationList answers are
+    paired with the input strings by position; dropping an empty one
+    shifted every later reference onto its neighbour's text."""
     try:
         root = ET.fromstring(tei_xml)
     except ET.ParseError:
@@ -595,6 +601,8 @@ def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
 
         if ref.get("raw") or ref.get("title"):
             refs.append(ref)
+        elif keep_empty:
+            refs.append({})
 
     return refs
 
@@ -667,7 +675,7 @@ def _looks_like_ref_candidate(raw: str, require_year: bool = True) -> bool:
     if _looks_like_body_text(raw):
         return False
     # Needs a 4-digit year — every modern citation has one
-    if require_year and not re.search(r"\b(?:19|20)\d{2}\b", raw):
+    if require_year and not re.search(r"\b(?:19|20)\d{2}[a-z]?\b", raw):
         return False
     return True
 
@@ -684,11 +692,16 @@ def _grobid_process_citation_list(citations: list[str]) -> list[dict[str, Any]]:
         headers={"Accept": "application/xml"},
     )
     tei = response.text
-    refs = _parse_tei_references(tei)
+    refs = _parse_tei_references(tei, keep_empty=True)
+    if len(refs) != len(citations):
+        # Can't pair by position safely: keep only what we can verify.
+        refs = [r for r in refs if r]
+        return [r for r in refs if r.get("raw") in citations]
     # processCitationList preserves input order.  Force raw to the input
     # string — GROBID sometimes reconstructs a partial raw from its structured
     # fields, losing the arXiv ID / "preprint arXiv:NNNN.NNNN" suffix that
-    # `_extract_arxiv_id` relies on for the arXiv batch prewarm.
+    # `_extract_arxiv_id` relies on for the arXiv batch prewarm.  An entry
+    # GROBID couldn't structure keeps its text (and nothing else).
     for r, c in zip(refs, citations):
         r["raw"] = c
     return refs
@@ -976,6 +989,7 @@ def _merge_ref_lists(
         # "Principal component analysis".  Each primary entry absorbs at
         # most one secondary entry.
         dup_idx, best = None, 0.0
+        title_hit = False      # a title match beats any raw-text match
         for i, (pt, pr) in enumerate(zip(primary_titles, primary_raws)):
             if i in claimed:
                 continue
@@ -983,12 +997,12 @@ def _merge_ref_lists(
             # so only numbers in the title and DOIs separate them here.
             if _distinct_refs(s, primary[i], check_year=False):
                 continue
-            score = 0.0
+            score, is_title = 0.0, False
             # Title match is the strong signal
             if st and pt:
                 t = _fuzz.token_sort_ratio(st, pt)
                 if t >= title_threshold:
-                    score = t
+                    score, is_title = t, True
             # Fallback: high partial overlap on raw text (one side got a
             # fragmentary or garbage title, but it is the same citation).
             # Not when the primary raw is much longer and its title is
@@ -999,9 +1013,14 @@ def _merge_ref_lists(
                 glued = (len(pr) >= 1.4 * len(sr) and st and pt
                          and not _is_name_list(primary[i].get("title") or "")
                          and _fuzz.partial_ratio(pt, sr) < 80)
-                if r >= 90 and not glued:
-                    score = max(score, r - 0.5)   # a title match wins ties
-            if score > best:
+                if r >= 90 and not glued and not is_title:
+                    score = r - 0.5
+            # Neighbouring entries of one author ("Zhao and Lian. 2024a/b")
+            # share long raw prefixes; raw overlap only decides when no
+            # entry matches by title.
+            if is_title and not title_hit:
+                dup_idx, best, title_hit = i, score, True
+            elif (is_title == title_hit) and score > best:
                 dup_idx, best = i, score
         if dup_idx is not None:
             claimed.add(dup_idx)

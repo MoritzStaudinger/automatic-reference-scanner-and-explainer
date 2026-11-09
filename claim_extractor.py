@@ -65,8 +65,8 @@ _MULTICITE_SPLIT_RE = re.compile(r"\s*;\s*")
 # One (surname, year) pair inside an in-paren citation.
 _AUTHOR_YEAR_ONE_RE = re.compile(
     r"([A-Z][A-Za-z\-']+)"                        # surname
-    r"(?:\s+et\s+al\.?|\s+and\s+[A-Z][A-Za-z\-']+)?"
-    r",?\s+(\d{4})[a-z]?"                         # year
+    r"(?:\s+(et\s+al\.?)|\s+and\s+([A-Z][A-Za-z\-']+))?"   # "et al." / "and Jones"
+    r",?\s+(\d{4}[a-z]?)"                        # year, with its a/b/c letter
 )
 
 # Sentence-boundary heuristics: split on ". " but not immediately after
@@ -122,23 +122,64 @@ def _first_surname(authors: str) -> str:
 
 
 def _year_of(ref: dict[str, Any]) -> str:
+    """Year with its disambiguation letter when the reference has one
+    ("2024b"): "Zhao and Lian, 2024a" and "2024b" are different papers."""
+    raw = ref.get("raw", "") or ""
     y = str(ref.get("year") or "").strip()
+    m = re.search(r"\b((?:19|20)\d{2})([a-z])\b", raw)      # "… Lian. 2024b. …"
     if re.fullmatch(r"\d{4}[a-z]?", y):
-        return y[:4]        # ignore the suffix letter
-    m = re.search(r"\b(19|20)\d{2}\b", ref.get("raw", "") or "")
+        if len(y) == 4 and m and m.group(1) == y:
+            return y + m.group(2)
+        return y
+    if m:
+        return m.group(0)
+    m = re.search(r"\b(19|20)\d{2}\b", raw)
     return m.group(0) if m else ""
 
 
-def _build_author_year_index(refs: list[dict[str, Any]]) -> dict[tuple[str, str], int]:
-    """Map (first_author_surname_lower, year) → ref index (first wins)."""
-    idx: dict[tuple[str, str], int] = {}
+def _build_author_year_index(refs: list[dict[str, Any]]) -> dict[tuple[str, str], list[int]]:
+    """Map (first_author_surname_lower, year) → ref indices, in order.
+    A reference with a suffixed year ("2024b") is indexed under that and,
+    as a fallback for citations written without the letter, under "2024"."""
+    idx: dict[tuple[str, str], list[int]] = {}
     for i, ref in enumerate(refs):
         surname = _first_surname(ref.get("authors", ""))
         year    = _year_of(ref)
         if not surname or not year:
             continue
-        idx.setdefault((surname, year), i)
+        idx.setdefault((surname, year), []).append(i)
+        if year[:4] != year:
+            idx.setdefault((surname, year[:4]), []).append(i)
     return idx
+
+
+def _n_authors(authors: str) -> int:
+    return len([a for a in re.split(r",\s*(?:and\s+)?|\s+and\s+", authors or "") if a.strip()])
+
+
+def _lookup_ay(idx: dict[tuple[str, str], list[int]], surname: str, year: str,
+               refs: list[dict[str, Any]] | None = None,
+               second: str | None = None, et_al: bool = False) -> int | None:
+    """The reference a "(Surname[ and Second | et al.], Year)" citation
+    means.  Several Zhangs can share a year: the co-author ("Zhang and
+    Lian") or "et al." (3+ authors) picks the right one."""
+    cands = idx.get((surname.lower(), year))
+    if not cands:
+        if len(year) == 5:              # "2024c" with no matching suffixed entry
+            return None
+        cands = idx.get((surname.lower(), year[:4]))
+    if not cands:
+        return None
+    if len(cands) == 1 or refs is None:
+        return cands[0]
+    def fits(i: int) -> bool:
+        a = refs[i].get("authors") or ""
+        if second:
+            return second.lower() in a.lower() and _n_authors(a) == 2
+        if et_al:
+            return _n_authors(a) >= 3
+        return _n_authors(a) == 1
+    return next((i for i in cands if fits(i)), cands[0])
 
 
 # ---------------------------------------------------------------------------
@@ -208,49 +249,32 @@ def extract(body_text: str, refs: list[dict[str, Any]]) -> list[Claim]:
     num_index = build_numeric_index(refs)
     claims:  list[Claim] = []
 
-    # 1. Numeric markers
-    for m in _NUMERIC_MARKER_RE.finditer(body):
-        payload = m.group(1)
-        numbers = _parse_numeric_payload(payload, 10_000)
-        indices = list(dict.fromkeys(num_index[n + 1] for n in numbers if n + 1 in num_index))
-        if not indices:
-            continue
-        sentence = _sentences_around(body, m.start(), m.end())
-        if not sentence:
-            continue
-        for idx in indices:
-            claims.append(Claim(
-                text=sentence,
-                citation_marker=m.group(0),
-                cited_ref_index=idx,
-                style="numeric",
-            ))
-
-    # 2. Author-year in parens (may contain multiple cites via `;`)
+    # 1. Author-year in parens (may contain multiple cites via `;`)
     for m in _PAREN_MARKER_RE.finditer(body):
         payload = m.group(1)
         sentence = _sentences_around(body, m.start(), m.end())
         if not sentence:
             continue
-        for surname, year in _parse_paren_payload(payload):
-            key = (surname.lower(), year)
-            if key not in ay_index:
+        for surname, year, second, et_al in _parse_paren_payload(payload):
+            idx = _lookup_ay(ay_index, surname, year, refs, second, et_al)
+            if idx is None:
                 continue
             claims.append(Claim(
                 text=sentence,
                 citation_marker=m.group(0),
-                cited_ref_index=ay_index[key],
+                cited_ref_index=idx,
                 style="paren",
             ))
 
-    # 3. Narrative form "Smith et al. (2020)"
+    # 2. Narrative form "Smith et al. (2020)"
     for m in _NARRATIVE_MARKER_RE.finditer(body):
         # Grab just the first surname from the group (before "et al." / "and")
         surname_part = m.group(1)
         surname = surname_part.split()[0].strip(",.")
-        year = m.group(2)
-        key = (surname.lower(), year[:4])
-        if key not in ay_index:
+        sm = re.search(r"\band\s+([A-Z][A-Za-z\-']+)", surname_part)
+        idx = _lookup_ay(ay_index, surname, m.group(2), refs,
+                         sm.group(1) if sm else None, "et al" in surname_part)
+        if idx is None:
             continue
         sentence = _sentences_around(body, m.start(), m.end())
         if not sentence:
@@ -258,14 +282,45 @@ def extract(body_text: str, refs: list[dict[str, Any]]) -> list[Claim]:
         claims.append(Claim(
             text=sentence,
             citation_marker=m.group(0),
-            cited_ref_index=ay_index[key],
+            cited_ref_index=idx,
             style="narrative",
         ))
+
+    # 3. Numeric markers — unless the paper cites author-year and its
+    #    bibliography carries no "[n]" labels.  Then a "[4]" is an
+    #    affiliation or footnote mark, and mapping it to the 4th entry by
+    #    position attached title-page author lists to random references.
+    if _numeric_labels_dominant(refs) or len(claims) < 3:
+        for m in _NUMERIC_MARKER_RE.finditer(body):
+            payload = m.group(1)
+            numbers = _parse_numeric_payload(payload, 10_000)
+            indices = list(dict.fromkeys(num_index[n + 1] for n in numbers if n + 1 in num_index))
+            if not indices:
+                continue
+            sentence = _sentences_around(body, m.start(), m.end())
+            if not sentence:
+                continue
+            for idx in indices:
+                claims.append(Claim(
+                    text=sentence,
+                    citation_marker=m.group(0),
+                    cited_ref_index=idx,
+                    style="numeric",
+                ))
 
     return _dedupe(claims)
 
 
 _REF_LABEL_RE = re.compile(r"^\s*(?:\[(\d{1,4})\]|(\d{1,4})[.)]\s)")
+
+
+def _numeric_labels_dominant(refs: list[dict[str, Any]]) -> bool:
+    """True when most parsed references carry a "[12]" / "12." label."""
+    cands = [r for r in refs if not r.get("_user_added") and not r.get("_auto_added")]
+    if not cands:
+        return False
+    labelled = sum(1 for r in cands if _REF_LABEL_RE.match(r.get("raw") or ""))
+    return labelled >= 0.6 * len(cands)
 
 
 def build_numeric_index(refs: list[dict[str, Any]]) -> dict[int, int]:
@@ -337,16 +392,16 @@ def _parse_numeric_payload(payload: str, n_refs: int) -> list[int]:
     return valid
 
 
-def _parse_paren_payload(payload: str) -> Iterable[tuple[str, str]]:
+def _parse_paren_payload(payload: str) -> Iterable[tuple[str, str, str | None, bool]]:
     """
-    Yield (surname, year) pairs from an in-paren citation payload.
+    Yield (surname, year, second_surname, et_al) from an in-paren citation payload.
     Handles ; separator for grouped cites.
     """
     for chunk in _MULTICITE_SPLIT_RE.split(payload):
         m = _AUTHOR_YEAR_ONE_RE.match(chunk.strip())
         if not m:
             continue
-        yield m.group(1), m.group(2)
+        yield m.group(1), m.group(4), m.group(3), bool(m.group(2))
 
 
 def _dedupe(claims: list[Claim]) -> list[Claim]:

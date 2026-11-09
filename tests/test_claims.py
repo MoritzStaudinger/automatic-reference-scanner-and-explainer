@@ -301,3 +301,35 @@ def test_passages_drop_markup_and_join_broken_paragraphs():
     [p] = evidence.segment(md)
     assert p.text.startswith("Decoder-only LLMs lag behind encoder-only counterparts.")
     assert "<sup>" not in p.text
+
+
+# ── Citation → reference assignment (author-year) ───────────────────────────
+
+def _ay_refs():
+    return [
+        {"authors": "Beichen Zhang, Pan Zhang, Xiaoyi Dong", "year": "2024",
+         "raw": "Beichen Zhang, Pan Zhang, and Xiaoyi Dong. 2024a. Long-clip.", "title": "Long-clip"},
+        {"authors": "Yiming Zhang, Zhouhui Lian", "year": "2024",
+         "raw": "Yiming Zhang and Zhouhui Lian. 2024a. Brush your text.", "title": "Brush your text"},
+        {"authors": "Yiming Zhang, Zhouhui Lian", "year": "2024",
+         "raw": "Yiming Zhang and Zhouhui Lian. 2024b. Diffste.", "title": "Diffste"},
+    ]
+
+
+def test_year_suffix_and_coauthor_pick_the_right_reference():
+    from claim_extractor import extract
+    body = ("Brush Your Text (Zhang and Lian, 2024a) refines alignment. DiffSTE (Zhang and Lian, "
+            "2024b) edits scene text. Long-CLIP (Zhang et al., 2024a) extends CLIP context.")
+    got = {c.citation_marker: c.cited_ref_index for c in extract(body, _ay_refs())}
+    assert got["(Zhang and Lian, 2024a)"] == 1
+    assert got["(Zhang and Lian, 2024b)"] == 2
+    assert got["(Zhang et al., 2024a)"] == 0
+
+
+def test_bracket_numbers_ignored_in_author_year_papers():
+    from claim_extractor import extract
+    body = ("Tianyu Zhang[1], Xinyu Wang[2], Zhenghan Tai[3] wrote this. "
+            "Brush Your Text (Zhang and Lian, 2024a) refines alignment. "
+            "DiffSTE (Zhang and Lian, 2024b) edits text. Long-CLIP (Zhang et al., 2024a) helps.")
+    styles = {c.style for c in extract(body, _ay_refs())}
+    assert "numeric" not in styles

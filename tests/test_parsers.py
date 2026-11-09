@@ -307,3 +307,29 @@ def test_tei_arxiv_prefix_is_stripped_from_url():
                        '<idno type="arXiv">arXiv:2404.05961</idno>')
     [ref] = _parse_tei_references(tei)
     assert ref["url"] == "https://arxiv.org/abs/2404.05961"
+
+
+# ── Author-year details found on EMNLP 2025 main.1070 ───────────────────────
+
+def test_suffixed_years_pass_the_candidate_filter():
+    from parsers import _looks_like_ref_candidate, _is_plausible_reference
+    raw = "Yiming Zhao and Zhouhui Lian. 2024a. Anytext2: Visual text generation and editing. CoRR."
+    assert _looks_like_ref_candidate(raw)
+    ref = {"raw": raw, "title": "Anytext2"}
+    assert _is_plausible_reference(ref) and ref["year"] == "2024"
+
+
+def test_empty_grobid_entry_keeps_the_citation_list_aligned(monkeypatch):
+    import parsers
+
+    class R:
+        text = ("<TEI xmlns='http://www.tei-c.org/ns/1.0'><text><back><listBibl>"
+                "<biblStruct><analytic><title level='a' type='main'>First paper</title></analytic></biblStruct>"
+                "<biblStruct/>"
+                "<biblStruct><analytic><title level='a' type='main'>Third paper</title></analytic></biblStruct>"
+                "</listBibl></back></text></TEI>")
+    monkeypatch.setattr(parsers, "_grobid_post", lambda *a, **k: R())
+    out = parsers._grobid_process_citation_list(["A. 2020. First paper.", "B. 2021. Recraft v3.",
+                                                 "C. 2022. Third paper."])
+    assert [o.get("title") for o in out] == ["First paper", None, "Third paper"]
+    assert out[2]["raw"] == "C. 2022. Third paper."

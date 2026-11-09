@@ -163,7 +163,7 @@ def auto_add_orphans(orphans_json: str) -> str:
         return "[]"      # GROBID down: orphans stay in the suggestions list
     out = []
     for orph, p in zip(high, parsed):
-        if p:
+        if p and p.get("title"):          # GROBID couldn't structure it → stays a suggestion
             out.append({**p, "_auto_added": True, "raw": orph["text"], "page": orph["page"],
                         "rect": orph["rect"], "found": True, "status": "pending"})
     return json.dumps(out)
