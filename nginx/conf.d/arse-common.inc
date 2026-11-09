@@ -17,7 +17,11 @@ add_header X-Frame-Options "SAMEORIGIN" always;
 # Streamlit enforces its own 25 MB upload limit (config.toml) — keep
 # nginx a bit above so users see Streamlit's message, not a bare 413.
 client_max_body_size 30m;
-limit_conn ares_conn 30;
+# Per-IP concurrent connections.  Over HTTP/2 nginx counts every stream,
+# and Streamlit's first page load fetches ~80 JS/CSS chunks at once —
+# a limit of 30 answered most of them with 429 and the page never loaded.
+# The API keeps a tight limit (below); static assets have their own.
+limit_conn ares_conn 100;
 
 proxy_http_version 1.1;
 proxy_set_header Host              $host;
@@ -31,6 +35,7 @@ set $arse_api arse-api:8500;
 
 location /api/ {
     limit_req zone=ares_api burst=20 nodelay;
+    limit_conn ares_conn 30;
     proxy_pass http://$arse_api;
     # Sync /api/v1/process can take minutes for an uncached paper.
     proxy_read_timeout 600s;
@@ -41,6 +46,7 @@ location /api/ {
 
 location = /api/v1/batch {
     limit_req zone=ares_api burst=5 nodelay;
+    limit_conn ares_conn 30;
     client_max_body_size 200m;
     proxy_pass http://$arse_api;
     proxy_read_timeout 600s;
@@ -50,6 +56,15 @@ location = /api/v1/batch {
 
 location = /api-health {
     proxy_pass http://$arse_api/healthz;
+}
+
+# Streamlit's static assets: content-hashed file names, so they can be
+# cached by the browser and need no request-rate limit.  (`expires`, not
+# add_header — an add_header here would drop the security headers above.)
+location /static/ {
+    limit_conn ares_conn 300;
+    proxy_pass http://$arse_ui;
+    expires 7d;
 }
 
 # Streamlit UI.

@@ -136,6 +136,17 @@ for host in "${HOSTS[@]}"; do
              --resolve "$host:443:127.0.0.1" "https://$host/_stcore/stream" || true)
     [[ "$code" == 101 ]] && green "✓ $host: app WebSocket (101)" \
         || fail "$host: WebSocket /_stcore/stream returned $code (page would never finish loading)"
+    # A first page load fetches ~80 static chunks at once over HTTP/2;
+    # nginx's per-IP limits must let that burst through.
+    asset=$(curl -sk --resolve "$host:443:127.0.0.1" "https://$host/" \
+            | grep -o '/static/js/[^"]*\.js' | head -1)
+    if [[ -n "$asset" ]]; then
+        args=(); for i in $(seq 80); do args+=(-o /dev/null "https://$host$asset?n=$i"); done
+        ok=$(curl -sk --http2 -Z --parallel-max 100 --resolve "$host:443:127.0.0.1" \
+                 -w '%{http_code}\n' "${args[@]}" | grep -c '^200$' || true)
+        [[ "$ok" == 80 ]] && green "✓ $host: 80 parallel asset requests (200)" \
+            || fail "$host: only $ok of 80 parallel asset requests succeeded (rate/connection limit?)"
+    fi
 done
 
 if (( FAILED )); then
