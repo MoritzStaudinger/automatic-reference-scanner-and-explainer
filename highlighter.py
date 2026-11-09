@@ -465,7 +465,7 @@ def highlight_references(
         # (has year + reasonable length).
         if len(text) < 40:
             continue
-        if not _re_h.search(r"\b(?:19|20)\d{2}\b|(?<![\w.])n\.\s?d\.", text):
+        if not _re_h.search(r"\b(?:19|20)\d{2}[a-z]?\b|(?<![\w.])n\.\s?d\.", text):
             continue
         # PDF-native rect coords (bottom-up y) — same convention as
         # parsed-ref rects above so the JS overlay can render
