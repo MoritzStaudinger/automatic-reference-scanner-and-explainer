@@ -122,7 +122,8 @@ def test_llm_analysis_output_is_coerced():
 def test_aggregate():
     agg = claim_verifier.aggregate
     assert agg(["supported", "supported"]) == "supported"
-    assert agg(["supported", "contradicted"]) == "contradicted"
+    assert agg(["supported", "contradicted"]) == "partially_supported"   # part holds
+    assert agg(["contradicted", "not_addressed"]) == "contradicted"
     assert agg(["supported", "not_addressed"]) == "partially_supported"
     assert agg(["not_addressed", "not_addressed"]) == "not_addressed"
     assert agg(["ambiguous", "not_addressed"]) == "ambiguous"
@@ -251,3 +252,52 @@ def test_short_text_without_matches_is_shown_whole():
     ps = [evidence.Passage(0, "Completely different words appear in this abstract.", "")]
     hits = evidence.retrieve("zebra quantum", ps, k=8)
     assert [h.passage.idx for h in hits] == [0]
+
+
+# ── Fewer false conflicts (LLM2Vec review case) ─────────────────────────────
+
+LLM2VEC = ("Prior work (Huang et al., 2024; BehnamGhader et al., 2024) has highlighted that LLMs "
+           "generally underperform in encoder roles, although some modifications can improve "
+           "their effectiveness.")
+
+
+def test_heuristic_keeps_the_qualifier_and_marks_shared_citations():
+    cc = claim_analysis.heuristic(_claim(LLM2VEC, "(Huang et al., 2024; BehnamGhader et al., 2024)"))
+    assert "although some modifications can improve" in cc.cited_claim
+    assert cc.shared is True
+    assert claim_analysis.heuristic(_claim("X improves Y [3].", "[3]")).shared is False
+    assert claim_analysis.heuristic(_claim("X improves Y [3, 7].", "[3, 7]")).shared is True
+
+
+def test_llm_shared_flag_is_read():
+    fb = claim_analysis.CitedClaim("fallback", ["fallback"], "result")
+    assert claim_analysis._coerce({"cited_claim": "a b c", "shared": True}, fb).shared is True
+    assert claim_analysis._coerce({"cited_claim": "a b c", "shared": "false"}, fb).shared is False
+    fb_shared = claim_analysis.CitedClaim("f", ["f"], "result", shared=True)
+    assert claim_analysis._coerce({"cited_claim": "a b c"}, fb_shared).shared is True
+
+
+def test_low_confidence_conflict_becomes_unclear(monkeypatch):
+    monkeypatch.setenv("ARSE_EMBEDDER", "none")
+    _fake_llm(monkeypatch, {"claims": [{"verdict": "contradicted", "passage_ids": ["P1"]}],
+                            "confidence": "low"})
+    cc = claim_analysis.CitedClaim("dense beats BM25", ["Dense retrieval recovers more than BM25."])
+    [v] = claim_verifier.verify_batch([_claim("Dense beats BM25 [4].")], _ft(), cited=[cc])
+    assert v.verdict == "ambiguous"
+
+
+def test_shared_claims_are_flagged_to_the_model(monkeypatch):
+    monkeypatch.setenv("ARSE_EMBEDDER", "none")
+    calls = _fake_llm(monkeypatch, {"claims": [{"verdict": "supported", "passage_ids": ["P1"]}]})
+    cc = claim_analysis.CitedClaim("dense beats BM25", ["Dense retrieval recovers more than BM25."],
+                                   shared=True)
+    claim_verifier.verify_batch([_claim("Dense beats BM25 (A, 2020; B, 2021).")], _ft(), cited=[cc])
+    assert "SHARED:" in calls[0]
+
+
+def test_passages_drop_markup_and_join_broken_paragraphs():
+    md = ("## 1 Introduction\nDecoder-only LLMs lag behind encoder-\n\n"
+          "only counterparts.<sup>1</sup> During pre-training, they learn from all tokens.\n")
+    [p] = evidence.segment(md)
+    assert p.text.startswith("Decoder-only LLMs lag behind encoder-only counterparts.")
+    assert "<sup>" not in p.text

@@ -299,3 +299,11 @@ def test_orphan_block_with_two_author_year_entries_is_split():
     texts = [o["text"] for o in orphans]
     assert len(texts) == 2
     assert texts[0].startswith("EuroBench. 2026.") and texts[1].startswith("Google. n.d.")
+
+
+
+def test_tei_arxiv_prefix_is_stripped_from_url():
+    tei = _TEI.replace('<idno type="DOI">10.1093/jamia/ocaa148</idno>',
+                       '<idno type="arXiv">arXiv:2404.05961</idno>')
+    [ref] = _parse_tei_references(tei)
+    assert ref["url"] == "https://arxiv.org/abs/2404.05961"

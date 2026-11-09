@@ -39,6 +39,9 @@ class CitedClaim:
     subclaims:   list[str] = field(default_factory=list)
     intent:      str = "result"
     source:      str = "heuristic"         # "llm" | "heuristic"
+    # Several works cited together for one statement ("Prior work (A; B)
+    # has shown X"): each needs only to be consistent with X.
+    shared:      bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,9 +55,19 @@ _ANY_MARKER_RE = re.compile(
     r"\[\s*\d[\d\s,\-–]*\]"                                  # [3], [3, 7-9]
     r"|\((?:[^()]*?\b(?:19|20)\d{2}[a-z]?)(?:;[^()]*?\b(?:19|20)\d{2}[a-z]?)*\)"   # (Smith, 2020; …)
 )
+# Clause boundaries that separate statements about DIFFERENT works.
+# "although" / "however" are not among them: they qualify the same
+# statement ("LLMs underperform as encoders, although modifications help"),
+# and dropping that half turned a fair summary into an overstatement.
 _CLAUSE_SPLIT_RE = re.compile(
-    r";\s+|,\s+(?:while|whereas|unlike|but|although|however|in contrast(?: to)?)\s+"
+    r";\s+|,\s+(?:while|whereas|unlike|but|in contrast(?: to)?)\s+"
     r"|\s+(?:whereas|while)\s+")
+
+
+def _is_shared_marker(marker: str) -> bool:
+    """"(Huang et al., 2024; BehnamGhader et al., 2024)", "[3, 7]", "[2-4]"."""
+    m = marker or ""
+    return (";" in m and "(" in m) or bool(re.search(r"\[\s*\d+\s*[,\-–]", m))
 
 _METHOD_RE = re.compile(
     r"\b(?:we|our)\b[^.;]{0,60}?\b(?:use[sd]?|using|adopt(?:ed|s)?|employ(?:ed|s)?|follow(?:ed|s|ing)?|"
@@ -82,8 +95,11 @@ def heuristic(claim: Claim) -> CitedClaim:
     if pos >= 0:
         # The clause holding the marker, without the connective
         # ("X improves Y [3], unlike Z [7]" → "X improves Y").
+        # Semicolons inside citation parentheses "(A, 2024; B, 2024)" are
+        # not clause boundaries: mask them (same length, positions kept).
+        masked = _ANY_MARKER_RE.sub(lambda m: m.group(0).replace(";", ","), sent)
         segs, start = [], 0
-        for m in _CLAUSE_SPLIT_RE.finditer(sent):
+        for m in _CLAUSE_SPLIT_RE.finditer(masked):
             segs.append((start, m.start()))
             start = m.end()
         segs.append((start, len(sent)))
@@ -101,7 +117,8 @@ def heuristic(claim: Claim) -> CitedClaim:
         intent = "background"
     else:
         intent = "result"
-    return CitedClaim(cited_claim=text, subclaims=[text], intent=intent, source="heuristic")
+    return CitedClaim(cited_claim=text, subclaims=[text], intent=intent, source="heuristic",
+                      shared=_is_shared_marker(claim.citation_marker))
 
 
 # ---------------------------------------------------------------------------
@@ -114,21 +131,32 @@ the sentence, the citation marker of interest, and the title of the work
 that marker cites.  Determine what the sentence claims about THAT work.
 
 Return a JSON array, one object per item, same order:
-  {"cited_claim": "...", "subclaims": ["...", ...], "intent": "..."}
+  {"cited_claim": "...", "subclaims": ["...", ...], "intent": "...", "shared": false}
 
 - cited_claim: the part of the sentence attributed to the marked work,
   as one standalone statement about that work ("The cited work shows
-  that …").  Leave out what the sentence says about other citations or
-  the citing authors' own work.  Keep numbers, datasets and names exactly.
+  that …").  Leave out only what the sentence attributes to OTHER works
+  or to the citing authors themselves.  Keep numbers, datasets and names
+  exactly, and keep every qualifier: hedges ("generally", "often",
+  "some", "can", "may") and concessive or limiting clauses ("although …",
+  "but …", "however …") belong to the statement they qualify.
+  "LLMs generally underperform as encoders, although some modifications
+  improve them" is ONE statement — never reduce it to "LLMs underperform
+  as encoders".
   If the sentence enumerates several works (models, datasets, tools,
   methods) each with its own citation, the claim about this work is only
   the item next to its marker: "We evaluate Mistral-7B [3], GPT-4 [5] and
   Gemma [8]" → for [5]: "The cited work introduces GPT-4." (intent method).
-- subclaims: 1-3 atomic statements ABOUT THE CITED WORK that together make
-  up cited_claim and can be checked against its text.  Never about what
+- subclaims: 1-3 statements ABOUT THE CITED WORK that together make up
+  cited_claim and can be checked against its text.  A qualified statement
+  stays in one subclaim together with its qualifier; split only
+  independent facts.  Never about what
   the citing authors do: for "We use the X dataset [4]" the subclaim is
   "The cited work introduces or describes the X dataset."  One subclaim
   if the claim is already atomic.
+- shared: true when the marker cites several works together for this one
+  statement ("Prior work (A; B) has highlighted X", "[3, 7]"); then each
+  work only needs to be consistent with X.
 - intent:
     "result"     the sentence reports a finding, number, property or
                  conclusion of the cited work;
@@ -166,8 +194,12 @@ def _coerce(item: Any, fallback: CitedClaim) -> CitedClaim:
     intent = str(item.get("intent") or "").strip().lower()
     if not cc:
         return fallback
+    shared = item.get("shared")
+    shared = fallback.shared if shared is None else (
+        shared if isinstance(shared, bool) else str(shared).strip().lower() in ("true", "1", "yes"))
     return CitedClaim(cited_claim=cc[:600], subclaims=[s[:400] for s in subs] or [cc[:400]],
-                      intent=intent if intent in INTENTS else fallback.intent, source="llm")
+                      intent=intent if intent in INTENTS else fallback.intent, source="llm",
+                      shared=shared)
 
 
 def analyse(claims: list[Claim], refs: list[dict[str, Any]],

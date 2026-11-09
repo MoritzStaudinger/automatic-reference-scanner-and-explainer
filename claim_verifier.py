@@ -537,14 +537,30 @@ For each claim pick:
   supported     — the passages state it, or it is a faithful paraphrase or
                   summary of what they state (citing authors condense and
                   reword; that is fine as long as the meaning is kept);
-  contradicted  — the passages say something incompatible with it;
-  ambiguous     — the passages support it only in a weaker form: a
-                  stronger effect, broader scope, missing condition or
-                  different population than the claim states;
+  contradicted  — ONLY when the passages state, as the cited paper's own
+                  finding about the same thing, the opposite of the claim
+                  (a different number, the reverse direction or outcome).
+                  Your explanation must name that statement.  Praise for
+                  the paper's own method is not the opposite of a claim
+                  about the problem it solves;
+  ambiguous     — the passages support it only in a weaker or different
+                  form: overstated ("generally", "always", a stronger
+                  effect), broader scope, a missing condition, a different
+                  population, or a shift of emphasis.  A loose or
+                  overstated paraphrase is ambiguous, not contradicted;
   not_addressed — the passages don't contain the information.
+A paper that proposes a fix usually describes the limitation it fixes
+("sub-optimal for …", "limits their ability to …"): such statements
+SUPPORT a claim about that limitation, even though the paper then
+overcomes it.
 Don't demand the claim's exact wording; do check numbers, direction of
 effects, populations (e.g. humans vs mice) and causal vs correlational
 language.
+
+If the claims are marked SHARED, several works are cited together for
+this statement: the paper only needs to be consistent with it and need
+not support every part of it on its own.  A shared claim is never
+contradicted unless the paper explicitly states the opposite.
 
 Passages marked [cites other work] attribute statements to OTHER papers
 (they contain citations).  For a result claim they are not the cited
@@ -597,12 +613,14 @@ def aggregate(verdicts: list[str]) -> str:
     vs = [v for v in verdicts if v]
     if not vs:
         return "not_addressed"
-    if "contradicted" in vs:
-        return "contradicted"
     if all(v == "supported" for v in vs):
         return "supported"
     if "supported" in vs:
+        # Part of the claim holds — even if another part conflicts, that's
+        # "partly matches", not a conflict with the whole citation.
         return "partially_supported"
+    if "contradicted" in vs:
+        return "contradicted"
     if all(v == "not_addressed" for v in vs):
         return "not_addressed"
     return "ambiguous"
@@ -624,7 +642,7 @@ def _gather(subclaims: list[str], passages, embedder, skip: int):
 
 def _passage_key(model: str, cc, shown) -> str:
     h = hashlib.sha256(_PASSAGE_PROMPT.encode())     # a prompt change invalidates
-    h.update(f"{model}\0{cc.intent}\0".encode())
+    h.update(f"{model}\0{cc.intent}\0{getattr(cc, 'shared', False)}\0".encode())
     for sc in cc.subclaims:
         h.update(sc.encode("utf-8") + b"\0")
     for sp in shown:
@@ -633,7 +651,9 @@ def _passage_key(model: str, cc, shown) -> str:
 
 
 def _ask(client, backend, model, cc, shown) -> Optional[dict]:
-    user = (f"INTENT: {cc.intent}\n\nPASSAGES:\n{_passage_block(shown)}\n\nCLAIMS:\n" +
+    shared = ("\nSHARED: several works are cited together for this statement; "
+              "this paper need only be consistent with it." if getattr(cc, "shared", False) else "")
+    user = (f"INTENT: {cc.intent}{shared}\n\nPASSAGES:\n{_passage_block(shown)}\n\nCLAIMS:\n" +
             "\n".join(f"{i}. {sc}" for i, sc in enumerate(cc.subclaims, 1)))
     key = _passage_key(model, cc, shown)
     hit = _cached_get(key)
@@ -695,7 +715,8 @@ def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
         # topic; judging the sentence's details would demand more than the
         # citation claims.
         subclaims = [f"The cited work addresses this topic: {cc.cited_claim}"]
-        cc = type(cc)(cc.cited_claim, subclaims, cc.intent, cc.source)
+        cc = type(cc)(cc.cited_claim, subclaims, cc.intent, cc.source,
+                      getattr(cc, "shared", False))
     shown = _gather(subclaims, passages, embedder, skip=0)
 
     def ev(sps):
@@ -727,7 +748,7 @@ def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
                        if _sub_verdict(parsed, i) in ("not_addressed", "")]
             if missing:
                 sub_cc = type(cc)(cc.cited_claim, [subclaims[i] for i in missing],
-                                  cc.intent, cc.source)
+                                  cc.intent, cc.source, getattr(cc, "shared", False))
                 more = _gather(sub_cc.subclaims, passages, embedder, skip=_K_PER_SUBCLAIM)
                 p2 = _ask(client, backend, model, sub_cc, more) if more else None
                 if p2:
@@ -760,6 +781,8 @@ def _verify_one_passages(claim: Claim, cc, ft: FullText, passages, embedder,
     evidence = [{"id": x, "text": by_id[x].passage.text, "section": by_id[x].passage.section,
                  "score": round(by_id[x].score, 4)} for x in used]
     conf = str(parsed.get("confidence", "")).strip().lower()
+    if overall == "contradicted" and conf == "low":
+        overall = "ambiguous"          # a conflict the model itself doubts isn't one
     expl = "; ".join(s["explanation"] for s in subs if s["explanation"])[:400]
     return ClaimVerification(**base, verdict=overall,
                              evidence_passage=(evidence[0]["text"][:400] if evidence else ""),

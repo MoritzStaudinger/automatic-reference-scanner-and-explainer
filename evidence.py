@@ -98,11 +98,15 @@ def _heading(line: str) -> Optional[str]:
 
 
 def _clean(text: str) -> str:
+    text = re.sub(r"<sup>[^<]{0,12}</sup>", "", text)             # footnote markers
+    text = re.sub(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>", "", text)   # other HTML tags
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)          # images
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)        # links → label
     text = re.sub(r"(\*\*|__|`)", "", text)
     text = re.sub(r"(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w)", "", text)
-    text = re.sub(r"(\w)-\s+([a-z])", r"\1\2", text)            # line-break hyphens
+    # Line-break hyphen: keep the hyphen and drop the break.  "encoder-
+    # only" is a real compound; "evalu-ation" still reads fine.
+    text = re.sub(r"(\w)-\s+([a-z])", r"\1-\2", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -130,7 +134,14 @@ def _paragraphs_with_sections(text: str) -> list[tuple[str, str]]:
 
     def flush():
         if buf and not dropping:
-            out.append((section, " ".join(buf)))
+            para = " ".join(buf)
+            # A paragraph that starts in lowercase continues the previous
+            # one across a page or column break ("only counterparts. During
+            # …"); keep it together so no passage starts mid-sentence.
+            if out and out[-1][0] == section and re.match(r"[a-z]", para):
+                out[-1] = (section, out[-1][1] + " " + para)
+            else:
+                out.append((section, para))
         buf.clear()
 
     for line in text.splitlines():

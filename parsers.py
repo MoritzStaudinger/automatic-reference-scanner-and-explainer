@@ -575,7 +575,9 @@ def _parse_tei_references(tei_xml: str) -> list[dict[str, Any]]:
         # arXiv → URL
         arxiv_el = bib.find(".//tei:idno[@type='arXiv']", _TEI_NS)
         if arxiv_el is not None and arxiv_el.text:
-            ref["url"] = f"https://arxiv.org/abs/{arxiv_el.text.strip()}"
+            # GROBID keeps the printed "arXiv:" prefix in the idno.
+            aid = re.sub(r"^\s*arxiv\s*:\s*", "", arxiv_el.text.strip(), flags=re.I)
+            ref["url"] = f"https://arxiv.org/abs/{aid}"
 
         # Web pointer fallback
         if not ref.get("url"):
