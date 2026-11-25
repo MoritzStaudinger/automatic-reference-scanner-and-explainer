@@ -118,6 +118,10 @@ services:
         condition: service_healthy
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # Access log, one file per month (see default.conf), kept across
+      # container recreation for the usage statistics (vm-monitor).
+      - nginx-logs:/var/log/nginx/arse
+      - ./nginx/entrypoint.d/40-arse-logs.sh:/docker-entrypoint.d/40-arse-logs.sh:ro
       # One cert/key pair per hostname, read-only.  create_host_path:
       # false makes a wrong path fail loudly instead of Docker silently
       # creating an empty directory in its place.
@@ -152,3 +156,7 @@ services:
 
 volumes:
   arse-data:
+  # Fixed name → fixed host path for the monitoring agent:
+  # /var/lib/docker/volumes/arse-nginx-logs/_data/access-YYYY-MM.log
+  nginx-logs:
+    name: arse-nginx-logs
